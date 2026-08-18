@@ -759,8 +759,17 @@ class ConnectorTests(unittest.TestCase):
                 self.assertGreater(state.snapshot()["cycle_requested_at"], 0)
                 with urllib.request.urlopen(base + "/") as response:
                     requested_page = response.read().decode("utf-8")
-                self.assertIn("demandé, en attente", requested_page)
-                self.assertIn('http-equiv="refresh"', requested_page)
+                self.assertNotIn('http-equiv="refresh"', requested_page)
+                self.assertIn("Rafraîchir l’état", requested_page)
+                self.assertIn('src="/inventory-status"', requested_page)
+                with urllib.request.urlopen(base + "/inventory-status") as response:
+                    status_page = response.read().decode("utf-8")
+                self.assertIn("demandé, en attente", status_page)
+                self.assertIn('http-equiv="refresh"', status_page)
+                state.cycle_started()
+                with urllib.request.urlopen(base + "/inventory-status") as response:
+                    active_page = response.read().decode("utf-8")
+                self.assertIn("en cours depuis", active_page)
 
                 pause = urllib.request.Request(
                     base + "/pause",
@@ -897,7 +906,7 @@ class ConnectorTests(unittest.TestCase):
             connector.set_paused(config, False)
             self.assertEqual(connector.claim_next(config, now=1).object_id, "archive")
 
-    def test_paused_runtime_inventories_mailboxes_without_indexing(self):
+    def test_paused_runtime_manually_inventories_without_indexing(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory), scan_interval_seconds=3600)
             self.select(config, "source-1")
@@ -927,6 +936,10 @@ class ConnectorTests(unittest.TestCase):
                 daemon=True,
             )
             thread.start()
+            time.sleep(0.05)
+            self.assertEqual(connector.mailbox_rows(config), [])
+            state.cycle_requested()
+            wake.set()
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline and not connector.mailbox_rows(config):
                 time.sleep(0.01)

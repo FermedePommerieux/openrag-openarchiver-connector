@@ -1563,6 +1563,7 @@ class RuntimeState:
         self.last_cycle_started_at = 0
         self.last_cycle_completed_at = 0
         self.cycle_requested_at = 0
+        self.cycle_in_progress = False
         self.last_error = ""
         self.last_scan: ScanResult | None = None
         self.last_processed = 0
@@ -1577,10 +1578,15 @@ class RuntimeState:
         with self.lock:
             self.last_cycle_started_at = int(time.time())
             self.cycle_requested_at = 0
+            self.cycle_in_progress = True
 
     def cycle_requested(self) -> None:
         with self.lock:
             self.cycle_requested_at = int(time.time())
+
+    def cycle_pending(self) -> bool:
+        with self.lock:
+            return bool(self.cycle_requested_at)
 
     def cycle_succeeded(self, scan: ScanResult, processed: int) -> None:
         with self.lock:
@@ -1589,12 +1595,14 @@ class RuntimeState:
             self.last_scan = scan
             self.last_processed = processed
             self.ready = True
+            self.cycle_in_progress = False
 
     def cycle_failed(self, error: Exception) -> None:
         with self.lock:
             self.last_cycle_completed_at = int(time.time())
             self.last_error = _safe_error(error)
             self.ready = False
+            self.cycle_in_progress = False
 
     def snapshot(self) -> dict[str, object]:
         with self.lock:
@@ -1604,6 +1612,7 @@ class RuntimeState:
                 "last_cycle_started_at": self.last_cycle_started_at,
                 "last_cycle_completed_at": self.last_cycle_completed_at,
                 "cycle_requested_at": self.cycle_requested_at,
+                "cycle_in_progress": self.cycle_in_progress,
                 "last_error": self.last_error,
                 "last_scan": self.last_scan,
                 "last_processed": self.last_processed,
@@ -1642,8 +1651,14 @@ def runtime_loop(
         if recovered:
             LOG.warning("%d opération(s) interrompue(s) récupérée(s)", recovered)
         while not stop.is_set():
-            if is_paused(config):
-                LOG.info("indexation en pause; inventaire IMAP uniquement")
+            paused = is_paused(config)
+            if paused and not state.cycle_pending():
+                LOG.info("indexation en pause; inventaire IMAP manuel en attente")
+                wake.wait(config.scan_interval_seconds)
+                wake.clear()
+                continue
+            if paused:
+                LOG.info("indexation en pause; inventaire IMAP manuel")
             state.cycle_started()
             try:
                 scan, processed = run_cycle(config, archive_client, rag_client)
@@ -1674,6 +1689,38 @@ def _status_counts(config: Config) -> dict[str, dict[str, int]]:
             ):
                 result[table][str(row["status"])] = int(row["count"])
     return result
+
+
+def inventory_status(snapshot: Mapping[str, object]) -> str:
+    started_at = int(snapshot["last_cycle_started_at"])
+    completed_at = int(snapshot["last_cycle_completed_at"])
+    requested_at = int(snapshot["cycle_requested_at"])
+    if bool(snapshot["cycle_in_progress"]):
+        return (
+            "en cours depuis "
+            + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(started_at))
+        )
+    if requested_at:
+        return "demandé, en attente de démarrage"
+    if completed_at:
+        last_scan = snapshot["last_scan"]
+        detail = ""
+        if isinstance(last_scan, ScanResult):
+            detail = f" — {last_scan.sources} source(s), {last_scan.emails} mail(s)"
+        return (
+            "terminé le "
+            + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(completed_at))
+            + detail
+        )
+    return "jamais exécuté depuis le démarrage"
+
+
+def render_inventory_status_page(state: RuntimeState) -> str:
+    status = html.escape(inventory_status(state.snapshot()))
+    return f"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="3">
+<style>body{{font:700 1rem system-ui,sans-serif;margin:0;color:#202124}}</style>
+</head><body>{status}</body></html>"""
 
 
 def render_status_page(config: Config, state: RuntimeState) -> str:
@@ -1735,51 +1782,26 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
     pause_label = "Reprendre l’indexation" if paused else "Mettre en pause"
     pause_action = "resume" if paused else "pause"
     activity = "en pause" if paused else "active"
-    started_at = int(snapshot["last_cycle_started_at"])
-    completed_at = int(snapshot["last_cycle_completed_at"])
-    requested_at = int(snapshot["cycle_requested_at"])
-    cycle_active = bool(started_at and started_at > completed_at)
-    if cycle_active:
-        inventory = (
-            "en cours depuis "
-            + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(started_at))
-        )
-    elif requested_at:
-        inventory = "demandé, en attente de démarrage"
-    elif completed_at:
-        last_scan = snapshot["last_scan"]
-        detail = ""
-        if isinstance(last_scan, ScanResult):
-            detail = f" — {last_scan.sources} source(s), {last_scan.emails} mail(s)"
-        inventory = (
-            "terminé le "
-            + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(completed_at))
-            + detail
-        )
-    else:
-        inventory = "jamais exécuté depuis le démarrage"
-    refresh = (
-        '<meta http-equiv="refresh" content="3">'
-        if cycle_active or requested_at
-        else ""
-    )
     return f"""<!doctype html>
 <html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-{refresh}
 <title>OpenArchiver vers OpenRAG</title>
 <style>
 body{{font-family:system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#202124}}
 fieldset{{border:1px solid #ccc;border-radius:.5rem;padding:1rem}}label{{display:block;margin:.6rem 0}}
 button{{padding:.55rem .9rem;margin:.5rem .5rem 0 0}}code{{background:#f2f2f2;padding:.1rem .3rem}}
 .muted{{color:#666}}.error{{color:#9b1c1c}}dt{{font-weight:700}}dd{{margin-bottom:.5rem}}
+.inventory-status{{border:0;width:100%;height:1.6rem;vertical-align:middle}}
 </style></head><body>
 <h1>Connecteur OpenArchiver → OpenRAG</h1>
 <p>État runtime : <strong>{ready}</strong></p>
 <p>Indexation : <strong>{activity}</strong></p>
-<p>Inventaire IMAP : <strong>{html.escape(inventory)}</strong></p>
+<p>Inventaire IMAP :</p>
+<iframe class="inventory-status" src="/inventory-status"
+ title="État de l’inventaire IMAP"></iframe>
 <p class="muted">La pause bloque les envois vers OpenRAG, mais autorise
 l’inventaire des sources et dossiers IMAP.</p>
+<form method="get" action="/"><button type="submit">Rafraîchir l’état</button></form>
 <dl><dt>Dernière erreur</dt><dd class="error">{error}</dd>
 <dt>Mails</dt><dd>{count_lines('emails')}</dd>
 <dt>Pièces jointes</dt><dd>{count_lines('attachments')}</dd></dl>
@@ -1844,7 +1866,8 @@ def make_http_handler(
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header(
                 "Content-Security-Policy",
-                "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+                "default-src 'none'; style-src 'unsafe-inline'; "
+                "frame-src 'self'; form-action 'self'",
             )
             self.end_headers()
             self.wfile.write(payload)
@@ -1881,6 +1904,12 @@ def make_http_handler(
                         200,
                         render_metrics(config, state),
                         "text/plain; version=0.0.4",
+                    )
+                elif path == "/inventory-status":
+                    self._send(
+                        200,
+                        render_inventory_status_page(state),
+                        "text/html; charset=utf-8",
                     )
                 elif path == "/":
                     self._send(
