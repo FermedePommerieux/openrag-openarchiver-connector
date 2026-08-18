@@ -43,10 +43,18 @@ spec:
               value: http://openarchiver-api.openarchiver.svc.cluster.local:4000/v1
             - name: OPENARCHIVER_API_KEY_FILE
               value: /var/run/secrets/connector/openarchiver-api-key
+            - name: OPENARCHIVER_SOURCE_URL_TEMPLATE
+              value: ""
             - name: OPENRAG_BASE_URL
               value: http://openrag-backend.openrag.svc.cluster.local:8000
             - name: OPENRAG_INGEST_PATH
+              value: /v1/documents/ingest-path
+            - name: OPENRAG_INGEST_MODE
+              value: auto
+            - name: OPENRAG_UPLOAD_PATH
               value: /v1/documents/ingest
+            - name: OPENRAG_INGEST_DIRECTORY
+              value: /shared/openrag-documents/openarchiver
             - name: OPENRAG_TASK_PATH
               value: /v1/tasks/{task_id}/enhanced
             - name: OPENRAG_API_KEY_FILE
@@ -124,8 +132,8 @@ spec:
             - name: api-keys
               mountPath: /var/run/secrets/connector
               readOnly: true
-            - name: tmp
-              mountPath: /tmp
+            - name: shared
+              mountPath: /shared
       volumes:
         - name: code
           configMap:
@@ -143,6 +151,6 @@ spec:
                 path: openarchiver-api-key
               - key: openrag-api-key
                 path: openrag-api-key
-        - name: tmp
-          emptyDir:
-            sizeLimit: 256Mi
+        - name: shared
+          persistentVolumeClaim:
+            claimName: openrag-shared

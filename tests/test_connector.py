@@ -2,8 +2,6 @@ import importlib.util
 import io
 import json
 import logging
-import os
-import sqlite3
 import sys
 import tempfile
 import threading
@@ -89,6 +87,12 @@ class FakeOpenRAG:
             raise connector.ConnectorError("ingestion OpenRAG indisponible")
         return "task-1"
 
+    def ingest_path(self, path):
+        return self.upload(path, path.name)
+
+    def ingest_source(self, path, source_url=None):
+        return self.ingest_path(path), False
+
     def wait(self, task_id):
         if self.fail:
             raise connector.ConnectorError("tâche OpenRAG failed")
@@ -104,7 +108,8 @@ class ConnectorTests(unittest.TestCase):
             "openarchiver_base_url": "http://openarchiver.openarchiver.svc.cluster.local:3000/api/v1",
             "openarchiver_api_key_file": oa_key,
             "openrag_base_url": "http://openrag-backend:8000",
-            "openrag_ingest_path": "/v1/documents/ingest",
+            "openrag_ingest_path": "/v1/documents/ingest-path",
+            "openrag_ingest_directory": root / "openrag-documents" / "openarchiver",
             "openrag_task_path": "/v1/tasks/{task_id}/enhanced",
             "openrag_api_key_file": rag_key,
             "state_db": root / "state" / "connector.sqlite3",
@@ -168,14 +173,24 @@ class ConnectorTests(unittest.TestCase):
                 "INGESTION_CONCURRENCY_MAX": "3",
             }
             loaded = connector.Config.from_env(env)
-            self.assertEqual(connector.read_secret(loaded.openarchiver_api_key_file, "OA"), "oa-secret")
-            self.assertEqual(connector.read_secret(loaded.openrag_api_key_file, "RAG"), "rag-secret")
+            self.assertEqual(
+                connector.read_secret(loaded.openarchiver_api_key_file, "OA"),
+                "oa-secret",
+            )
+            self.assertEqual(
+                connector.read_secret(loaded.openrag_api_key_file, "RAG"), "rag-secret"
+            )
             self.assertEqual(loaded.supported_extensions, frozenset({".pdf", ".xlsx"}))
             self.assertEqual(loaded.ingestion_concurrency, 3)
             self.assertEqual(
                 loaded.openarchiver_base_url,
                 "http://openarchiver-api.openarchiver.svc.cluster.local:4000/v1",
             )
+            self.assertEqual(
+                loaded.openrag_ingest_directory,
+                Path("/shared/openrag-documents/openarchiver"),
+            )
+            self.assertEqual(loaded.openrag_ingest_path, "/v1/documents/ingest-path")
 
             defaults = connector.Config.from_env(
                 {
@@ -188,8 +203,17 @@ class ConnectorTests(unittest.TestCase):
                 defaults.supported_extensions,
                 frozenset(
                     {
-                        ".asc", ".asciidoc", ".adoc", ".csv", ".docx", ".htm",
-                        ".html", ".md", ".pdf", ".txt", ".xlsx",
+                        ".asc",
+                        ".asciidoc",
+                        ".adoc",
+                        ".csv",
+                        ".docx",
+                        ".htm",
+                        ".html",
+                        ".md",
+                        ".pdf",
+                        ".txt",
+                        ".xlsx",
                     }
                 ),
             )
@@ -210,20 +234,64 @@ class ConnectorTests(unittest.TestCase):
             config = self.config(Path(directory))
             for _ in range(2):
                 db = connector.connect_db(config)
-                tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                tables = {
+                    row[0]
+                    for row in db.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
                 email_columns = {
                     row["name"] for row in db.execute("PRAGMA table_info(emails)")
                 }
                 db.close()
-            self.assertTrue({"sources", "mailboxes", "emails", "attachments", "email_attachments", "settings"} <= tables)
+            self.assertTrue(
+                {
+                    "sources",
+                    "mailboxes",
+                    "emails",
+                    "attachments",
+                    "email_attachments",
+                    "settings",
+                }
+                <= tables
+            )
             self.assertIn("sha256", email_columns)
             self.assertIn("mailbox_path", email_columns)
             self.assertFalse(connector.is_paused(config))
 
+    def test_legacy_markdown_mail_is_requeued_as_original_eml(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            email = connector._validate_email(self.mail("mail-1"), "source-1")
+            db = connector.connect_db(config)
+            connector._upsert_email(db, email, 1)
+            db.execute(
+                """UPDATE emails SET openrag_filename=?, status='validated',
+                   sha256='old', task_id='old-task' WHERE id=?""",
+                ("openarchiver-mail-mail-1.md", "mail-1"),
+            )
+            connector._upsert_email(db, email, 2)
+            row = db.execute("SELECT * FROM emails WHERE id='mail-1'").fetchone()
+            db.commit()
+            db.close()
+            self.assertEqual(row["openrag_filename"], "openarchiver-mail-mail-1.eml")
+            self.assertEqual(row["status"], "queued")
+            self.assertEqual(row["sha256"], "")
+            self.assertEqual(row["task_id"], "")
+
     def test_refresh_and_select_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
-            client = FakeArchive(sources=[{"id": "root", "name": "Racine", "provider": "imap", "mergedIntoId": None}])
+            client = FakeArchive(
+                sources=[
+                    {
+                        "id": "root",
+                        "name": "Racine",
+                        "provider": "imap",
+                        "mergedIntoId": None,
+                    }
+                ]
+            )
             connector.refresh_sources(config, client)
             connector.set_source_selected(config, "root", True)
             self.assertEqual(connector.selected_source_ids(config), ["root"])
@@ -253,23 +321,35 @@ class ConnectorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
             self.select(config, "source-1")
-            client = FakeArchive(pages={
-                ("source-1", 1): {"items": [self.mail("a"), self.mail("b")], "total": 3},
-                ("source-1", 2): {"items": [self.mail("c")], "total": 3},
-            })
+            client = FakeArchive(
+                pages={
+                    ("source-1", 1): {
+                        "items": [self.mail("a"), self.mail("b")],
+                        "total": 3,
+                    },
+                    ("source-1", 2): {"items": [self.mail("c")], "total": 3},
+                }
+            )
             result = connector.scan_selected_sources(config, client)
             self.assertEqual(result, connector.ScanResult(1, 3, True, False))
-            self.assertEqual([row["status"] for row in self.rows(config, "emails")], ["queued"] * 3)
+            self.assertEqual(
+                [row["status"] for row in self.rows(config, "emails")], ["queued"] * 3
+            )
 
     def test_duplicate_uuid_across_overlapping_merged_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory), page_limit=10)
             self.select(config, "root", "child")
             shared = self.mail("same", "child")
-            client = FakeArchive(pages={
-                ("root", 1): {"items": [shared, self.mail("root-only", "root")], "total": 2},
-                ("child", 1): {"items": [shared], "total": 1},
-            })
+            client = FakeArchive(
+                pages={
+                    ("root", 1): {
+                        "items": [shared, self.mail("root-only", "root")],
+                        "total": 2,
+                    },
+                    ("child", 1): {"items": [shared], "total": 1},
+                }
+            )
             result = connector.scan_selected_sources(config, client)
             self.assertTrue(result.complete)
             self.assertEqual(result.emails, 2)
@@ -282,11 +362,7 @@ class ConnectorTests(unittest.TestCase):
             child_mail = self.mail("child-mail", "child")
             result = connector.scan_selected_sources(
                 config,
-                FakeArchive(
-                    pages={
-                        ("root", 1): {"items": [child_mail], "total": 1}
-                    }
-                ),
+                FakeArchive(pages={("root", 1): {"items": [child_mail], "total": 1}}),
             )
             self.assertTrue(result.complete)
             row = self.rows(config, "emails")[0]
@@ -298,16 +374,18 @@ class ConnectorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
             self.select(config, "source-1")
-            client = FakeArchive(pages={
-                ("source-1", 1): [
-                    {"items": [self.mail("a"), self.mail("b")], "total": 3},
-                    {"items": [self.mail("a"), self.mail("b")], "total": 3},
-                ],
-                ("source-1", 2): [
-                    {"items": [self.mail("b")], "total": 3},
-                    {"items": [self.mail("c")], "total": 3},
-                ],
-            })
+            client = FakeArchive(
+                pages={
+                    ("source-1", 1): [
+                        {"items": [self.mail("a"), self.mail("b")], "total": 3},
+                        {"items": [self.mail("a"), self.mail("b")], "total": 3},
+                    ],
+                    ("source-1", 2): [
+                        {"items": [self.mail("b")], "total": 3},
+                        {"items": [self.mail("c")], "total": 3},
+                    ],
+                }
+            )
             result = connector.scan_selected_sources(config, client)
             self.assertTrue(result.complete)
             self.assertTrue(result.repeated)
@@ -317,42 +395,56 @@ class ConnectorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
             self.select(config, "source-1")
-            stable = FakeArchive(pages={
-                ("source-1", 1): {"items": [self.mail("a"), self.mail("b")], "total": 2}
-            })
+            stable = FakeArchive(
+                pages={
+                    ("source-1", 1): {
+                        "items": [self.mail("a"), self.mail("b")],
+                        "total": 2,
+                    }
+                }
+            )
             connector.scan_selected_sources(config, stable)
-            broken = FakeArchive(pages={
-                ("source-1", 1): [
-                    {"items": [self.mail("a")], "total": 2},
-                    {"items": [self.mail("a")], "total": 2},
-                ]
-            })
+            broken = FakeArchive(
+                pages={
+                    ("source-1", 1): [
+                        {"items": [self.mail("a")], "total": 2},
+                        {"items": [self.mail("a")], "total": 2},
+                    ]
+                }
+            )
             result = connector.scan_selected_sources(config, broken)
             self.assertFalse(result.complete)
-            self.assertNotIn("missing", [row["status"] for row in self.rows(config, "emails")])
+            self.assertNotIn(
+                "missing", [row["status"] for row in self.rows(config, "emails")]
+            )
 
     def test_unchanged_mail_stays_validated_and_changed_mail_is_requeued(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory), page_limit=10)
             self.select(config, "source-1")
             original = self.mail("a")
-            connector.scan_selected_sources(config, FakeArchive(pages={
-                ("source-1", 1): {"items": [original], "total": 1}
-            }))
+            connector.scan_selected_sources(
+                config,
+                FakeArchive(pages={("source-1", 1): {"items": [original], "total": 1}}),
+            )
             db = connector.connect_db(config)
             db.execute(
                 "UPDATE emails SET status='validated', last_success_at=10, sha256='old-sha'"
             )
             db.commit()
             db.close()
-            connector.scan_selected_sources(config, FakeArchive(pages={
-                ("source-1", 1): {"items": [dict(original)], "total": 1}
-            }))
+            connector.scan_selected_sources(
+                config,
+                FakeArchive(
+                    pages={("source-1", 1): {"items": [dict(original)], "total": 1}}
+                ),
+            )
             self.assertEqual(self.rows(config, "emails")[0]["status"], "validated")
             changed = dict(original, storageHashSha256="new-hash")
-            connector.scan_selected_sources(config, FakeArchive(pages={
-                ("source-1", 1): {"items": [changed], "total": 1}
-            }))
+            connector.scan_selected_sources(
+                config,
+                FakeArchive(pages={("source-1", 1): {"items": [changed], "total": 1}}),
+            )
             row = self.rows(config, "emails")[0]
             self.assertEqual(row["status"], "queued")
             self.assertEqual(row["sha256"], "")
@@ -395,7 +487,9 @@ class ConnectorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
             calls = []
-            error = urllib.error.HTTPError("url", 429, "limited", {"Retry-After": "2"}, None)
+            error = urllib.error.HTTPError(
+                "url", 429, "limited", {"Retry-After": "2"}, None
+            )
             outcomes = [error, Response(b"[]")]
 
             def opener(*_args, **_kwargs):
@@ -404,7 +498,9 @@ class ConnectorTests(unittest.TestCase):
                     raise value
                 return value
 
-            client = connector.OpenArchiverClient(config, opener=opener, sleeper=calls.append)
+            client = connector.OpenArchiverClient(
+                config, opener=opener, sleeper=calls.append
+            )
             self.assertEqual(client.list_sources(), [])
             self.assertEqual(calls, [2.0])
 
@@ -412,11 +508,17 @@ class ConnectorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
             for status in (401, 403, 404):
+
                 def opener(*_args, _status=status, **_kwargs):
                     raise urllib.error.HTTPError("url", _status, "error", {}, None)
 
-                client = connector.OpenArchiverClient(config, opener=opener, sleeper=lambda _s: None)
-                with self.subTest(status=status), self.assertRaises(connector.HTTPStatusError) as caught:
+                client = connector.OpenArchiverClient(
+                    config, opener=opener, sleeper=lambda _s: None
+                )
+                with (
+                    self.subTest(status=status),
+                    self.assertRaises(connector.HTTPStatusError) as caught,
+                ):
                     client.list_sources()
                 self.assertEqual(caught.exception.status, status)
 
@@ -427,7 +529,9 @@ class ConnectorTests(unittest.TestCase):
                 raise urllib.error.HTTPError("url", 503, "error", {}, None)
 
             with self.assertRaises(connector.HTTPStatusError):
-                connector.OpenArchiverClient(config, opener=temporary, sleeper=lambda _s: None).list_sources()
+                connector.OpenArchiverClient(
+                    config, opener=temporary, sleeper=lambda _s: None
+                ).list_sources()
             self.assertEqual(len(attempts), config.max_auto_retries)
 
     def test_timeout_and_invalid_json_are_sanitised(self):
@@ -440,7 +544,9 @@ class ConnectorTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(connector.ConnectorError, "indisponible"):
                 timeout_client.list_sources()
-            invalid = connector.OpenArchiverClient(config, opener=lambda *_a, **_k: Response(b"not-json"))
+            invalid = connector.OpenArchiverClient(
+                config, opener=lambda *_a, **_k: Response(b"not-json")
+            )
             with self.assertRaisesRegex(connector.ConnectorError, "JSON"):
                 invalid.list_sources()
 
@@ -477,7 +583,9 @@ class ConnectorTests(unittest.TestCase):
             message["From"] = "Élodie Test <sender@example.invalid>"
             message["To"] = "Destinataire <reader@example.invalid>"
             message.set_content("Bonjour\n-- signature")
-            body, headers = connector.parse_eml(self.write_message(Path(directory), message))
+            body, headers = connector.parse_eml(
+                self.write_message(Path(directory), message)
+            )
             self.assertIn("Bonjour", body)
             self.assertIn("Élodie", headers["from"][0])
 
@@ -506,7 +614,9 @@ class ConnectorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             message = EmailMessage()
             message.add_header("Content-Type", "text/html; charset=utf-8")
-            message.set_payload("<style>secret-css</style><p>Bonjour <b>monde</b></p><script>secret-js</script>")
+            message.set_payload(
+                "<style>secret-css</style><p>Bonjour <b>monde</b></p><script>secret-js</script>"
+            )
             body, _ = connector.parse_eml(self.write_message(Path(directory), message))
             self.assertEqual(body, "Bonjour monde")
 
@@ -520,15 +630,35 @@ class ConnectorTests(unittest.TestCase):
 
     def test_markdown_is_stable_and_does_not_copy_thread_bodies(self):
         row = {
-            "id": "mail-1", "subject": "Sujet", "source_id": "source-1",
-            "thread_id": "thread-1", "sent_at": "2026-01-01",
-            "sender_name": "Alice", "sender_email": "alice@example.invalid",
-            "recipients_json": '["Bob <bob@example.invalid>"]', "cc_json": "[]",
+            "id": "mail-1",
+            "subject": "Sujet",
+            "source_id": "source-1",
+            "thread_id": "thread-1",
+            "sent_at": "2026-01-01",
+            "sender_name": "Alice",
+            "sender_email": "alice@example.invalid",
+            "recipients_json": '["Bob <bob@example.invalid>"]',
+            "cc_json": "[]",
             "message_id": "<mail-1@example.invalid>",
         }
-        attachments = [{"id": "pj-2", "filename": "été.pdf"}, {"id": "pj-1", "filename": "a.txt"}]
-        first = connector.render_mail_markdown(row, "Corps courant", attachments, source_name="Archive", link_template="https://oa.invalid/dashboard/archived-emails/{email_id}")
-        second = connector.render_mail_markdown(row, "Corps courant", list(reversed(attachments)), source_name="Archive", link_template="https://oa.invalid/dashboard/archived-emails/{email_id}")
+        attachments = [
+            {"id": "pj-2", "filename": "été.pdf"},
+            {"id": "pj-1", "filename": "a.txt"},
+        ]
+        first = connector.render_mail_markdown(
+            row,
+            "Corps courant",
+            attachments,
+            source_name="Archive",
+            link_template="https://oa.invalid/dashboard/archived-emails/{email_id}",
+        )
+        second = connector.render_mail_markdown(
+            row,
+            "Corps courant",
+            list(reversed(attachments)),
+            source_name="Archive",
+            link_template="https://oa.invalid/dashboard/archived-emails/{email_id}",
+        )
         self.assertEqual(first, second)
         self.assertIn("Corps courant", first)
         self.assertNotIn("corps d'un autre mail", first)
@@ -559,13 +689,25 @@ class ConnectorTests(unittest.TestCase):
             config = self.config(Path(directory))
             self._insert_email(config, self.mail("mail-1"))
             self._insert_email(config, self.mail("mail-2"))
-            detail = {"attachments": [{"id": "att-1", "filename": "Classeur été.XLSX", "mimeType": "application/test", "sizeBytes": 10, "storagePath": "att/1"}]}
+            detail = {
+                "attachments": [
+                    {
+                        "id": "att-1",
+                        "filename": "Classeur été.XLSX",
+                        "mimeType": "application/test",
+                        "sizeBytes": 10,
+                        "storagePath": "att/1",
+                    }
+                ]
+            }
             connector.inventory_attachments(config, "mail-1", detail)
             connector.inventory_attachments(config, "mail-2", detail)
             rows = self.rows(config, "attachments")
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["status"], "queued")
-            self.assertEqual(rows[0]["openrag_filename"], "openarchiver-attachment-att-1.xlsx")
+            self.assertEqual(
+                rows[0]["openrag_filename"], "openarchiver-attachment-att-1.xlsx"
+            )
             db = connector.connect_db(config)
             links = db.execute("SELECT COUNT(*) FROM email_attachments").fetchone()[0]
             db.close()
@@ -575,23 +717,46 @@ class ConnectorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory), max_file_bytes=10)
             self._insert_email(config)
-            detail = {"attachments": [
-                {"id": "large", "filename": "large.pdf", "sizeBytes": 11, "storagePath": "att/large"},
-                {"id": "unknown", "filename": "archive.exe", "sizeBytes": 1, "storagePath": "att/unknown"},
-            ]}
+            detail = {
+                "attachments": [
+                    {
+                        "id": "large",
+                        "filename": "large.pdf",
+                        "sizeBytes": 11,
+                        "storagePath": "att/large",
+                    },
+                    {
+                        "id": "unknown",
+                        "filename": "archive.exe",
+                        "sizeBytes": 1,
+                        "storagePath": "att/unknown",
+                    },
+                ]
+            }
             connector.inventory_attachments(config, "mail-1", detail)
             rows = self.rows(config, "attachments")
-            self.assertEqual([row["status"] for row in rows], ["non_indexable", "non_indexable"])
-            self.assertEqual(connector.attachment_openrag_filename("x", "../../evil.EXE"), "openarchiver-attachment-x.exe")
+            self.assertEqual(
+                [row["status"] for row in rows], ["non_indexable", "non_indexable"]
+            )
+            self.assertEqual(
+                connector.attachment_openrag_filename("x", "../../evil.EXE"),
+                "openarchiver-attachment-x.exe",
+            )
 
     def test_changed_attachment_resets_transient_ingestion_state(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
             self._insert_email(config)
-            detail = {"attachments": [{
-                "id": "att", "filename": "doc.pdf", "sizeBytes": 4,
-                "storagePath": "att/old",
-            }]}
+            detail = {
+                "attachments": [
+                    {
+                        "id": "att",
+                        "filename": "doc.pdf",
+                        "sizeBytes": 4,
+                        "storagePath": "att/old",
+                    }
+                ]
+            }
             connector.inventory_attachments(config, "mail-1", detail)
             db = connector.connect_db(config)
             db.execute(
@@ -621,29 +786,72 @@ class ConnectorTests(unittest.TestCase):
             root = Path(directory)
             config = self.config(root)
             response = Response(chunks=[b"abc", b"def"])
-            client = connector.OpenArchiverClient(config, opener=lambda *_a, **_k: response)
+            client = connector.OpenArchiverClient(
+                config, opener=lambda *_a, **_k: response
+            )
             destination = root / "download"
             size, digest = client.download("path", destination)
             self.assertEqual(size, 6)
-            self.assertEqual(digest, "bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721")
+            self.assertEqual(
+                digest,
+                "bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721",
+            )
             self.assertEqual(destination.read_bytes(), b"abcdef")
 
     def test_download_enforces_maximum_size(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = self.config(root, max_file_bytes=3)
-            client = connector.OpenArchiverClient(config, opener=lambda *_a, **_k: Response(chunks=[b"abcd"]))
+            client = connector.OpenArchiverClient(
+                config, opener=lambda *_a, **_k: Response(chunks=[b"abcd"])
+            )
             with self.assertRaisesRegex(connector.ConnectorError, "volumineux"):
                 client.download("path", root / "download")
+
+    def test_deposit_source_publishes_atomically_and_cleans_partial_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            archive = FakeArchive(downloads={"mail/source.eml": b"raw source"})
+            destination, size, digest = connector.deposit_source(
+                config, archive, "mail/source.eml", "source.eml"
+            )
+            self.assertEqual(destination.read_bytes(), b"raw source")
+            self.assertEqual(size, 10)
+            self.assertEqual(
+                digest,
+                "16911a2110ab626e1b62476366de38bba71cadcea22d02df42d701aba6cdd409",
+            )
+            self.assertEqual(list(config.openrag_ingest_directory.glob("*.part")), [])
+
+            class FailingArchive:
+                def download(self, _storage_path, temporary):
+                    temporary.write_bytes(b"partial")
+                    raise connector.ConnectorError("download failed")
+
+            with self.assertRaisesRegex(connector.ConnectorError, "download failed"):
+                connector.deposit_source(
+                    config, FailingArchive(), "mail/failure.eml", "failure.eml"
+                )
+            self.assertFalse((config.openrag_ingest_directory / "failure.eml").exists())
+            self.assertEqual(list(config.openrag_ingest_directory.glob("*.part")), [])
 
     def test_openrag_task_success_and_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
             client = connector.OpenRAGClient(config, sleeper=lambda _s: None)
-            with mock.patch.object(client, "task", return_value={"status": "completed", "failed_files": 0}):
+            with mock.patch.object(
+                client, "task", return_value={"status": "completed", "failed_files": 0}
+            ):
                 client.wait("ok")
-            with mock.patch.object(client, "task", return_value={"status": "completed", "failed_files": ["file"]}):
-                with self.assertRaisesRegex(connector.ConnectorError, "fichiers en échec"):
+            with mock.patch.object(
+                client,
+                "task",
+                return_value={"status": "completed", "failed_files": ["file"]},
+            ):
+                with self.assertRaisesRegex(
+                    connector.ConnectorError, "fichiers en échec"
+                ):
                     client.wait("bad")
             with mock.patch.object(client, "task", return_value={"status": "failed"}):
                 with self.assertRaisesRegex(connector.ConnectorError, "failed"):
@@ -664,47 +872,169 @@ class ConnectorTests(unittest.TestCase):
                 task.call_args_list[1].kwargs["path"], "/v1/tasks/task%2Fid"
             )
 
-    def test_openrag_upload_uses_multipart_replace_duplicates(self):
+    def test_openrag_ingest_path_uses_json_replace_duplicates(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = self.config(root)
-            document = root / "document.md"
+            document = config.openrag_ingest_directory / "document.eml"
+            document.parent.mkdir(parents=True)
             document.write_text("contenu", encoding="utf-8")
 
-            class Connection:
-                instance = None
-
-                def __init__(self, host, port, timeout):
-                    self.host, self.port, self.timeout = host, port, timeout
-                    self.headers = {}
-                    self.sent = []
-                    Connection.instance = self
-
-                def putrequest(self, method, target):
-                    self.method, self.target = method, target
-
-                def putheader(self, name, value):
-                    self.headers[name] = value
-
-                def endheaders(self):
-                    pass
-
-                def send(self, data):
-                    self.sent.append(data)
-
-                def getresponse(self):
-                    return Response(b'{"task_id":"task-upload"}')
-
-                def close(self):
-                    pass
-
-            with mock.patch.object(connector.http.client, "HTTPConnection", Connection):
-                task_id = connector.OpenRAGClient(config).upload(document, "stable.md")
+            opener = mock.Mock(return_value=Response(b'{"task_id":"task-upload"}'))
+            with mock.patch.object(connector.urllib.request, "urlopen", opener):
+                task_id = connector.OpenRAGClient(config).ingest_path(document)
             self.assertEqual(task_id, "task-upload")
-            self.assertEqual(Connection.instance.method, "POST")
-            body = b"".join(Connection.instance.sent)
-            self.assertIn(b'name="replace_duplicates"\r\n\r\ntrue', body)
-            self.assertIn(b'filename="stable.md"', body)
+            request = opener.call_args.args[0]
+            self.assertEqual(request.method, "POST")
+            self.assertEqual(
+                json.loads(request.data),
+                {"path": str(document.resolve()), "replace_duplicates": True},
+            )
+            self.assertEqual(request.headers["Content-type"], "application/json")
+
+    def test_openrag_ingest_path_rejects_a_path_outside_shared_inbox(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            outside = root / "outside.eml"
+            outside.write_bytes(b"source")
+            with self.assertRaisesRegex(connector.ConnectorError, "hors du dossier"):
+                connector.OpenRAGClient(config).ingest_path(outside)
+
+    def test_multipart_upload_disables_local_archive_and_forwards_source_url(self):
+        class Connection:
+            def __init__(self):
+                self.target = ""
+                self.headers = {}
+                self.body = bytearray()
+
+            def putrequest(self, method, target):
+                self.method = method
+                self.target = target
+
+            def putheader(self, name, value):
+                self.headers[name.lower()] = value
+
+            def endheaders(self):
+                pass
+
+            def send(self, content):
+                self.body.extend(content)
+
+            def getresponse(self):
+                return Response(b'{"task_id":"task-api"}')
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            document = root / "document.eml"
+            document.write_bytes(b"raw-source")
+            connection = Connection()
+            with mock.patch.object(
+                connector.http.client,
+                "HTTPConnection",
+                return_value=connection,
+            ):
+                task_id = connector.OpenRAGClient(config).upload(
+                    document,
+                    "document.eml",
+                    "https://archive.example.test/source.eml",
+                )
+
+            body = bytes(connection.body)
+            self.assertEqual(task_id, "task-api")
+            self.assertEqual(connection.method, "POST")
+            self.assertEqual(connection.target, "/v1/documents/ingest")
+            self.assertEqual(int(connection.headers["content-length"]), len(body))
+            self.assertIn(
+                b'name="archive_source"\r\n\r\nfalse\r\n',
+                body,
+            )
+            self.assertIn(
+                b'name="source_url"\r\n\r\nhttps://archive.example.test/source.eml\r\n',
+                body,
+            )
+            self.assertIn(b"raw-source", body)
+
+    def test_remote_source_url_template_is_encoded_and_optional(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root)
+            self.assertIsNone(
+                connector.render_remote_source_url(
+                    config,
+                    kind="email",
+                    object_id="mail-1",
+                    storage_path="mail/source.eml",
+                    email_id="mail-1",
+                )
+            )
+            configured = self.config(
+                root,
+                openarchiver_source_url_template=(
+                    "https://archive.example.test/api/v1/storage/download"
+                    "?path={storage_path}"
+                ),
+            )
+            self.assertEqual(
+                connector.render_remote_source_url(
+                    configured,
+                    kind="email",
+                    object_id="mail-1",
+                    storage_path="mail/a source.eml",
+                    email_id="mail-1",
+                ),
+                "https://archive.example.test/api/v1/storage/download"
+                "?path=mail%2Fa%20source.eml",
+            )
+            invalid = self.config(
+                root,
+                openarchiver_source_url_template=(
+                    "https://archive.example.test/source\x7f/{object_id}"
+                ),
+            )
+            with self.assertRaisesRegex(connector.ConnectorError, "invalide"):
+                connector.render_remote_source_url(
+                    invalid,
+                    kind="email",
+                    object_id="mail-1",
+                    storage_path="mail/source.eml",
+                    email_id="mail-1",
+                )
+
+    def test_auto_mode_falls_back_to_multipart_and_reuses_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(root, openrag_ingest_mode="auto")
+            document = config.openrag_ingest_directory / "document.eml"
+            document.parent.mkdir(parents=True)
+            document.write_bytes(b"source")
+            client = connector.OpenRAGClient(config)
+            with (
+                mock.patch.object(
+                    client,
+                    "ingest_path",
+                    side_effect=connector.HTTPStatusError(403, "ingestion OpenRAG"),
+                ) as ingest_path,
+                mock.patch.object(client, "upload", return_value="task-api") as upload,
+            ):
+                first = client.ingest_source(
+                    document, "https://archive.example.test/source.eml"
+                )
+                second = client.ingest_source(document)
+
+            self.assertEqual(first, ("task-api", True))
+            self.assertEqual(second, ("task-api", True))
+            ingest_path.assert_called_once_with(document)
+            self.assertEqual(upload.call_count, 2)
+            upload.assert_any_call(
+                document,
+                "document.eml",
+                "https://archive.example.test/source.eml",
+            )
 
     def test_runtime_cycle_refreshes_sources_without_implicit_selection(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -814,9 +1144,9 @@ class ConnectorTests(unittest.TestCase):
         middleware_headers = (root / "middleware-headers.yaml").read_text(
             encoding="utf-8"
         )
-        middleware_redirect = (
-            root / "middleware-redirect-https.yaml"
-        ).read_text(encoding="utf-8")
+        middleware_redirect = (root / "middleware-redirect-https.yaml").read_text(
+            encoding="utf-8"
+        )
         hostname = "openrag-openarchiver-connector.ferme-de-pommerieux.fr"
         self.assertIn("automountServiceAccountToken: false", deployment)
         self.assertIn("readOnlyRootFilesystem: true", deployment)
@@ -827,6 +1157,10 @@ class ConnectorTests(unittest.TestCase):
         )
         self.assertIn("openarchiver-api-key", deployment)
         self.assertIn("openrag-api-key", deployment)
+        self.assertIn("OPENRAG_INGEST_DIRECTORY", deployment)
+        self.assertIn("/shared/openrag-documents/openarchiver", deployment)
+        self.assertIn("/v1/documents/ingest-path", deployment)
+        self.assertIn("claimName: openrag-shared", deployment)
         self.assertIn("type: ClusterIP", service)
         self.assertNotIn("NodePort", service)
         self.assertIn(hostname, ingress_http)
@@ -843,7 +1177,9 @@ class ConnectorTests(unittest.TestCase):
         )
         self.assertIn("contentTypeNosniff: true", middleware_headers)
         self.assertIn("scheme: https", middleware_redirect)
-        self.assertNotIn("ipAllowList", "\n".join((middleware_auth, middleware_headers)))
+        self.assertNotIn(
+            "ipAllowList", "\n".join((middleware_auth, middleware_headers))
+        )
         for resource in (
             "pvc.yaml",
             "deployment.yaml",
@@ -958,9 +1294,7 @@ class ConnectorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
             with self.assertRaisesRegex(connector.ConnectorError, "inconnu"):
-                connector.replace_mailbox_selection(
-                    config, [("source-1", "INBOX")]
-                )
+                connector.replace_mailbox_selection(config, [("source-1", "INBOX")])
 
     def test_deselected_mailbox_blocks_an_existing_attachment(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -996,9 +1330,9 @@ class ConnectorTests(unittest.TestCase):
         manifest = (
             MODULE_PATH.parents[3] / "apps/openarchiver/openarchiver.yaml"
         ).read_text(encoding="utf-8")
-        api_service = manifest.split("  name: openarchiver-api", 1)[1].split(
-            "---", 1
-        )[0]
+        api_service = manifest.split("  name: openarchiver-api", 1)[1].split("---", 1)[
+            0
+        ]
         self.assertIn("type: ClusterIP", api_service)
         self.assertIn("port: 4000", api_service)
         self.assertIn("targetPort: backend", api_service)
@@ -1021,36 +1355,72 @@ class ConnectorTests(unittest.TestCase):
                 row["sha256"],
                 connector.hashlib.sha256(message.as_bytes()).hexdigest(),
             )
-            self.assertEqual(rag.uploads[0][0], "openarchiver-mail-mail-1.md")
-            self.assertIn(b"Corps sans donn", rag.uploads[0][1])
+            self.assertEqual(rag.uploads[0][0], "openarchiver-mail-mail-1.eml")
+            self.assertEqual(rag.uploads[0][1], message.as_bytes())
 
     def test_attachment_process_stream_hash_and_validate(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
             self._insert_email(config)
-            connector.inventory_attachments(config, "mail-1", {"attachments": [{"id": "att", "filename": "doc.pdf", "sizeBytes": 4, "storagePath": "att/path"}]})
+            connector.inventory_attachments(
+                config,
+                "mail-1",
+                {
+                    "attachments": [
+                        {
+                            "id": "att",
+                            "filename": "doc.pdf",
+                            "sizeBytes": 4,
+                            "storagePath": "att/path",
+                        }
+                    ]
+                },
+            )
             db = connector.connect_db(config)
             db.execute("UPDATE emails SET status='validated'")
             db.commit()
             db.close()
             item = connector.claim_next(config, now=1)
-            connector.process_work_item(config, item, FakeArchive(downloads={"att/path": b"data"}), FakeOpenRAG())
+            connector.process_work_item(
+                config,
+                item,
+                FakeArchive(downloads={"att/path": b"data"}),
+                FakeOpenRAG(),
+            )
             row = self.rows(config, "attachments")[0]
             self.assertEqual(row["status"], "validated")
-            self.assertEqual(row["sha256"], "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7")
+            self.assertEqual(
+                row["sha256"],
+                "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7",
+            )
 
     def test_attachment_actual_oversize_becomes_non_indexable_without_upload(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory), max_file_bytes=3)
             self._insert_email(config)
-            connector.inventory_attachments(config, "mail-1", {"attachments": [{"id": "att", "filename": "doc.pdf", "sizeBytes": 0, "storagePath": "att/path"}]})
+            connector.inventory_attachments(
+                config,
+                "mail-1",
+                {
+                    "attachments": [
+                        {
+                            "id": "att",
+                            "filename": "doc.pdf",
+                            "sizeBytes": 0,
+                            "storagePath": "att/path",
+                        }
+                    ]
+                },
+            )
             db = connector.connect_db(config)
             db.execute("UPDATE emails SET status='validated'")
             db.commit()
             db.close()
             item = connector.claim_next(config, now=1)
             rag = FakeOpenRAG()
-            connector.process_work_item(config, item, FakeArchive(downloads={"att/path": b"four"}), rag)
+            connector.process_work_item(
+                config, item, FakeArchive(downloads={"att/path": b"four"}), rag
+            )
             row = self.rows(config, "attachments")[0]
             self.assertEqual(row["status"], "non_indexable")
             self.assertEqual(rag.uploads, [])
@@ -1059,8 +1429,15 @@ class ConnectorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory), max_auto_retries=2)
             self._insert_email(config)
-            archive = FakeArchive(downloads={"mail/mail-1.eml": b"Subject: test\r\n\r\nbody"})
-            connector.process_work_item(config, connector.claim_next(config, now=1), archive, FakeOpenRAG(fail=True))
+            archive = FakeArchive(
+                downloads={"mail/mail-1.eml": b"Subject: test\r\n\r\nbody"}
+            )
+            connector.process_work_item(
+                config,
+                connector.claim_next(config, now=1),
+                archive,
+                FakeOpenRAG(fail=True),
+            )
             row = self.rows(config, "emails")[0]
             self.assertEqual(row["status"], "failed")
             self.assertGreater(row["next_retry_at"], 0)
@@ -1068,7 +1445,12 @@ class ConnectorTests(unittest.TestCase):
             db.execute("UPDATE emails SET next_retry_at=1")
             db.commit()
             db.close()
-            connector.process_work_item(config, connector.claim_next(config, now=2), archive, FakeOpenRAG(fail=True))
+            connector.process_work_item(
+                config,
+                connector.claim_next(config, now=2),
+                archive,
+                FakeOpenRAG(fail=True),
+            )
             row = self.rows(config, "emails")[0]
             self.assertEqual(row["attempts"], 2)
             self.assertEqual(row["next_retry_at"], 0)
@@ -1126,12 +1508,16 @@ class ConnectorTests(unittest.TestCase):
             self._insert_email(config)
             item = connector.claim_next(config, now=1)
             body = "CORPS-TRES-SECRET"
-            archive = FakeArchive(downloads={"mail/mail-1.eml": f"Subject: test\r\n\r\n{body}".encode()})
+            archive = FakeArchive(
+                downloads={"mail/mail-1.eml": f"Subject: test\r\n\r\n{body}".encode()}
+            )
             stream = io.StringIO()
             handler = logging.StreamHandler(stream)
             connector.LOG.addHandler(handler)
             try:
-                connector.process_work_item(config, item, archive, FakeOpenRAG(fail=True))
+                connector.process_work_item(
+                    config, item, archive, FakeOpenRAG(fail=True)
+                )
             finally:
                 connector.LOG.removeHandler(handler)
             logs = stream.getvalue()

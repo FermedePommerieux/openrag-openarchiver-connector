@@ -1,20 +1,14 @@
-"""Cœur du connecteur OpenArchiver vers OpenRAG.
+"""Cœur du connecteur OpenArchiver vers le dossier d'ingestion OpenRAG.
 
-Ce que l'on veut : sélectionner des sources et dossiers IMAP OpenArchiver,
-mettre leur indexation en pause, et produire dans OpenRAG un Markdown stable
-par mail ainsi que chaque pièce jointe compatible.
-Pourquoi : rendre les archives interrogeables sans coupler les deux projets ni
-recharger les contenus déjà connus à chacun des scans.
-Comment : parcourir l'API OpenArchiver de manière conservative, conserver les
-identités, dossiers, sélections, pause et file dans SQLite, puis utiliser l'API
-publique OpenRAG.
-Compatibilité : le protocole multipart, le suivi des tâches et les réservations
-SQLite reprennent les principes éprouvés du connecteur NAS sans le modifier.
-KISS : un module Python standard, un fichier SQLite, aucun fork, broker,
-framework web, accès PostgreSQL, montage NFS ou accès Kubernetes.
+Le connecteur conserve son inventaire, ses sélections, ses reprises et son
+rate limiting dans SQLite. Pour l'ingestion, il dépose désormais les messages
+originaux ``.eml`` et les pièces jointes compatibles dans le volume partagé,
+par renommage atomique, puis déclenche l'API ``ingest-path`` d'OpenRAG.
 
-Hypothèse à confirmer au runtime : ``replace_duplicates=true`` remplace bien
-le document OpenRAG portant le même nom. Aucun appel DELETE n'est implémenté.
+OpenRAG reste ainsi seul responsable du traitement et, lorsque l'archivage est
+activé dans Settings > Archiving, du déplacement de la source vers son archive
+authentifiée. En mode multi-utilisateur, le refus du chemin local déclenche un
+repli vers l'upload multipart, avec une ``source_url`` distante facultative.
 """
 
 from __future__ import annotations
@@ -29,10 +23,8 @@ import os
 import re
 import signal
 import sqlite3
-import tempfile
 import threading
 import time
-import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -65,9 +57,7 @@ ALL_STATUSES = (
     "missing",
     "unavailable",
 )
-DEFAULT_EXTENSIONS = (
-    ".asc,.asciidoc,.adoc,.csv,.docx,.htm,.html,.md,.pdf,.txt,.xlsx"
-)
+DEFAULT_EXTENSIONS = ".asc,.asciidoc,.adoc,.csv,.docx,.htm,.html,.md,.pdf,.txt,.xlsx"
 SAFE_EXTENSION = re.compile(r"^\.[a-z0-9]{1,10}$")
 STOP = threading.Event()
 WAKE = threading.Event()
@@ -100,6 +90,9 @@ class Config:
     openrag_task_path: str
     openrag_api_key_file: Path
     state_db: Path
+    openrag_ingest_directory: Path = Path("/shared/openrag-documents/openarchiver")
+    openrag_ingest_mode: str = "auto"
+    openrag_upload_path: str = "/v1/documents/ingest"
     scan_interval_seconds: int = 3600
     task_timeout_seconds: int = 3600
     max_file_bytes: int = 104_857_600
@@ -112,6 +105,7 @@ class Config:
     ingestion_concurrency_max: int = 4
     page_limit: int = 250
     openarchiver_link_template: str = ""
+    openarchiver_source_url_template: str = ""
     request_timeout_seconds: int = 30
     cycle_retry_seconds: int = 60
     http_host: str = "0.0.0.0"
@@ -122,7 +116,9 @@ class Config:
         values = os.environ if env is None else env
         extensions = frozenset(
             _normalise_extension(item)
-            for item in values.get("SUPPORTED_EXTENSIONS", DEFAULT_EXTENSIONS).split(",")
+            for item in values.get("SUPPORTED_EXTENSIONS", DEFAULT_EXTENSIONS).split(
+                ","
+            )
             if item.strip()
         )
         concurrency_max = max(1, int(values.get("INGESTION_CONCURRENCY_MAX", "4")))
@@ -141,7 +137,19 @@ class Config:
                 "OPENRAG_BASE_URL", "http://openrag-backend:8000"
             ).rstrip("/"),
             openrag_ingest_path=values.get(
-                "OPENRAG_INGEST_PATH", "/v1/documents/ingest"
+                "OPENRAG_INGEST_PATH", "/v1/documents/ingest-path"
+            ),
+            openrag_ingest_directory=Path(
+                values.get(
+                    "OPENRAG_INGEST_DIRECTORY",
+                    "/shared/openrag-documents/openarchiver",
+                )
+            ),
+            openrag_ingest_mode=values.get("OPENRAG_INGEST_MODE", "auto")
+            .strip()
+            .lower(),
+            openrag_upload_path=values.get(
+                "OPENRAG_UPLOAD_PATH", "/v1/documents/ingest"
             ),
             openrag_task_path=values.get(
                 "OPENRAG_TASK_PATH", "/v1/tasks/{task_id}/enhanced"
@@ -150,8 +158,12 @@ class Config:
                 values.get("OPENRAG_API_KEY_FILE", "/var/run/secrets/openrag/api-key")
             ),
             state_db=Path(values.get("STATE_DB", "/state/connector.sqlite3")),
-            scan_interval_seconds=max(60, int(values.get("SCAN_INTERVAL_SECONDS", "3600"))),
-            task_timeout_seconds=max(1, int(values.get("TASK_TIMEOUT_SECONDS", "3600"))),
+            scan_interval_seconds=max(
+                60, int(values.get("SCAN_INTERVAL_SECONDS", "3600"))
+            ),
+            task_timeout_seconds=max(
+                1, int(values.get("TASK_TIMEOUT_SECONDS", "3600"))
+            ),
             max_file_bytes=max(1, int(values.get("MAX_FILE_BYTES", "104857600"))),
             max_auto_retries=max(1, int(values.get("MAX_AUTO_RETRIES", "3"))),
             retry_base_seconds=max(1, int(values.get("RETRY_BASE_SECONDS", "300"))),
@@ -166,17 +178,25 @@ class Config:
             ingestion_concurrency_max=concurrency_max,
             page_limit=max(1, int(values.get("OPENARCHIVER_PAGE_LIMIT", "250"))),
             openarchiver_link_template=values.get("OPENARCHIVER_LINK_TEMPLATE", ""),
+            openarchiver_source_url_template=values.get(
+                "OPENARCHIVER_SOURCE_URL_TEMPLATE",
+                values.get("OPENARCHIVER_LINK_TEMPLATE", ""),
+            ),
             request_timeout_seconds=max(
                 1, int(values.get("REQUEST_TIMEOUT_SECONDS", "30"))
             ),
-            cycle_retry_seconds=max(
-                5, int(values.get("CYCLE_RETRY_SECONDS", "60"))
-            ),
+            cycle_retry_seconds=max(5, int(values.get("CYCLE_RETRY_SECONDS", "60"))),
             http_host=values.get("HTTP_HOST", "0.0.0.0"),
             http_port=min(65_535, max(1, int(values.get("HTTP_PORT", "8080")))),
         )
-        _validate_internal_http_url(config.openarchiver_base_url, "OPENARCHIVER_BASE_URL")
+        _validate_internal_http_url(
+            config.openarchiver_base_url, "OPENARCHIVER_BASE_URL"
+        )
         _validate_internal_http_url(config.openrag_base_url, "OPENRAG_BASE_URL")
+        if not config.openrag_ingest_directory.is_absolute():
+            raise ValueError("OPENRAG_INGEST_DIRECTORY doit être un chemin absolu")
+        if config.openrag_ingest_mode not in {"auto", "path", "api"}:
+            raise ValueError("OPENRAG_INGEST_MODE doit être auto, path ou api")
         return config
 
 
@@ -213,6 +233,54 @@ def _validate_internal_http_url(value: str, variable: str) -> None:
     )
     if parsed.scheme != "http" or not internal or parsed.username or parsed.password:
         raise ValueError(f"{variable} doit être une URL HTTP interne sans identifiants")
+
+
+def _validate_source_url(value: str) -> str:
+    url = value.strip()
+    parsed = urllib.parse.urlsplit(url)
+    if (
+        not url
+        or len(url) > 2048
+        or any(ord(character) < 32 or ord(character) == 127 for character in url)
+        or parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ConnectorError("URL de source distante invalide")
+    return url
+
+
+def render_remote_source_url(
+    config: Config,
+    *,
+    kind: str,
+    object_id: str,
+    storage_path: str,
+    email_id: str = "",
+) -> str | None:
+    """Render the optional user-facing OpenArchiver source URL.
+
+    Every interpolated value is percent-encoded so metadata received from
+    OpenArchiver cannot alter the configured URL structure. An empty template
+    intentionally means that multipart ingestion proceeds without source_url.
+    """
+    template = config.openarchiver_source_url_template.strip()
+    if not template:
+        return None
+    encoded_object_id = urllib.parse.quote(object_id, safe="")
+    values = {
+        "kind": kind,
+        "object_id": encoded_object_id,
+        "email_id": urllib.parse.quote(email_id, safe=""),
+        "attachment_id": encoded_object_id if kind == "attachment" else "",
+        "storage_path": urllib.parse.quote(storage_path, safe=""),
+    }
+    try:
+        rendered = template.format_map(values)
+    except (KeyError, ValueError):
+        raise ConnectorError("OPENARCHIVER_SOURCE_URL_TEMPLATE invalide") from None
+    return _validate_source_url(rendered)
 
 
 def read_secret(path: Path, label: str) -> str:
@@ -323,9 +391,7 @@ def connect_db(config: Config) -> sqlite3.Connection:
         db.execute(
             "ALTER TABLE emails ADD COLUMN mailbox_path TEXT NOT NULL DEFAULT ''"
         )
-    db.execute(
-        "INSERT OR IGNORE INTO settings(key,value) VALUES ('paused','0')"
-    )
+    db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES ('paused','0')")
     db.commit()
     return db
 
@@ -377,9 +443,7 @@ def source_rows(config: Config) -> list[sqlite3.Row]:
 
 def is_paused(config: Config) -> bool:
     with database(config) as db:
-        row = db.execute(
-            "SELECT value FROM settings WHERE key='paused'"
-        ).fetchone()
+        row = db.execute("SELECT value FROM settings WHERE key='paused'").fetchone()
         return bool(row and str(row[0]) == "1")
 
 
@@ -430,10 +494,7 @@ def replace_source_selection(config: Config, source_ids: Iterable[str]) -> list[
     """Remplace atomiquement la sélection par des sources déjà découvertes."""
     requested = sorted(set(source_ids))
     with database(config) as db:
-        known = {
-            str(row[0])
-            for row in db.execute("SELECT id FROM sources")
-        }
+        known = {str(row[0]) for row in db.execute("SELECT id FROM sources")}
         unknown = sorted(set(requested) - known)
         if unknown:
             raise ConnectorError("sélection contenant une source inconnue")
@@ -549,7 +610,9 @@ class OpenArchiverClient:
                 if attempt + 1 < attempts:
                     self.sleeper(self._backoff(attempt))
                     continue
-                raise ConnectorError("appel OpenArchiver temporairement indisponible") from None
+                raise ConnectorError(
+                    "appel OpenArchiver temporairement indisponible"
+                ) from None
         raise ConnectorError("appel OpenArchiver épuisé")
 
     def _backoff(self, attempt: int) -> float:
@@ -575,9 +638,7 @@ class OpenArchiverClient:
                 OSError,
             ):
                 if attempt + 1 >= self.config.max_auto_retries:
-                    raise ConnectorError(
-                        "réponse OpenArchiver interrompue"
-                    ) from None
+                    raise ConnectorError("réponse OpenArchiver interrompue") from None
                 self.sleeper(self._backoff(attempt))
                 continue
             finally:
@@ -603,9 +664,7 @@ class OpenArchiverClient:
         return _require_object(payload, "page de mails")
 
     def email_detail(self, email_id: str) -> dict[str, object]:
-        payload = self.json(
-            "/archived-emails/" + urllib.parse.quote(email_id, safe="")
-        )
+        payload = self.json("/archived-emails/" + urllib.parse.quote(email_id, safe=""))
         return _require_object(payload, "détail du mail")
 
     def download(self, storage_path: str, destination: Path) -> tuple[int, str]:
@@ -635,7 +694,9 @@ def _require_object(value: object, label: str) -> dict[str, object]:
     return value
 
 
-def refresh_sources(config: Config, client: OpenArchiverClient) -> list[dict[str, object]]:
+def refresh_sources(
+    config: Config, client: OpenArchiverClient
+) -> list[dict[str, object]]:
     sources = client.list_sources()
     now = int(time.time())
     with database(config) as db:
@@ -679,7 +740,9 @@ def _scan_source_pass(
             raise IncompleteScanError(f"pagination invalide pour la source {source_id}")
         response_limit = payload.get("limit", config.page_limit)
         if not isinstance(response_limit, int) or response_limit < 1:
-            raise IncompleteScanError(f"limite de pagination invalide pour la source {source_id}")
+            raise IncompleteScanError(
+                f"limite de pagination invalide pour la source {source_id}"
+            )
         if announced_total is None:
             announced_total = total
         elif total != announced_total:
@@ -824,7 +887,9 @@ def _normalise_recipients(value: object) -> list[str]:
         elif isinstance(item, dict):
             name = _optional_text(item.get("name"))
             address = _optional_text(item.get("email"))
-            result.append(f"{name} <{address}>" if name and address else address or name)
+            result.append(
+                f"{name} <{address}>" if name and address else address or name
+            )
     return sorted(item for item in result if item)
 
 
@@ -904,17 +969,32 @@ def _upsert_email(db: sqlite3.Connection, email: dict[str, object], now: int) ->
             message_id=excluded.message_id, storage_path=excluded.storage_path,
             storage_hash=excluded.storage_hash, size_bytes=excluded.size_bytes,
             has_attachments=excluded.has_attachments,
+            openrag_filename=excluded.openrag_filename,
             sha256=CASE
-                WHEN emails.fingerprint <> excluded.fingerprint THEN ''
+                WHEN emails.fingerprint <> excluded.fingerprint
+                  OR emails.openrag_filename <> excluded.openrag_filename THEN ''
                 ELSE emails.sha256 END,
             status=CASE
-                WHEN emails.fingerprint <> excluded.fingerprint THEN 'queued'
+                WHEN emails.fingerprint <> excluded.fingerprint
+                  OR emails.openrag_filename <> excluded.openrag_filename THEN 'queued'
                 WHEN emails.status IN ('missing','unavailable') THEN 'queued'
                 ELSE emails.status END,
-            attempts=CASE WHEN emails.fingerprint <> excluded.fingerprint THEN 0 ELSE emails.attempts END,
-            next_retry_at=CASE WHEN emails.fingerprint <> excluded.fingerprint THEN 0 ELSE emails.next_retry_at END,
-            last_error=CASE WHEN emails.fingerprint <> excluded.fingerprint THEN '' ELSE emails.last_error END,
-            task_id=CASE WHEN emails.fingerprint <> excluded.fingerprint THEN '' ELSE emails.task_id END,
+            attempts=CASE
+                WHEN emails.fingerprint <> excluded.fingerprint
+                  OR emails.openrag_filename <> excluded.openrag_filename THEN 0
+                ELSE emails.attempts END,
+            next_retry_at=CASE
+                WHEN emails.fingerprint <> excluded.fingerprint
+                  OR emails.openrag_filename <> excluded.openrag_filename THEN 0
+                ELSE emails.next_retry_at END,
+            last_error=CASE
+                WHEN emails.fingerprint <> excluded.fingerprint
+                  OR emails.openrag_filename <> excluded.openrag_filename THEN ''
+                ELSE emails.last_error END,
+            task_id=CASE
+                WHEN emails.fingerprint <> excluded.fingerprint
+                  OR emails.openrag_filename <> excluded.openrag_filename THEN ''
+                ELSE emails.task_id END,
             fingerprint=excluded.fingerprint, last_seen_at=excluded.last_seen_at
         """,
         (
@@ -942,7 +1022,7 @@ def _upsert_email(db: sqlite3.Connection, email: dict[str, object], now: int) ->
 
 
 def mail_openrag_filename(email_id: str) -> str:
-    return f"openarchiver-mail-{_safe_identifier(email_id)}.md"
+    return f"openarchiver-mail-{_safe_identifier(email_id)}.eml"
 
 
 def safe_attachment_extension(filename: str) -> str:
@@ -1214,36 +1294,112 @@ def render_mail_markdown(
     return "\n".join(lines)
 
 
+def deposit_source(
+    config: Config,
+    openarchiver: OpenArchiverClient,
+    storage_path: str,
+    filename: str,
+) -> tuple[Path, int, str]:
+    """Télécharge puis publie atomiquement une source dans l'inbox partagée."""
+    safe_name = Path(filename).name
+    if not safe_name or safe_name != filename:
+        raise ConnectorError("nom de source OpenRAG invalide")
+
+    directory = config.openrag_ingest_directory
+    directory.mkdir(parents=True, exist_ok=True)
+    directory = directory.resolve()
+    destination = directory / safe_name
+    temporary = directory / f".{safe_name}.{uuid.uuid4().hex}.part"
+    try:
+        size, sha256 = openarchiver.download(storage_path, temporary)
+        if size > config.max_file_bytes:
+            raise FileTooLargeError(
+                f"fichier supérieur à {config.max_file_bytes} octets"
+            )
+        with temporary.open("rb+") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        try:
+            directory_fd = os.open(
+                directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            # Certains serveurs NFS ne permettent pas fsync sur un répertoire.
+            pass
+        return destination, size, sha256
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 class OpenRAGClient:
-    def __init__(self, config: Config, *, sleeper: Callable[[float], None] = time.sleep) -> None:
+    def __init__(
+        self, config: Config, *, sleeper: Callable[[float], None] = time.sleep
+    ) -> None:
         self.config = config
         self.sleeper = sleeper
+        self._auto_api_mode = False
 
-    def upload(self, path: Path, remote_name: str) -> str:
+    def upload(
+        self, path: Path, remote_name: str, source_url: str | None = None
+    ) -> str:
+        """Stream a source through the authenticated multipart API."""
+        if Path(remote_name).name != remote_name or not re.fullmatch(
+            r"[A-Za-z0-9._-]{1,255}", remote_name
+        ):
+            raise ConnectorError("nom de source OpenRAG invalide")
+        if source_url is not None:
+            source_url = _validate_source_url(source_url)
         parsed = urllib.parse.urlsplit(self.config.openrag_base_url)
         boundary = f"openarchiver-{uuid.uuid4().hex}"
-        content_type = mimetypes.guess_type(remote_name)[0] or "application/octet-stream"
-        prefix = (
-            f"--{boundary}\r\n"
-            'Content-Disposition: form-data; name="replace_duplicates"\r\n\r\n'
-            "true\r\n"
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="file"; filename="{remote_name}"\r\n'
-            f"Content-Type: {content_type}\r\n\r\n"
-        ).encode("utf-8")
+        content_type = (
+            mimetypes.guess_type(remote_name)[0] or "application/octet-stream"
+        )
+        fields = [
+            ("replace_duplicates", "true"),
+            ("archive_source", "false"),
+        ]
+        if source_url is not None:
+            fields.append(("source_url", source_url))
+        prefix_parts = []
+        for name, value in fields:
+            prefix_parts.append(
+                (
+                    f"--{boundary}\r\n"
+                    f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                    f"{value}\r\n"
+                ).encode("utf-8")
+            )
+        prefix_parts.append(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="file"; filename="{remote_name}"\r\n'
+                f"Content-Type: {content_type}\r\n\r\n"
+            ).encode("utf-8")
+        )
+        prefix = b"".join(prefix_parts)
         suffix = f"\r\n--{boundary}--\r\n".encode("ascii")
         connection = http.client.HTTPConnection(
-            parsed.hostname, parsed.port or 80, timeout=self.config.request_timeout_seconds
+            parsed.hostname,
+            parsed.port or 80,
+            timeout=self.config.request_timeout_seconds,
         )
-        target = (parsed.path.rstrip("/") + self.config.openrag_ingest_path) or "/"
+        target = (parsed.path.rstrip("/") + self.config.openrag_upload_path) or "/"
         try:
             connection.putrequest("POST", target)
             connection.putheader(
                 "X-API-Key", read_secret(self.config.openrag_api_key_file, "OpenRAG")
             )
             connection.putheader("Accept", "application/json")
-            connection.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
-            connection.putheader("Content-Length", str(len(prefix) + path.stat().st_size + len(suffix)))
+            connection.putheader(
+                "Content-Type", f"multipart/form-data; boundary={boundary}"
+            )
+            connection.putheader(
+                "Content-Length", str(len(prefix) + path.stat().st_size + len(suffix))
+            )
             connection.endheaders()
             connection.send(prefix)
             with path.open("rb") as handle:
@@ -1265,6 +1421,70 @@ class OpenRAGClient:
         if not isinstance(task_id, str) or not task_id:
             raise ConnectorError("réponse OpenRAG sans task_id")
         return task_id
+
+    def ingest_path(self, path: Path) -> str:
+        ingestion_directory = self.config.openrag_ingest_directory.resolve()
+        resolved_path = path.resolve()
+        try:
+            resolved_path.relative_to(ingestion_directory)
+        except ValueError:
+            raise ConnectorError("source hors du dossier d'ingestion OpenRAG") from None
+
+        payload = json.dumps(
+            {
+                "path": str(resolved_path),
+                "replace_duplicates": True,
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            self.config.openrag_base_url + self.config.openrag_ingest_path,
+            data=payload,
+            method="POST",
+            headers={
+                "X-API-Key": read_secret(self.config.openrag_api_key_file, "OpenRAG"),
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=self.config.request_timeout_seconds
+            ) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as error:
+            raise HTTPStatusError(error.code, "ingestion OpenRAG") from None
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ConnectorError("réponse JSON OpenRAG invalide") from None
+        task_id = payload.get("task_id") if isinstance(payload, dict) else None
+        if not isinstance(task_id, str) or not task_id:
+            raise ConnectorError("réponse OpenRAG sans task_id")
+        return task_id
+
+    def ingest_source(
+        self, path: Path, source_url: str | None = None
+    ) -> tuple[str, bool]:
+        """Submit a source using the safe mode selected for this deployment.
+
+        Multi-user OpenRAG rejects server-local paths. In ``auto`` mode the
+        first such 403 switches this client instance to multipart API uploads.
+        The boolean result tells the caller whether the shared file is only a
+        working copy that can be removed after a successful task.
+        """
+        mode = self.config.openrag_ingest_mode
+        if mode == "api" or (mode == "auto" and self._auto_api_mode):
+            return self.upload(path, path.name, source_url), True
+        try:
+            return self.ingest_path(path), False
+        except HTTPStatusError as error:
+            if mode != "auto" or error.status != 403:
+                raise
+            self._auto_api_mode = True
+            LOG.info(
+                "ingestion locale refusée par OpenRAG; bascule vers l'API multipart"
+            )
+            return self.upload(path, path.name, source_url), True
 
     def task(self, task_id: str, *, path: str | None = None) -> dict[str, object]:
         encoded = urllib.parse.quote(task_id, safe="")
@@ -1329,9 +1549,7 @@ def claim_next(config: Config, *, now: int | None = None) -> WorkItem | None:
     db = connect_db(config)
     try:
         db.execute("BEGIN IMMEDIATE")
-        paused = db.execute(
-            "SELECT value FROM settings WHERE key='paused'"
-        ).fetchone()
+        paused = db.execute("SELECT value FROM settings WHERE key='paused'").fetchone()
         if paused is not None and str(paused[0]) == "1":
             db.commit()
             return None
@@ -1400,9 +1618,13 @@ def _set_object_state(
         db.execute(f"UPDATE {table} SET {clause} WHERE id=?", (*values, object_id))
 
 
-def _rows_for_email(config: Config, email_id: str) -> tuple[sqlite3.Row, list[sqlite3.Row], str]:
+def _rows_for_email(
+    config: Config, email_id: str
+) -> tuple[sqlite3.Row, list[sqlite3.Row], str]:
     with database(config) as db:
-        email_row = db.execute("SELECT * FROM emails WHERE id=?", (email_id,)).fetchone()
+        email_row = db.execute(
+            "SELECT * FROM emails WHERE id=?", (email_id,)
+        ).fetchone()
         if email_row is None:
             raise ConnectorError("mail réservé introuvable")
         attachments = list(
@@ -1415,7 +1637,9 @@ def _rows_for_email(config: Config, email_id: str) -> tuple[sqlite3.Row, list[sq
                 (email_id,),
             )
         )
-        source = db.execute("SELECT name FROM sources WHERE id=?", (email_row["source_id"],)).fetchone()
+        source = db.execute(
+            "SELECT name FROM sources WHERE id=?", (email_row["source_id"],)
+        ).fetchone()
         return email_row, attachments, str(source[0]) if source else ""
 
 
@@ -1428,64 +1652,92 @@ def process_work_item(
     try:
         if item.kind == "email":
             with database(config) as db:
-                row = db.execute("SELECT * FROM emails WHERE id=?", (item.object_id,)).fetchone()
+                row = db.execute(
+                    "SELECT * FROM emails WHERE id=?", (item.object_id,)
+                ).fetchone()
             if row is None:
                 raise ConnectorError("mail réservé introuvable")
             if int(row["has_attachments"]):
                 detail = openarchiver.email_detail(item.object_id)
                 inventory_attachments(config, item.object_id, detail)
-            with tempfile.TemporaryDirectory(prefix="openarchiver-mail-") as directory:
-                eml = Path(directory) / "message.eml"
-                _size, sha256 = openarchiver.download(str(row["storage_path"]), eml)
-                _set_object_state(
-                    config, "email", item.object_id, "sha256=?", (sha256,)
-                )
-                body, headers = parse_eml(eml)
-                current, attachments, source_name = _rows_for_email(config, item.object_id)
-                markdown_row = dict(current)
-                if not markdown_row["subject"]:
-                    markdown_row["subject"] = headers["subject"]
-                if not markdown_row["sent_at"]:
-                    markdown_row["sent_at"] = headers["date"]
-                if not markdown_row["message_id"]:
-                    markdown_row["message_id"] = headers["message_id"]
-                if not markdown_row["sender_email"] and headers["from"]:
-                    markdown_row["sender_email"] = ", ".join(headers["from"])
-                if markdown_row["recipients_json"] == "[]" and headers["to"]:
-                    markdown_row["recipients_json"] = json.dumps(
-                        headers["to"], ensure_ascii=False
+            document, _size, sha256 = deposit_source(
+                config,
+                openarchiver,
+                str(row["storage_path"]),
+                str(row["openrag_filename"]),
+            )
+            _set_object_state(
+                config,
+                "email",
+                item.object_id,
+                "sha256=?, status='ingesting'",
+                (sha256,),
+            )
+            source_url = render_remote_source_url(
+                config,
+                kind="email",
+                object_id=item.object_id,
+                storage_path=str(row["storage_path"]),
+                email_id=item.object_id,
+            )
+            task_id, api_upload = openrag.ingest_source(document, source_url)
+            _set_object_state(config, "email", item.object_id, "task_id=?", (task_id,))
+            openrag.wait(task_id)
+            if api_upload:
+                try:
+                    document.unlink(missing_ok=True)
+                except OSError as error:
+                    LOG.warning(
+                        "copie de travail non supprimée après ingestion: %s", error
                     )
-                if markdown_row["cc_json"] == "[]" and headers["cc"]:
-                    markdown_row["cc_json"] = json.dumps(headers["cc"], ensure_ascii=False)
-                markdown = render_mail_markdown(
-                    markdown_row,
-                    body,
-                    attachments,
-                    source_name=source_name,
-                    link_template=config.openarchiver_link_template,
-                )
-                document = Path(directory) / str(current["openrag_filename"])
-                document.write_text(markdown, encoding="utf-8")
-                _set_object_state(config, "email", item.object_id, "status='ingesting'", ())
-                task_id = openrag.upload(document, str(current["openrag_filename"]))
-                _set_object_state(config, "email", item.object_id, "task_id=?", (task_id,))
-                openrag.wait(task_id)
         else:
             with database(config) as db:
-                row = db.execute("SELECT * FROM attachments WHERE id=?", (item.object_id,)).fetchone()
+                row = db.execute(
+                    """
+                    SELECT a.*,
+                           COALESCE((
+                               SELECT MIN(ea.email_id)
+                               FROM email_attachments ea
+                               WHERE ea.attachment_id=a.id
+                           ), '') AS email_id
+                    FROM attachments a WHERE a.id=?
+                    """,
+                    (item.object_id,),
+                ).fetchone()
             if row is None:
                 raise ConnectorError("pièce jointe réservée introuvable")
-            with tempfile.TemporaryDirectory(prefix="openarchiver-attachment-") as directory:
-                path = Path(directory) / str(row["openrag_filename"])
-                size, sha256 = openarchiver.download(str(row["storage_path"]), path)
-                if size > config.max_file_bytes:
-                    raise FileTooLargeError("fichier OpenArchiver trop volumineux")
-                _set_object_state(
-                    config, "attachment", item.object_id, "sha256=?, status='ingesting'", (sha256,)
-                )
-                task_id = openrag.upload(path, str(row["openrag_filename"]))
-                _set_object_state(config, "attachment", item.object_id, "task_id=?", (task_id,))
-                openrag.wait(task_id)
+            document, _size, sha256 = deposit_source(
+                config,
+                openarchiver,
+                str(row["storage_path"]),
+                str(row["openrag_filename"]),
+            )
+            _set_object_state(
+                config,
+                "attachment",
+                item.object_id,
+                "sha256=?, status='ingesting'",
+                (sha256,),
+            )
+            source_url = render_remote_source_url(
+                config,
+                kind="attachment",
+                object_id=item.object_id,
+                storage_path=str(row["storage_path"]),
+                email_id=str(row["email_id"]),
+            )
+            task_id, api_upload = openrag.ingest_source(document, source_url)
+            _set_object_state(
+                config, "attachment", item.object_id, "task_id=?", (task_id,)
+            )
+            openrag.wait(task_id)
+            if api_upload:
+                try:
+                    document.unlink(missing_ok=True)
+                except OSError as error:
+                    LOG.warning(
+                        "copie de travail non supprimée après ingestion: %s", error
+                    )
         _set_object_state(
             config,
             item.kind,
@@ -1549,7 +1801,9 @@ def process_queue(
             process_work_item(config, item, openarchiver, openrag)
             processed += 1
 
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="openarchiver-ingest") as pool:
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="openarchiver-ingest"
+    ) as pool:
         return sum(pool.map(lambda _index: worker(), range(workers)))
 
 
@@ -1696,9 +1950,8 @@ def inventory_status(snapshot: Mapping[str, object]) -> str:
     completed_at = int(snapshot["last_cycle_completed_at"])
     requested_at = int(snapshot["cycle_requested_at"])
     if bool(snapshot["cycle_in_progress"]):
-        return (
-            "en cours depuis "
-            + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(started_at))
+        return "en cours depuis " + time.strftime(
+            "%Y-%m-%d %H:%M:%S UTC", time.gmtime(started_at)
         )
     if requested_at:
         return "demandé, en attente de démarrage"
@@ -1803,15 +2056,15 @@ button{{padding:.55rem .9rem;margin:.5rem .5rem 0 0}}code{{background:#f2f2f2;pa
 l’inventaire des sources et dossiers IMAP.</p>
 <form method="get" action="/"><button type="submit">Rafraîchir l’état</button></form>
 <dl><dt>Dernière erreur</dt><dd class="error">{error}</dd>
-<dt>Mails</dt><dd>{count_lines('emails')}</dd>
-<dt>Pièces jointes</dt><dd>{count_lines('attachments')}</dd></dl>
+<dt>Mails</dt><dd>{count_lines("emails")}</dd>
+<dt>Pièces jointes</dt><dd>{count_lines("attachments")}</dd></dl>
 <form method="post" action="/sources"><fieldset><legend>Sources indexées</legend>
 <input type="hidden" name="csrf" value="{csrf}">
-{''.join(source_lines)}
+{"".join(source_lines)}
 <button type="submit">Enregistrer et lancer l’inventaire</button></fieldset></form>
 <form method="post" action="/mailboxes"><fieldset><legend>Dossiers IMAP indexés</legend>
 <input type="hidden" name="csrf" value="{csrf}">
-{''.join(mailbox_lines)}
+{"".join(mailbox_lines)}
 <button type="submit">Enregistrer les dossiers et lancer l’inventaire</button></fieldset></form>
 <form method="post" action="/scan"><input type="hidden" name="csrf" value="{csrf}">
 <button type="submit">Relancer l’inventaire</button></form>
