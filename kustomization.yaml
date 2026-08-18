@@ -5,6 +5,11 @@ resources:
   - pvc.yaml
   - deployment.yaml
   - service.yaml
+  - middleware-auth.yaml
+  - middleware-headers.yaml
+  - middleware-redirect-https.yaml
+  - ingress-http.yaml
+  - ingress-https.yaml
 
 configMapGenerator:
   - name: openrag-openarchiver-connector

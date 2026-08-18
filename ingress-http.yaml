@@ -1,0 +1,23 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: openrag-openarchiver-connector-http
+  labels:
+    app.kubernetes.io/name: openrag-openarchiver-connector
+    app.kubernetes.io/part-of: openrag
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    traefik.ingress.kubernetes.io/router.middlewares: openrag-openrag-openarchiver-connector-redirect-https@kubernetescrd
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: openrag-openarchiver-connector.ferme-de-pommerieux.fr
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: openrag-openarchiver-connector
+                port:
+                  name: http

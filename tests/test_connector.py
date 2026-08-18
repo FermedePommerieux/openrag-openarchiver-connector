@@ -730,11 +730,21 @@ class ConnectorTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
-    def test_runtime_manifests_keep_the_initial_exposure_internal(self):
+    def test_runtime_manifests_expose_the_interface_securely_on_the_lan(self):
         root = MODULE_PATH.parent
         deployment = (root / "deployment.yaml").read_text(encoding="utf-8")
         service = (root / "service.yaml").read_text(encoding="utf-8")
         kustomization = (root / "kustomization.yaml").read_text(encoding="utf-8")
+        ingress_http = (root / "ingress-http.yaml").read_text(encoding="utf-8")
+        ingress_https = (root / "ingress-https.yaml").read_text(encoding="utf-8")
+        middleware_auth = (root / "middleware-auth.yaml").read_text(encoding="utf-8")
+        middleware_headers = (root / "middleware-headers.yaml").read_text(
+            encoding="utf-8"
+        )
+        middleware_redirect = (
+            root / "middleware-redirect-https.yaml"
+        ).read_text(encoding="utf-8")
+        hostname = "openrag-openarchiver-connector.ferme-de-pommerieux.fr"
         self.assertIn("automountServiceAccountToken: false", deployment)
         self.assertIn("readOnlyRootFilesystem: true", deployment)
         self.assertIn("openrag-openarchiver-connector-api", deployment)
@@ -742,8 +752,31 @@ class ConnectorTests(unittest.TestCase):
         self.assertIn("openrag-api-key", deployment)
         self.assertIn("type: ClusterIP", service)
         self.assertNotIn("NodePort", service)
-        self.assertEqual(list(root.glob("ingress*.yaml")), [])
-        for resource in ("pvc.yaml", "deployment.yaml", "service.yaml"):
+        self.assertIn(hostname, ingress_http)
+        self.assertIn(hostname, ingress_https)
+        self.assertIn("router.entrypoints: web\n", ingress_http)
+        self.assertIn("redirect-https@kubernetescrd", ingress_http)
+        self.assertIn("router.entrypoints: websecure", ingress_https)
+        self.assertIn('router.tls: "true"', ingress_https)
+        self.assertIn("auth@kubernetescrd", ingress_https)
+        self.assertIn("headers@kubernetescrd", ingress_https)
+        self.assertIn(
+            "secret: openrag-openarchiver-connector-basic-auth",
+            middleware_auth,
+        )
+        self.assertIn("contentTypeNosniff: true", middleware_headers)
+        self.assertIn("scheme: https", middleware_redirect)
+        self.assertNotIn("ipAllowList", "\n".join((middleware_auth, middleware_headers)))
+        for resource in (
+            "pvc.yaml",
+            "deployment.yaml",
+            "service.yaml",
+            "middleware-auth.yaml",
+            "middleware-headers.yaml",
+            "middleware-redirect-https.yaml",
+            "ingress-http.yaml",
+            "ingress-https.yaml",
+        ):
             self.assertIn(f"- {resource}", kustomization)
 
     def test_runtime_bundle_contains_no_kubernetes_secret_value(self):

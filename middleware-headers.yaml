@@ -1,0 +1,13 @@
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: openrag-openarchiver-connector-headers
+  labels:
+    app.kubernetes.io/name: openrag-openarchiver-connector
+    app.kubernetes.io/part-of: openrag
+spec:
+  headers:
+    contentTypeNosniff: true
+    frameDeny: true
+    referrerPolicy: no-referrer
+    stsSeconds: 31536000
