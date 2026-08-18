@@ -490,11 +490,28 @@ class OpenArchiverClient:
         )
 
     def json(self, path: str) -> object:
-        response = self._open(path)
-        try:
-            raw = response.read()
-        finally:
-            response.close()
+        # Une réponse HTTP peut être acceptée puis interrompue pendant la
+        # lecture du corps. Rejouer alors le GET complet, avec la même borne
+        # que les autres erreurs transitoires OpenArchiver.
+        for attempt in range(self.config.max_auto_retries):
+            response = self._open(path)
+            try:
+                raw = response.read()
+            except (
+                http.client.IncompleteRead,
+                http.client.RemoteDisconnected,
+                TimeoutError,
+                OSError,
+            ):
+                if attempt + 1 >= self.config.max_auto_retries:
+                    raise ConnectorError(
+                        "réponse OpenArchiver interrompue"
+                    ) from None
+                self.sleeper(self._backoff(attempt))
+                continue
+            finally:
+                response.close()
+            break
         try:
             return json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -1656,7 +1673,11 @@ def make_http_handler(
                         "text/plain; charset=utf-8",
                     )
                 elif path == "/readyz":
-                    ready = bool(state.snapshot()["ready"])
+                    # La readiness Kubernetes décrit la capacité du serveur à
+                    # recevoir du trafic. Une erreur de synchronisation reste
+                    # visible dans l'interface et les métriques, mais ne doit
+                    # pas retirer l'unique pod des endpoints du Service.
+                    ready = bool(state.snapshot()["running"])
                     self._send(
                         200 if ready else 503,
                         "ready\n" if ready else "not ready\n",
