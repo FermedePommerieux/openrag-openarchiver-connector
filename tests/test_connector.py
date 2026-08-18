@@ -290,7 +290,9 @@ class ConnectorTests(unittest.TestCase):
                 ("source-1", 1): {"items": [original], "total": 1}
             }))
             db = connector.connect_db(config)
-            db.execute("UPDATE emails SET status='validated', last_success_at=10")
+            db.execute(
+                "UPDATE emails SET status='validated', last_success_at=10, sha256='old-sha'"
+            )
             db.commit()
             db.close()
             connector.scan_selected_sources(config, FakeArchive(pages={
@@ -301,7 +303,9 @@ class ConnectorTests(unittest.TestCase):
             connector.scan_selected_sources(config, FakeArchive(pages={
                 ("source-1", 1): {"items": [changed], "total": 1}
             }))
-            self.assertEqual(self.rows(config, "emails")[0]["status"], "queued")
+            row = self.rows(config, "emails")[0]
+            self.assertEqual(row["status"], "queued")
+            self.assertEqual(row["sha256"], "")
 
     def test_recipient_shapes_split_to_and_cc(self):
         raw = self.mail(
@@ -497,6 +501,30 @@ class ConnectorTests(unittest.TestCase):
             self.assertEqual([row["status"] for row in rows], ["non_indexable", "non_indexable"])
             self.assertEqual(connector.attachment_openrag_filename("x", "../../evil.EXE"), "openarchiver-attachment-x.exe")
 
+    def test_changed_attachment_resets_transient_ingestion_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            self._insert_email(config)
+            detail = {"attachments": [{
+                "id": "att", "filename": "doc.pdf", "sizeBytes": 4,
+                "storagePath": "att/old",
+            }]}
+            connector.inventory_attachments(config, "mail-1", detail)
+            db = connector.connect_db(config)
+            db.execute(
+                """UPDATE attachments SET status='validated', sha256='old-sha',
+                   task_id='old-task', next_retry_at=123 WHERE id='att'"""
+            )
+            db.commit()
+            db.close()
+            detail["attachments"][0]["storagePath"] = "att/new"
+            connector.inventory_attachments(config, "mail-1", detail)
+            row = self.rows(config, "attachments")[0]
+            self.assertEqual(row["status"], "queued")
+            self.assertEqual(row["sha256"], "")
+            self.assertEqual(row["task_id"], "")
+            self.assertEqual(row["next_retry_at"], 0)
+
     def test_remote_names_are_stable_and_escape_unsafe_identifiers(self):
         first = connector.mail_openrag_filename('id"\r\nheader')
         second = connector.mail_openrag_filename('id"\r\nother')
@@ -537,6 +565,21 @@ class ConnectorTests(unittest.TestCase):
             with mock.patch.object(client, "task", return_value={"status": "failed"}):
                 with self.assertRaisesRegex(connector.ConnectorError, "failed"):
                     client.wait("bad")
+
+    def test_openrag_task_404_falls_back_to_standard_endpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            client = connector.OpenRAGClient(config, sleeper=lambda _s: None)
+            responses = [
+                connector.HTTPStatusError(404, "lecture tâche OpenRAG"),
+                {"status": "completed", "failed_files": 0},
+            ]
+            with mock.patch.object(client, "task", side_effect=responses) as task:
+                client.wait("task/id")
+            self.assertEqual(task.call_count, 2)
+            self.assertEqual(
+                task.call_args_list[1].kwargs["path"], "/v1/tasks/task%2Fid"
+            )
 
     def test_openrag_upload_uses_multipart_replace_duplicates(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -651,12 +694,28 @@ class ConnectorTests(unittest.TestCase):
 
     def test_recovery_only_requeues_interrupted_operations(self):
         with tempfile.TemporaryDirectory() as directory:
-            config = self.config(Path(directory))
+            config = self.config(Path(directory), max_auto_retries=3)
             self._insert_email(config, self.mail("active"), "ingesting")
             self._insert_email(config, self.mail("done"), "validated")
             self.assertEqual(connector.recover_interrupted(config), 1)
-            statuses = {row["id"]: row["status"] for row in self.rows(config, "emails")}
-            self.assertEqual(statuses, {"active": "queued", "done": "validated"})
+            rows = {row["id"]: row for row in self.rows(config, "emails")}
+            self.assertEqual(rows["active"]["status"], "failed")
+            self.assertGreater(rows["active"]["next_retry_at"], 0)
+            self.assertEqual(rows["done"]["status"], "validated")
+
+    def test_recovery_does_not_exceed_retry_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory), max_auto_retries=3)
+            self._insert_email(config, self.mail("exhausted"), "ingesting")
+            db = connector.connect_db(config)
+            db.execute("UPDATE emails SET attempts=3 WHERE id='exhausted'")
+            db.commit()
+            db.close()
+            self.assertEqual(connector.recover_interrupted(config), 1)
+            row = self.rows(config, "emails")[0]
+            self.assertEqual(row["status"], "failed")
+            self.assertEqual(row["next_retry_at"], 0)
+            self.assertIsNone(connector.claim_next(config, now=2**31))
 
     def test_concurrent_claim_has_no_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:
