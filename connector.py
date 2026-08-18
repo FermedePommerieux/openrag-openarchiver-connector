@@ -1562,6 +1562,7 @@ class RuntimeState:
         self.started_at = int(time.time())
         self.last_cycle_started_at = 0
         self.last_cycle_completed_at = 0
+        self.cycle_requested_at = 0
         self.last_error = ""
         self.last_scan: ScanResult | None = None
         self.last_processed = 0
@@ -1575,6 +1576,11 @@ class RuntimeState:
     def cycle_started(self) -> None:
         with self.lock:
             self.last_cycle_started_at = int(time.time())
+            self.cycle_requested_at = 0
+
+    def cycle_requested(self) -> None:
+        with self.lock:
+            self.cycle_requested_at = int(time.time())
 
     def cycle_succeeded(self, scan: ScanResult, processed: int) -> None:
         with self.lock:
@@ -1597,6 +1603,7 @@ class RuntimeState:
                 "started_at": self.started_at,
                 "last_cycle_started_at": self.last_cycle_started_at,
                 "last_cycle_completed_at": self.last_cycle_completed_at,
+                "cycle_requested_at": self.cycle_requested_at,
                 "last_error": self.last_error,
                 "last_scan": self.last_scan,
                 "last_processed": self.last_processed,
@@ -1636,10 +1643,7 @@ def runtime_loop(
             LOG.warning("%d opération(s) interrompue(s) récupérée(s)", recovered)
         while not stop.is_set():
             if is_paused(config):
-                LOG.info("indexation en pause")
-                wake.wait(config.scan_interval_seconds)
-                wake.clear()
-                continue
+                LOG.info("indexation en pause; inventaire IMAP uniquement")
             state.cycle_started()
             try:
                 scan, processed = run_cycle(config, archive_client, rag_client)
@@ -1731,9 +1735,38 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
     pause_label = "Reprendre l’indexation" if paused else "Mettre en pause"
     pause_action = "resume" if paused else "pause"
     activity = "en pause" if paused else "active"
+    started_at = int(snapshot["last_cycle_started_at"])
+    completed_at = int(snapshot["last_cycle_completed_at"])
+    requested_at = int(snapshot["cycle_requested_at"])
+    cycle_active = bool(started_at and started_at > completed_at)
+    if cycle_active:
+        inventory = (
+            "en cours depuis "
+            + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(started_at))
+        )
+    elif requested_at:
+        inventory = "demandé, en attente de démarrage"
+    elif completed_at:
+        last_scan = snapshot["last_scan"]
+        detail = ""
+        if isinstance(last_scan, ScanResult):
+            detail = f" — {last_scan.sources} source(s), {last_scan.emails} mail(s)"
+        inventory = (
+            "terminé le "
+            + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(completed_at))
+            + detail
+        )
+    else:
+        inventory = "jamais exécuté depuis le démarrage"
+    refresh = (
+        '<meta http-equiv="refresh" content="3">'
+        if cycle_active or requested_at
+        else ""
+    )
     return f"""<!doctype html>
 <html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+{refresh}
 <title>OpenArchiver vers OpenRAG</title>
 <style>
 body{{font-family:system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#202124}}
@@ -1744,19 +1777,22 @@ button{{padding:.55rem .9rem;margin:.5rem .5rem 0 0}}code{{background:#f2f2f2;pa
 <h1>Connecteur OpenArchiver → OpenRAG</h1>
 <p>État runtime : <strong>{ready}</strong></p>
 <p>Indexation : <strong>{activity}</strong></p>
+<p>Inventaire IMAP : <strong>{html.escape(inventory)}</strong></p>
+<p class="muted">La pause bloque les envois vers OpenRAG, mais autorise
+l’inventaire des sources et dossiers IMAP.</p>
 <dl><dt>Dernière erreur</dt><dd class="error">{error}</dd>
 <dt>Mails</dt><dd>{count_lines('emails')}</dd>
 <dt>Pièces jointes</dt><dd>{count_lines('attachments')}</dd></dl>
 <form method="post" action="/sources"><fieldset><legend>Sources indexées</legend>
 <input type="hidden" name="csrf" value="{csrf}">
 {''.join(source_lines)}
-<button type="submit">Enregistrer la sélection et scanner</button></fieldset></form>
+<button type="submit">Enregistrer et lancer l’inventaire</button></fieldset></form>
 <form method="post" action="/mailboxes"><fieldset><legend>Dossiers IMAP indexés</legend>
 <input type="hidden" name="csrf" value="{csrf}">
 {''.join(mailbox_lines)}
-<button type="submit">Enregistrer les dossiers et scanner</button></fieldset></form>
+<button type="submit">Enregistrer les dossiers et lancer l’inventaire</button></fieldset></form>
 <form method="post" action="/scan"><input type="hidden" name="csrf" value="{csrf}">
-<button type="submit">Relancer un cycle</button></form>
+<button type="submit">Relancer l’inventaire</button></form>
 <form method="post" action="/pause"><input type="hidden" name="csrf" value="{csrf}">
 <input type="hidden" name="action" value="{pause_action}">
 <button type="submit">{pause_label}</button></form>
@@ -1873,6 +1909,7 @@ def make_http_handler(
                     return
                 if path == "/sources":
                     replace_source_selection(config, form.get("source_id", []))
+                    state.cycle_requested()
                     wake.set()
                     self._redirect()
                 elif path == "/mailboxes":
@@ -1887,6 +1924,7 @@ def make_http_handler(
                             raise ConnectorError("sélection de dossier invalide")
                         selections.append((decoded[0], decoded[1]))
                     replace_mailbox_selection(config, selections)
+                    state.cycle_requested()
                     wake.set()
                     self._redirect()
                 elif path == "/pause":
@@ -1894,9 +1932,12 @@ def make_http_handler(
                     if action not in {"pause", "resume"}:
                         raise ConnectorError("action de pause invalide")
                     set_paused(config, action == "pause")
-                    wake.set()
+                    if action == "resume":
+                        state.cycle_requested()
+                        wake.set()
                     self._redirect()
                 elif path == "/scan":
+                    state.cycle_requested()
                     wake.set()
                     self._redirect()
                 else:

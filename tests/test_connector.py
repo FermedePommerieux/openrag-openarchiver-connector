@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -755,6 +756,11 @@ class ConnectorTests(unittest.TestCase):
                     self.assertEqual(response.status, 200)
                 self.assertEqual(connector.selected_source_ids(config), [])
                 self.assertTrue(wake.is_set())
+                self.assertGreater(state.snapshot()["cycle_requested_at"], 0)
+                with urllib.request.urlopen(base + "/") as response:
+                    requested_page = response.read().decode("utf-8")
+                self.assertIn("demandé, en attente", requested_page)
+                self.assertIn('http-equiv="refresh"', requested_page)
 
                 pause = urllib.request.Request(
                     base + "/pause",
@@ -890,6 +896,50 @@ class ConnectorTests(unittest.TestCase):
             self.assertIsNone(connector.claim_next(config, now=1))
             connector.set_paused(config, False)
             self.assertEqual(connector.claim_next(config, now=1).object_id, "archive")
+
+    def test_paused_runtime_inventories_mailboxes_without_indexing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory), scan_interval_seconds=3600)
+            self.select(config, "source-1")
+            connector.set_paused(config, True)
+            archive = FakeArchive(
+                sources=[{"id": "source-1", "name": "Archive", "provider": "imap"}],
+                pages={
+                    ("source-1", 1): {
+                        "items": [self.mail("mail-1", path="INBOX")],
+                        "total": 1,
+                    }
+                },
+            )
+            rag = FakeOpenRAG()
+            state = connector.RuntimeState()
+            stop = threading.Event()
+            wake = threading.Event()
+            thread = threading.Thread(
+                target=connector.runtime_loop,
+                args=(config, state),
+                kwargs={
+                    "openarchiver": archive,
+                    "openrag": rag,
+                    "stop": stop,
+                    "wake": wake,
+                },
+                daemon=True,
+            )
+            thread.start()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not connector.mailbox_rows(config):
+                time.sleep(0.01)
+            stop.set()
+            wake.set()
+            thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(
+                [row["path"] for row in connector.mailbox_rows(config)], ["INBOX"]
+            )
+            self.assertEqual(rag.uploads, [])
+            self.assertTrue(state.snapshot()["ready"])
 
     def test_mailbox_selection_rejects_unknown_path(self):
         with tempfile.TemporaryDirectory() as directory:
