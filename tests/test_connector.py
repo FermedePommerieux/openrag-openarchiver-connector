@@ -9,6 +9,8 @@ import tempfile
 import threading
 import unittest
 import urllib.error
+import urllib.parse
+import urllib.request
 from email.message import EmailMessage
 from pathlib import Path
 from unittest import mock
@@ -218,6 +220,27 @@ class ConnectorTests(unittest.TestCase):
             connector.set_source_selected(config, "root", True)
             self.assertEqual(connector.selected_source_ids(config), ["root"])
 
+    def test_replace_selection_limits_queue_claims(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            self._insert_email(config, self.mail("one", "source-1"))
+            self._insert_email(config, self.mail("two", "source-2"))
+            connector.replace_source_selection(config, ["source-1"])
+            first = connector.claim_next(config, now=1)
+            self.assertEqual(first.object_id, "one")
+            self.assertIsNone(connector.claim_next(config, now=1))
+            connector.replace_source_selection(config, ["source-2"])
+            second = connector.claim_next(config, now=1)
+            self.assertEqual(second.object_id, "two")
+
+    def test_replace_selection_rejects_unknown_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            connector.set_source_selected(config, "known", True)
+            with self.assertRaisesRegex(connector.ConnectorError, "inconnue"):
+                connector.replace_source_selection(config, ["missing"])
+            self.assertEqual(connector.selected_source_ids(config), ["known"])
+
     def test_normal_pagination_and_new_mail_is_queued(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
@@ -243,6 +266,24 @@ class ConnectorTests(unittest.TestCase):
             self.assertTrue(result.complete)
             self.assertEqual(result.emails, 2)
             self.assertEqual(len(self.rows(config, "emails")), 2)
+
+    def test_merged_source_keeps_selected_inventory_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory), page_limit=10)
+            self.select(config, "root")
+            child_mail = self.mail("child-mail", "child")
+            result = connector.scan_selected_sources(
+                config,
+                FakeArchive(
+                    pages={
+                        ("root", 1): {"items": [child_mail], "total": 1}
+                    }
+                ),
+            )
+            self.assertTrue(result.complete)
+            row = self.rows(config, "emails")[0]
+            self.assertEqual(row["source_id"], "root")
+            self.assertIsNotNone(connector.claim_next(config, now=1))
 
     def test_pages_moved_trigger_one_stabilisation_pass(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -463,7 +504,10 @@ class ConnectorTests(unittest.TestCase):
         self.assertNotIn("corps d'un autre mail", first)
 
     def _insert_email(self, config, email=None, status="queued"):
-        data = connector._validate_email(email or self.mail("mail-1"), "source-1")
+        raw = email or self.mail("mail-1")
+        source_id = str(raw.get("ingestionSourceId") or "source-1")
+        data = connector._validate_email(raw, source_id)
+        connector.set_source_selected(config, data["source_id"], True)
         db = connector.connect_db(config)
         connector._upsert_email(db, data, 1)
         db.execute("UPDATE emails SET status=? WHERE id=?", (status, data["id"]))
@@ -622,6 +666,94 @@ class ConnectorTests(unittest.TestCase):
             body = b"".join(Connection.instance.sent)
             self.assertIn(b'name="replace_duplicates"\r\n\r\ntrue', body)
             self.assertIn(b'filename="stable.md"', body)
+
+    def test_runtime_cycle_refreshes_sources_without_implicit_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            archive = FakeArchive(
+                sources=[{"id": "source-1", "name": "Archive", "provider": "imap"}]
+            )
+            scan, processed = connector.run_cycle(config, archive, FakeOpenRAG())
+            self.assertEqual(scan, connector.ScanResult(0, 0, True, False))
+            self.assertEqual(processed, 0)
+            self.assertEqual(connector.selected_source_ids(config), [])
+            self.assertEqual(
+                [row["id"] for row in connector.source_rows(config)], ["source-1"]
+            )
+
+    def test_http_probes_and_source_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            connector.set_source_selected(config, "source-1", True)
+            state = connector.RuntimeState()
+            state.set_running(True)
+            state.cycle_succeeded(connector.ScanResult(1, 0, True, False), 0)
+            wake = threading.Event()
+            server = connector.ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                connector.make_http_handler(config, state, wake=wake),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                with urllib.request.urlopen(base + "/healthz") as response:
+                    self.assertEqual(response.status, 200)
+                with urllib.request.urlopen(base + "/readyz") as response:
+                    self.assertEqual(response.status, 200)
+                with urllib.request.urlopen(base + "/") as response:
+                    page = response.read().decode("utf-8")
+                self.assertIn("source-1", page)
+
+                body = urllib.parse.urlencode(
+                    {"csrf": state.snapshot()["csrf_token"]}
+                ).encode("ascii")
+                request = urllib.request.Request(base + "/sources", data=body)
+                with urllib.request.urlopen(request) as response:
+                    self.assertEqual(response.status, 200)
+                self.assertEqual(connector.selected_source_ids(config), [])
+                self.assertTrue(wake.is_set())
+
+                bad = urllib.request.Request(
+                    base + "/scan",
+                    data=urllib.parse.urlencode({"csrf": "bad"}).encode("ascii"),
+                )
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(bad)
+                self.assertEqual(caught.exception.code, 403)
+                state.set_running(False)
+                with self.assertRaises(urllib.error.HTTPError) as stopped:
+                    urllib.request.urlopen(base + "/healthz")
+                self.assertEqual(stopped.exception.code, 503)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_runtime_manifests_keep_the_initial_exposure_internal(self):
+        root = MODULE_PATH.parent
+        deployment = (root / "deployment.yaml").read_text(encoding="utf-8")
+        service = (root / "service.yaml").read_text(encoding="utf-8")
+        kustomization = (root / "kustomization.yaml").read_text(encoding="utf-8")
+        self.assertIn("automountServiceAccountToken: false", deployment)
+        self.assertIn("readOnlyRootFilesystem: true", deployment)
+        self.assertIn("openrag-openarchiver-connector-api", deployment)
+        self.assertIn("openarchiver-api-key", deployment)
+        self.assertIn("openrag-api-key", deployment)
+        self.assertIn("type: ClusterIP", service)
+        self.assertNotIn("NodePort", service)
+        self.assertEqual(list(root.glob("ingress*.yaml")), [])
+        for resource in ("pvc.yaml", "deployment.yaml", "service.yaml"):
+            self.assertIn(f"- {resource}", kustomization)
+
+    def test_runtime_bundle_contains_no_kubernetes_secret_value(self):
+        root = MODULE_PATH.parent
+        manifests = "\n".join(
+            path.read_text(encoding="utf-8") for path in root.glob("*.yaml")
+        )
+        self.assertNotIn("kind: Secret", manifests)
+        self.assertNotIn("stringData:", manifests)
+        self.assertNotIn("data:\n  openarchiver-api-key", manifests)
 
     def test_process_mail_downloads_once_then_validates(self):
         with tempfile.TemporaryDirectory() as directory:

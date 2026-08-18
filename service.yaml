@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: openrag-openarchiver-connector
+  labels:
+    app.kubernetes.io/name: openrag-openarchiver-connector
+    app.kubernetes.io/part-of: openrag
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: openrag-openarchiver-connector
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

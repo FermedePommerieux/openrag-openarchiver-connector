@@ -18,12 +18,14 @@ le document OpenRAG portant le même nom. Aucun appel DELETE n'est implémenté.
 from __future__ import annotations
 
 import hashlib
+import html
 import http.client
 import json
 import logging
 import mimetypes
 import os
 import re
+import signal
 import sqlite3
 import tempfile
 import threading
@@ -40,6 +42,7 @@ from dataclasses import dataclass
 from email import policy
 from email.parser import BytesParser
 from email.utils import getaddresses
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Mapping, Sequence
@@ -64,6 +67,8 @@ DEFAULT_EXTENSIONS = (
     ".asc,.asciidoc,.adoc,.csv,.docx,.htm,.html,.md,.pdf,.txt,.xlsx"
 )
 SAFE_EXTENSION = re.compile(r"^\.[a-z0-9]{1,10}$")
+STOP = threading.Event()
+WAKE = threading.Event()
 
 
 class ConnectorError(RuntimeError):
@@ -106,6 +111,9 @@ class Config:
     page_limit: int = 250
     openarchiver_link_template: str = ""
     request_timeout_seconds: int = 30
+    cycle_retry_seconds: int = 60
+    http_host: str = "0.0.0.0"
+    http_port: int = 8080
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Config":
@@ -159,6 +167,11 @@ class Config:
             request_timeout_seconds=max(
                 1, int(values.get("REQUEST_TIMEOUT_SECONDS", "30"))
             ),
+            cycle_retry_seconds=max(
+                5, int(values.get("CYCLE_RETRY_SECONDS", "60"))
+            ),
+            http_host=values.get("HTTP_HOST", "0.0.0.0"),
+            http_port=min(65_535, max(1, int(values.get("HTTP_PORT", "8080")))),
         )
         _validate_internal_http_url(config.openarchiver_base_url, "OPENARCHIVER_BASE_URL")
         _validate_internal_http_url(config.openrag_base_url, "OPENRAG_BASE_URL")
@@ -329,6 +342,38 @@ def selected_source_ids(config: Config) -> list[str]:
             str(row[0])
             for row in db.execute("SELECT id FROM sources WHERE selected=1 ORDER BY id")
         ]
+
+
+def source_rows(config: Config) -> list[sqlite3.Row]:
+    with database(config) as db:
+        return list(
+            db.execute(
+                """SELECT id, name, provider, selected, merged_into_id,
+                          last_seen_at, last_error
+                   FROM sources ORDER BY name, id"""
+            )
+        )
+
+
+def replace_source_selection(config: Config, source_ids: Iterable[str]) -> list[str]:
+    """Remplace atomiquement la sélection par des sources déjà découvertes."""
+    requested = sorted(set(source_ids))
+    with database(config) as db:
+        known = {
+            str(row[0])
+            for row in db.execute("SELECT id FROM sources")
+        }
+        unknown = sorted(set(requested) - known)
+        if unknown:
+            raise ConnectorError("sélection contenant une source inconnue")
+        db.execute("UPDATE sources SET selected=0")
+        if requested:
+            placeholders = ",".join("?" for _ in requested)
+            db.execute(
+                f"UPDATE sources SET selected=1 WHERE id IN ({placeholders})",
+                requested,
+            )
+    return requested
 
 
 def recover_interrupted(config: Config) -> int:
@@ -628,9 +673,10 @@ def _validate_email(raw: dict[str, object], fallback_source: str) -> dict[str, o
         raise IncompleteScanError("mail OpenArchiver sans identifiant")
     if not isinstance(storage_path, str) or not storage_path:
         raise IncompleteScanError(f"mail {email_id} sans storagePath")
-    source_id = raw.get("ingestionSourceId")
-    if not isinstance(source_id, str) or not source_id:
-        source_id = fallback_source
+    # Une source fusionnée peut retourner un mail dont ingestionSourceId pointe
+    # vers une source enfant. L'identité globale reste l'UUID du mail, mais la
+    # portée opérationnelle doit rester la source effectivement sélectionnée.
+    source_id = fallback_source
     recipients, recipient_cc = _split_recipients(raw.get("recipients"))
     cc = sorted(set(recipient_cc + _normalise_recipients(raw.get("cc"))))
     return {
@@ -1168,12 +1214,27 @@ def claim_next(config: Config, *, now: int | None = None) -> WorkItem | None:
     try:
         db.execute("BEGIN IMMEDIATE")
         for kind, table in (("email", "emails"), ("attachment", "attachments")):
+            selection_clause = (
+                """EXISTS (
+                       SELECT 1 FROM sources s
+                       WHERE s.id=emails.source_id AND s.selected=1
+                   )"""
+                if kind == "email"
+                else """EXISTS (
+                       SELECT 1 FROM email_attachments ea
+                       JOIN emails e ON e.id=ea.email_id
+                       JOIN sources s ON s.id=e.source_id
+                       WHERE ea.attachment_id=attachments.id AND s.selected=1
+                   )"""
+            )
             row = db.execute(
                 f"""
                 SELECT id, attempts FROM {table}
-                WHERE status='queued' OR (
-                    status='failed' AND attempts < ?
-                    AND next_retry_at > 0 AND next_retry_at <= ?
+                WHERE ({selection_clause}) AND (
+                    status='queued' OR (
+                        status='failed' AND attempts < ?
+                        AND next_retry_at > 0 AND next_retry_at <= ?
+                    )
                 )
                 ORDER BY CASE status WHEN 'queued' THEN 0 ELSE 1 END,
                          next_retry_at, id
@@ -1361,3 +1422,340 @@ def process_queue(
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="openarchiver-ingest") as pool:
         return sum(pool.map(lambda _index: worker(), range(workers)))
+
+
+class RuntimeState:
+    """Petit état mémoire pour les probes et l'interface d'exploitation."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.csrf_token = uuid.uuid4().hex
+        self.started_at = int(time.time())
+        self.last_cycle_started_at = 0
+        self.last_cycle_completed_at = 0
+        self.last_error = ""
+        self.last_scan: ScanResult | None = None
+        self.last_processed = 0
+        self.ready = False
+        self.running = False
+
+    def set_running(self, value: bool) -> None:
+        with self.lock:
+            self.running = value
+
+    def cycle_started(self) -> None:
+        with self.lock:
+            self.last_cycle_started_at = int(time.time())
+
+    def cycle_succeeded(self, scan: ScanResult, processed: int) -> None:
+        with self.lock:
+            self.last_cycle_completed_at = int(time.time())
+            self.last_error = ""
+            self.last_scan = scan
+            self.last_processed = processed
+            self.ready = True
+
+    def cycle_failed(self, error: Exception) -> None:
+        with self.lock:
+            self.last_cycle_completed_at = int(time.time())
+            self.last_error = _safe_error(error)
+            self.ready = False
+
+    def snapshot(self) -> dict[str, object]:
+        with self.lock:
+            return {
+                "csrf_token": self.csrf_token,
+                "started_at": self.started_at,
+                "last_cycle_started_at": self.last_cycle_started_at,
+                "last_cycle_completed_at": self.last_cycle_completed_at,
+                "last_error": self.last_error,
+                "last_scan": self.last_scan,
+                "last_processed": self.last_processed,
+                "ready": self.ready,
+                "running": self.running,
+            }
+
+
+def run_cycle(
+    config: Config,
+    openarchiver: OpenArchiverClient,
+    openrag: OpenRAGClient,
+) -> tuple[ScanResult, int]:
+    refresh_sources(config, openarchiver)
+    scan = scan_selected_sources(config, openarchiver)
+    if not scan.complete:
+        raise IncompleteScanError("inventaire incomplet; ingestion différée")
+    processed = process_queue(config, openarchiver, openrag)
+    return scan, processed
+
+
+def runtime_loop(
+    config: Config,
+    state: RuntimeState,
+    *,
+    openarchiver: OpenArchiverClient | None = None,
+    openrag: OpenRAGClient | None = None,
+    stop: threading.Event = STOP,
+    wake: threading.Event = WAKE,
+) -> None:
+    archive_client = openarchiver or OpenArchiverClient(config)
+    rag_client = openrag or OpenRAGClient(config)
+    state.set_running(True)
+    try:
+        recovered = recover_interrupted(config)
+        if recovered:
+            LOG.warning("%d opération(s) interrompue(s) récupérée(s)", recovered)
+        while not stop.is_set():
+            state.cycle_started()
+            try:
+                scan, processed = run_cycle(config, archive_client, rag_client)
+                state.cycle_succeeded(scan, processed)
+                LOG.info(
+                    "cycle terminé: sources=%d mails=%d traités=%d",
+                    scan.sources,
+                    scan.emails,
+                    processed,
+                )
+                delay = config.scan_interval_seconds
+            except Exception as error:
+                state.cycle_failed(error)
+                LOG.error("cycle en échec: %s", _safe_error(error))
+                delay = config.cycle_retry_seconds
+            wake.wait(delay)
+            wake.clear()
+    finally:
+        state.set_running(False)
+
+
+def _status_counts(config: Config) -> dict[str, dict[str, int]]:
+    result: dict[str, dict[str, int]] = {"emails": {}, "attachments": {}}
+    with database(config) as db:
+        for table in result:
+            for row in db.execute(
+                f"SELECT status, COUNT(*) AS count FROM {table} GROUP BY status"
+            ):
+                result[table][str(row["status"])] = int(row["count"])
+    return result
+
+
+def render_status_page(config: Config, state: RuntimeState) -> str:
+    snapshot = state.snapshot()
+    sources = source_rows(config)
+    counts = _status_counts(config)
+    csrf = html.escape(str(snapshot["csrf_token"]), quote=True)
+
+    source_lines = []
+    for row in sources:
+        source_id = html.escape(str(row["id"]), quote=True)
+        label = html.escape(str(row["name"] or row["id"]))
+        provider = html.escape(str(row["provider"] or "—"))
+        checked = " checked" if int(row["selected"]) else ""
+        source_lines.append(
+            f'<label><input type="checkbox" name="source_id" value="{source_id}"'
+            f"{checked}> <strong>{label}</strong> "
+            f'<span class="muted">({provider}, {source_id})</span></label>'
+        )
+    if not source_lines:
+        source_lines.append(
+            '<p class="muted">Aucune source découverte. '
+            "Vérifier le Secret et OpenArchiver.</p>"
+        )
+
+    def count_lines(table: str) -> str:
+        values = counts[table]
+        if not values:
+            return '<span class="muted">aucun objet</span>'
+        return ", ".join(
+            f"{html.escape(status)}={count}" for status, count in sorted(values.items())
+        )
+
+    error = html.escape(str(snapshot["last_error"] or "aucune"))
+    ready = "prêt" if snapshot["ready"] else "non prêt"
+    return f"""<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpenArchiver vers OpenRAG</title>
+<style>
+body{{font-family:system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#202124}}
+fieldset{{border:1px solid #ccc;border-radius:.5rem;padding:1rem}}label{{display:block;margin:.6rem 0}}
+button{{padding:.55rem .9rem;margin:.5rem .5rem 0 0}}code{{background:#f2f2f2;padding:.1rem .3rem}}
+.muted{{color:#666}}.error{{color:#9b1c1c}}dt{{font-weight:700}}dd{{margin-bottom:.5rem}}
+</style></head><body>
+<h1>Connecteur OpenArchiver → OpenRAG</h1>
+<p>État runtime : <strong>{ready}</strong></p>
+<dl><dt>Dernière erreur</dt><dd class="error">{error}</dd>
+<dt>Mails</dt><dd>{count_lines('emails')}</dd>
+<dt>Pièces jointes</dt><dd>{count_lines('attachments')}</dd></dl>
+<form method="post" action="/sources"><fieldset><legend>Sources indexées</legend>
+<input type="hidden" name="csrf" value="{csrf}">
+{''.join(source_lines)}
+<button type="submit">Enregistrer la sélection et scanner</button></fieldset></form>
+<form method="post" action="/scan"><input type="hidden" name="csrf" value="{csrf}">
+<button type="submit">Relancer un cycle</button></form>
+<p class="muted">Aucune suppression OpenRAG n'est automatique.
+Interface prévue pour un port-forward.</p>
+</body></html>"""
+
+
+def render_metrics(config: Config, state: RuntimeState) -> str:
+    snapshot = state.snapshot()
+    counts = _status_counts(config)
+    selected = len(selected_source_ids(config))
+    lines = [
+        "# TYPE openarchiver_connector_ready gauge",
+        f"openarchiver_connector_ready {1 if snapshot['ready'] else 0}",
+        "# TYPE openarchiver_connector_selected_sources gauge",
+        f"openarchiver_connector_selected_sources {selected}",
+        "# TYPE openarchiver_connector_objects gauge",
+    ]
+    for kind, values in counts.items():
+        for status, count in sorted(values.items()):
+            lines.append(
+                f'openarchiver_connector_objects{{kind="{kind}",status="{status}"}} {count}'
+            )
+    return "\n".join(lines) + "\n"
+
+
+def make_http_handler(
+    config: Config,
+    state: RuntimeState,
+    *,
+    wake: threading.Event = WAKE,
+) -> type[BaseHTTPRequestHandler]:
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "OpenArchiverConnector/1"
+
+        def _send(self, status: int, body: str, content_type: str) -> None:
+            payload = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+            )
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _redirect(self) -> None:
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_GET(self) -> None:
+            path = urllib.parse.urlsplit(self.path).path
+            try:
+                if path == "/healthz":
+                    running = bool(state.snapshot()["running"])
+                    self._send(
+                        200 if running else 503,
+                        "ok\n" if running else "worker stopped\n",
+                        "text/plain; charset=utf-8",
+                    )
+                elif path == "/readyz":
+                    ready = bool(state.snapshot()["ready"])
+                    self._send(
+                        200 if ready else 503,
+                        "ready\n" if ready else "not ready\n",
+                        "text/plain; charset=utf-8",
+                    )
+                elif path == "/metrics":
+                    self._send(
+                        200,
+                        render_metrics(config, state),
+                        "text/plain; version=0.0.4",
+                    )
+                elif path == "/":
+                    self._send(
+                        200,
+                        render_status_page(config, state),
+                        "text/html; charset=utf-8",
+                    )
+                else:
+                    self._send(404, "not found\n", "text/plain; charset=utf-8")
+            except Exception:
+                LOG.exception("échec de réponse HTTP")
+                self._send(500, "internal error\n", "text/plain; charset=utf-8")
+
+        def do_POST(self) -> None:
+            path = urllib.parse.urlsplit(self.path).path
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length < 0 or length > 65_536:
+                    self._send(413, "request too large\n", "text/plain; charset=utf-8")
+                    return
+                raw = self.rfile.read(length).decode("utf-8")
+                form = urllib.parse.parse_qs(raw, keep_blank_values=True)
+                csrf = form.get("csrf", [""])[0]
+                if not isinstance(csrf, str) or csrf != state.snapshot()["csrf_token"]:
+                    self._send(403, "forbidden\n", "text/plain; charset=utf-8")
+                    return
+                if path == "/sources":
+                    replace_source_selection(config, form.get("source_id", []))
+                    wake.set()
+                    self._redirect()
+                elif path == "/scan":
+                    wake.set()
+                    self._redirect()
+                else:
+                    self._send(404, "not found\n", "text/plain; charset=utf-8")
+            except (UnicodeDecodeError, ValueError, ConnectorError) as error:
+                self._send(400, _safe_error(error) + "\n", "text/plain; charset=utf-8")
+            except Exception:
+                LOG.exception("échec de requête HTTP")
+                self._send(500, "internal error\n", "text/plain; charset=utf-8")
+
+        def log_message(self, template: str, *args: object) -> None:
+            LOG.info("http " + template, *args)
+
+    return Handler
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    config = Config.from_env()
+    read_secret(config.openarchiver_api_key_file, "OpenArchiver")
+    read_secret(config.openrag_api_key_file, "OpenRAG")
+    with database(config):
+        pass
+
+    STOP.clear()
+    WAKE.clear()
+    state = RuntimeState()
+
+    def stop_service(_signum: int, _frame: object) -> None:
+        STOP.set()
+        WAKE.set()
+
+    signal.signal(signal.SIGTERM, stop_service)
+    signal.signal(signal.SIGINT, stop_service)
+    worker = threading.Thread(
+        target=runtime_loop,
+        args=(config, state),
+        name="openarchiver-cycle",
+        daemon=True,
+    )
+    worker.start()
+    server = ThreadingHTTPServer(
+        (config.http_host, config.http_port), make_http_handler(config, state)
+    )
+    server.timeout = 1
+    LOG.info("interface HTTP en écoute sur %s:%d", config.http_host, config.http_port)
+    try:
+        while not STOP.is_set():
+            server.handle_request()
+    finally:
+        STOP.set()
+        WAKE.set()
+        server.server_close()
+        worker.join(timeout=5)
+
+
+if __name__ == "__main__":
+    main()
