@@ -692,7 +692,7 @@ class ConnectorTests(unittest.TestCase):
             self.assertEqual(row["attempts"], 2)
             self.assertEqual(row["next_retry_at"], 0)
 
-    def test_recovery_only_requeues_interrupted_operations(self):
+    def test_recovery_only_marks_interrupted_operations_failed(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory), max_auto_retries=3)
             self._insert_email(config, self.mail("active"), "ingesting")
