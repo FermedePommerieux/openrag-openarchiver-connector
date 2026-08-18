@@ -455,6 +455,28 @@ def set_paused(config: Config, paused: bool) -> None:
         )
 
 
+def reset_state_database(config: Config) -> None:
+    """Vide l'état local du connecteur sans toucher aux systèmes sources.
+
+    Ce que l'on veut : repartir avec un inventaire OpenArchiver vierge.
+    Pourquoi : permettre une reconstruction propre après un test ou un mauvais choix.
+    Comment : vider les tables fonctionnelles dans une transaction et rester en pause.
+    Compatibilité : aucun mail OpenArchiver ni document OpenRAG n'est supprimé.
+    KISS : le schéma et le PVC restent en place ; seul leur contenu fonctionnel est effacé.
+    """
+    with database(config) as db:
+        for table in (
+            "email_attachments",
+            "attachments",
+            "emails",
+            "mailboxes",
+            "sources",
+            "settings",
+        ):
+            db.execute(f"DELETE FROM {table}")
+        db.execute("INSERT INTO settings(key,value) VALUES ('paused','1')")
+
+
 def mailbox_rows(config: Config) -> list[sqlite3.Row]:
     with database(config) as db:
         return list(
@@ -1821,6 +1843,8 @@ class RuntimeState:
         self.last_error = ""
         self.last_scan: ScanResult | None = None
         self.last_processed = 0
+        self.reset_requested_at = 0
+        self.last_reset_at = 0
         self.ready = False
         self.running = False
 
@@ -1841,6 +1865,30 @@ class RuntimeState:
     def cycle_pending(self) -> bool:
         with self.lock:
             return bool(self.cycle_requested_at)
+
+    def reset_requested(self) -> None:
+        with self.lock:
+            self.reset_requested_at = int(time.time())
+
+    def reset_pending(self) -> bool:
+        with self.lock:
+            return bool(self.reset_requested_at)
+
+    def reset_succeeded(self) -> None:
+        with self.lock:
+            self.reset_requested_at = 0
+            self.last_reset_at = int(time.time())
+            self.last_cycle_started_at = 0
+            self.last_cycle_completed_at = 0
+            self.cycle_requested_at = 0
+            self.last_error = ""
+            self.last_scan = None
+            self.last_processed = 0
+            self.ready = True
+
+    def reset_failed(self, error: Exception) -> None:
+        with self.lock:
+            self.last_error = _safe_error(error)
 
     def cycle_succeeded(self, scan: ScanResult, processed: int) -> None:
         with self.lock:
@@ -1870,6 +1918,8 @@ class RuntimeState:
                 "last_error": self.last_error,
                 "last_scan": self.last_scan,
                 "last_processed": self.last_processed,
+                "reset_requested_at": self.reset_requested_at,
+                "last_reset_at": self.last_reset_at,
                 "ready": self.ready,
                 "running": self.running,
             }
@@ -1905,6 +1955,19 @@ def runtime_loop(
         if recovered:
             LOG.warning("%d opération(s) interrompue(s) récupérée(s)", recovered)
         while not stop.is_set():
+            if state.reset_pending():
+                try:
+                    reset_state_database(config)
+                    state.reset_succeeded()
+                    LOG.info("base locale remise à zéro")
+                    delay = config.scan_interval_seconds
+                except Exception as error:
+                    state.reset_failed(error)
+                    LOG.error("remise à zéro en échec: %s", _safe_error(error))
+                    delay = config.cycle_retry_seconds
+                wake.wait(delay)
+                wake.clear()
+                continue
             paused = is_paused(config)
             if paused and not state.cycle_pending():
                 LOG.info("indexation en pause; inventaire IMAP manuel en attente")
@@ -2035,6 +2098,16 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
     pause_label = "Reprendre l’indexation" if paused else "Mettre en pause"
     pause_action = "resume" if paused else "pause"
     activity = "en pause" if paused else "active"
+    if snapshot["reset_requested_at"]:
+        reset_status = (
+            "Remise à zéro demandée ; attente de la fin des opérations en cours."
+        )
+    elif snapshot["last_reset_at"]:
+        reset_status = "Dernière remise à zéro : " + time.strftime(
+            "%Y-%m-%d %H:%M:%S UTC", time.gmtime(int(snapshot["last_reset_at"]))
+        )
+    else:
+        reset_status = "Aucune remise à zéro depuis le démarrage."
     return f"""<!doctype html>
 <html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2044,6 +2117,7 @@ body{{font-family:system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:
 fieldset{{border:1px solid #ccc;border-radius:.5rem;padding:1rem}}label{{display:block;margin:.6rem 0}}
 button{{padding:.55rem .9rem;margin:.5rem .5rem 0 0}}code{{background:#f2f2f2;padding:.1rem .3rem}}
 .muted{{color:#666}}.error{{color:#9b1c1c}}dt{{font-weight:700}}dd{{margin-bottom:.5rem}}
+.danger{{border:1px solid #b91c1c;border-radius:.5rem;padding:1rem;margin-top:1.5rem}}
 .inventory-status{{border:0;width:100%;height:1.6rem;vertical-align:middle}}
 </style></head><body>
 <h1>Connecteur OpenArchiver → OpenRAG</h1>
@@ -2071,6 +2145,14 @@ l’inventaire des sources et dossiers IMAP.</p>
 <form method="post" action="/pause"><input type="hidden" name="csrf" value="{csrf}">
 <input type="hidden" name="action" value="{pause_action}">
 <button type="submit">{pause_label}</button></form>
+<section class="danger"><h2>Remise à zéro</h2>
+<p>Efface l’inventaire, les sélections et l’historique local du connecteur.
+Aucun mail OpenArchiver ni document OpenRAG n’est supprimé. Le connecteur reste en pause.</p>
+<p class="muted">{html.escape(reset_status)}</p>
+<form method="post" action="/reset"><input type="hidden" name="csrf" value="{csrf}">
+<label>Saisir <code>RESET</code> pour confirmer
+<input name="confirmation" required pattern="RESET"></label>
+<button type="submit">Remettre la base locale à zéro</button></form></section>
 <p class="muted">Aucune suppression OpenRAG n'est automatique.
 Interface prévue pour un port-forward.</p>
 </body></html>"""
@@ -2220,6 +2302,16 @@ def make_http_handler(
                     self._redirect()
                 elif path == "/scan":
                     state.cycle_requested()
+                    wake.set()
+                    self._redirect()
+                elif path == "/reset":
+                    if form.get("confirmation", [""])[0] != "RESET":
+                        raise ConnectorError("confirmation de remise à zéro absente")
+                    # La pause empêche les workers de réserver un nouvel objet.
+                    # Le thread runtime exécute ensuite le reset, après la fin
+                    # des quelques tâches qui étaient déjà en cours.
+                    set_paused(config, True)
+                    state.reset_requested()
                     wake.set()
                     self._redirect()
                 else:

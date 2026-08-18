@@ -1114,6 +1114,21 @@ class ConnectorTests(unittest.TestCase):
                     self.assertEqual(response.status, 200)
                 self.assertTrue(connector.is_paused(config))
 
+                reset = urllib.request.Request(
+                    base + "/reset",
+                    data=urllib.parse.urlencode(
+                        {
+                            "csrf": state.snapshot()["csrf_token"],
+                            "confirmation": "RESET",
+                        }
+                    ).encode("ascii"),
+                )
+                with urllib.request.urlopen(reset) as response:
+                    reset_page = response.read().decode("utf-8")
+                self.assertTrue(state.snapshot()["reset_requested_at"])
+                self.assertIn("Remise à zéro demandée", reset_page)
+                self.assertIn("Remettre la base locale à zéro", reset_page)
+
                 bad = urllib.request.Request(
                     base + "/scan",
                     data=urllib.parse.urlencode({"csrf": "bad"}).encode("ascii"),
@@ -1241,6 +1256,53 @@ class ConnectorTests(unittest.TestCase):
             self.assertIsNone(connector.claim_next(config, now=1))
             connector.set_paused(config, False)
             self.assertEqual(connector.claim_next(config, now=1).object_id, "archive")
+
+    def test_pending_reset_clears_local_database_and_stays_paused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory), scan_interval_seconds=3600)
+            self._insert_email(config)
+            state = connector.RuntimeState()
+            state.reset_requested()
+            connector.set_paused(config, True)
+            stop = threading.Event()
+            wake = threading.Event()
+            thread = threading.Thread(
+                target=connector.runtime_loop,
+                args=(config, state),
+                kwargs={
+                    "openarchiver": FakeArchive(),
+                    "openrag": FakeOpenRAG(),
+                    "stop": stop,
+                    "wake": wake,
+                },
+                daemon=True,
+            )
+            thread.start()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not state.snapshot()["last_reset_at"]:
+                time.sleep(0.01)
+            stop.set()
+            wake.set()
+            thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertGreater(state.snapshot()["last_reset_at"], 0)
+            self.assertTrue(connector.is_paused(config))
+            db = connector.connect_db(config)
+            try:
+                counts = {
+                    table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in (
+                        "sources",
+                        "mailboxes",
+                        "emails",
+                        "attachments",
+                        "email_attachments",
+                    )
+                }
+            finally:
+                db.close()
+            self.assertEqual(counts, {table: 0 for table in counts})
 
     def test_paused_runtime_manually_inventories_without_indexing(self):
         with tempfile.TemporaryDirectory() as directory:
