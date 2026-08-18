@@ -435,6 +435,27 @@ class ConnectorTests(unittest.TestCase):
             with self.assertRaisesRegex(connector.ConnectorError, "JSON"):
                 invalid.list_sources()
 
+    def test_incomplete_json_response_is_retried(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            calls = []
+
+            class InterruptedResponse(Response):
+                def read(self, size=-1):
+                    raise connector.http.client.IncompleteRead(b"[")
+
+            outcomes = [InterruptedResponse(), Response(b"[]")]
+
+            def opener(*_args, **_kwargs):
+                calls.append(1)
+                return outcomes.pop(0)
+
+            client = connector.OpenArchiverClient(
+                config, opener=opener, sleeper=lambda _seconds: None
+            )
+            self.assertEqual(client.list_sources(), [])
+            self.assertEqual(len(calls), 2)
+
     def write_message(self, root, message):
         path = root / "mail.eml"
         path.write_bytes(message.as_bytes())
@@ -701,6 +722,10 @@ class ConnectorTests(unittest.TestCase):
                     self.assertEqual(response.status, 200)
                 with urllib.request.urlopen(base + "/readyz") as response:
                     self.assertEqual(response.status, 200)
+                state.cycle_failed(connector.ConnectorError("échec temporaire"))
+                with urllib.request.urlopen(base + "/readyz") as response:
+                    self.assertEqual(response.status, 200)
+                self.assertFalse(state.snapshot()["ready"])
                 with urllib.request.urlopen(base + "/") as response:
                     page = response.read().decode("utf-8")
                 self.assertIn("source-1", page)
@@ -724,6 +749,9 @@ class ConnectorTests(unittest.TestCase):
                 state.set_running(False)
                 with self.assertRaises(urllib.error.HTTPError) as stopped:
                     urllib.request.urlopen(base + "/healthz")
+                self.assertEqual(stopped.exception.code, 503)
+                with self.assertRaises(urllib.error.HTTPError) as stopped:
+                    urllib.request.urlopen(base + "/readyz")
                 self.assertEqual(stopped.exception.code, 503)
             finally:
                 server.shutdown()
