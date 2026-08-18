@@ -1,11 +1,13 @@
 """Cœur du connecteur OpenArchiver vers OpenRAG.
 
-Ce que l'on veut : sélectionner des sources OpenArchiver et indexer dans
-OpenRAG un Markdown stable par mail ainsi que chaque pièce jointe compatible.
+Ce que l'on veut : sélectionner des sources et dossiers IMAP OpenArchiver,
+mettre leur indexation en pause, et produire dans OpenRAG un Markdown stable
+par mail ainsi que chaque pièce jointe compatible.
 Pourquoi : rendre les archives interrogeables sans coupler les deux projets ni
 recharger les contenus déjà connus à chacun des scans.
 Comment : parcourir l'API OpenArchiver de manière conservative, conserver les
-identités et la file dans SQLite, puis utiliser l'API publique OpenRAG.
+identités, dossiers, sélections, pause et file dans SQLite, puis utiliser l'API
+publique OpenRAG.
 Compatibilité : le protocole multipart, le suivi des tâches et les réservations
 SQLite reprennent les principes éprouvés du connecteur NAS sans le modifier.
 KISS : un module Python standard, un fichier SQLite, aucun fork, broker,
@@ -127,7 +129,7 @@ class Config:
         config = cls(
             openarchiver_base_url=values.get(
                 "OPENARCHIVER_BASE_URL",
-                "http://openarchiver.openarchiver.svc.cluster.local:3000/api/v1",
+                "http://openarchiver-api.openarchiver.svc.cluster.local:4000/v1",
             ).rstrip("/"),
             openarchiver_api_key_file=Path(
                 values.get(
@@ -242,6 +244,7 @@ def connect_db(config: Config) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS emails (
             id TEXT PRIMARY KEY,
             source_id TEXT NOT NULL,
+            mailbox_path TEXT NOT NULL DEFAULT '',
             thread_id TEXT NOT NULL DEFAULT '',
             sent_at TEXT NOT NULL DEFAULT '',
             subject TEXT NOT NULL DEFAULT '',
@@ -295,6 +298,16 @@ def connect_db(config: Config) -> sqlite3.Connection:
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS mailboxes (
+            source_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            selected INTEGER NOT NULL DEFAULT 0,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            first_seen_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            PRIMARY KEY (source_id, path),
+            FOREIGN KEY (source_id) REFERENCES sources(id)
+        );
         CREATE INDEX IF NOT EXISTS emails_queue
             ON emails(status, next_retry_at);
         CREATE INDEX IF NOT EXISTS attachments_queue
@@ -306,6 +319,13 @@ def connect_db(config: Config) -> sqlite3.Connection:
     }
     if "sha256" not in email_columns:
         db.execute("ALTER TABLE emails ADD COLUMN sha256 TEXT NOT NULL DEFAULT ''")
+    if "mailbox_path" not in email_columns:
+        db.execute(
+            "ALTER TABLE emails ADD COLUMN mailbox_path TEXT NOT NULL DEFAULT ''"
+        )
+    db.execute(
+        "INSERT OR IGNORE INTO settings(key,value) VALUES ('paused','0')"
+    )
     db.commit()
     return db
 
@@ -353,6 +373,57 @@ def source_rows(config: Config) -> list[sqlite3.Row]:
                    FROM sources ORDER BY name, id"""
             )
         )
+
+
+def is_paused(config: Config) -> bool:
+    with database(config) as db:
+        row = db.execute(
+            "SELECT value FROM settings WHERE key='paused'"
+        ).fetchone()
+        return bool(row and str(row[0]) == "1")
+
+
+def set_paused(config: Config, paused: bool) -> None:
+    with database(config) as db:
+        db.execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES ('paused',?)",
+            ("1" if paused else "0",),
+        )
+
+
+def mailbox_rows(config: Config) -> list[sqlite3.Row]:
+    with database(config) as db:
+        return list(
+            db.execute(
+                """
+                SELECT m.source_id, m.path, m.selected, m.message_count,
+                       m.last_seen_at, s.name AS source_name
+                FROM mailboxes m
+                JOIN sources s ON s.id=m.source_id
+                ORDER BY s.name, m.source_id, m.path
+                """
+            )
+        )
+
+
+def replace_mailbox_selection(
+    config: Config, selections: Iterable[tuple[str, str]]
+) -> list[tuple[str, str]]:
+    """Remplace atomiquement la sélection par des dossiers déjà découverts."""
+    requested = sorted(set(selections))
+    with database(config) as db:
+        known = {
+            (str(row[0]), str(row[1]))
+            for row in db.execute("SELECT source_id, path FROM mailboxes")
+        }
+        if set(requested) - known:
+            raise ConnectorError("sélection contenant un dossier inconnu")
+        db.execute("UPDATE mailboxes SET selected=0")
+        db.executemany(
+            "UPDATE mailboxes SET selected=1 WHERE source_id=? AND path=?",
+            requested,
+        )
+    return requested
 
 
 def replace_source_selection(config: Config, source_ids: Iterable[str]) -> list[str]:
@@ -665,6 +736,29 @@ def scan_selected_sources(config: Config, client: OpenArchiverClient) -> ScanRes
         return ScanResult(len(source_ids), len(global_emails), False, True)
 
     with database(config) as db:
+        if source_ids:
+            placeholders = ",".join("?" for _ in source_ids)
+            db.execute(
+                f"UPDATE mailboxes SET message_count=0 "
+                f"WHERE source_id IN ({placeholders})",
+                source_ids,
+            )
+        mailbox_counts: dict[tuple[str, str], int] = {}
+        for email in global_emails.values():
+            key = (str(email["source_id"]), str(email["mailbox_path"]))
+            mailbox_counts[key] = mailbox_counts.get(key, 0) + 1
+        for (source_id, path), count in mailbox_counts.items():
+            db.execute(
+                """
+                INSERT INTO mailboxes(
+                    source_id, path, message_count, first_seen_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(source_id,path) DO UPDATE SET
+                    message_count=excluded.message_count,
+                    last_seen_at=excluded.last_seen_at
+                """,
+                (source_id, path, count, scan_started, scan_started),
+            )
         for email in global_emails.values():
             _upsert_email(db, email, scan_started)
         if source_ids:
@@ -699,6 +793,7 @@ def _validate_email(raw: dict[str, object], fallback_source: str) -> dict[str, o
     return {
         "id": email_id,
         "source_id": source_id,
+        "mailbox_path": _optional_text(raw.get("path")),
         "thread_id": _optional_text(raw.get("threadId")),
         "sent_at": _optional_text(raw.get("sentAt")),
         "subject": _optional_text(raw.get("subject")),
@@ -777,6 +872,7 @@ def _upsert_email(db: sqlite3.Connection, email: dict[str, object], now: int) ->
         (
             "id",
             "source_id",
+            "mailbox_path",
             "thread_id",
             "sent_at",
             "subject",
@@ -794,13 +890,14 @@ def _upsert_email(db: sqlite3.Connection, email: dict[str, object], now: int) ->
     db.execute(
         """
         INSERT INTO emails(
-            id, source_id, thread_id, sent_at, subject, sender_name,
+            id, source_id, mailbox_path, thread_id, sent_at, subject, sender_name,
             sender_email, recipients_json, cc_json, message_id, storage_path,
             storage_hash, size_bytes, has_attachments, fingerprint,
             openrag_filename, status, first_seen_at, last_seen_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
         ON CONFLICT(id) DO UPDATE SET
-            source_id=excluded.source_id, thread_id=excluded.thread_id,
+            source_id=excluded.source_id, mailbox_path=excluded.mailbox_path,
+            thread_id=excluded.thread_id,
             sent_at=excluded.sent_at, subject=excluded.subject,
             sender_name=excluded.sender_name, sender_email=excluded.sender_email,
             recipients_json=excluded.recipients_json, cc_json=excluded.cc_json,
@@ -823,6 +920,7 @@ def _upsert_email(db: sqlite3.Connection, email: dict[str, object], now: int) ->
         (
             email["id"],
             email["source_id"],
+            email["mailbox_path"],
             email["thread_id"],
             email["sent_at"],
             email["subject"],
@@ -1075,6 +1173,7 @@ def render_mail_markdown(
         field("Identifiant OpenArchiver", value(email_row, "id")),
         field("Source", value(email_row, "source_id")),
         field("Nom de la source", source_name),
+        field("Dossier IMAP", value(email_row, "mailbox_path")),
         field("Thread", value(email_row, "thread_id")),
         field("Date", value(email_row, "sent_at")),
         field(
@@ -1230,18 +1329,31 @@ def claim_next(config: Config, *, now: int | None = None) -> WorkItem | None:
     db = connect_db(config)
     try:
         db.execute("BEGIN IMMEDIATE")
+        paused = db.execute(
+            "SELECT value FROM settings WHERE key='paused'"
+        ).fetchone()
+        if paused is not None and str(paused[0]) == "1":
+            db.commit()
+            return None
         for kind, table in (("email", "emails"), ("attachment", "attachments")):
             selection_clause = (
                 """EXISTS (
                        SELECT 1 FROM sources s
-                       WHERE s.id=emails.source_id AND s.selected=1
+                       JOIN mailboxes m
+                         ON m.source_id=emails.source_id
+                        AND m.path=emails.mailbox_path
+                       WHERE s.id=emails.source_id
+                         AND s.selected=1 AND m.selected=1
                    )"""
                 if kind == "email"
                 else """EXISTS (
                        SELECT 1 FROM email_attachments ea
                        JOIN emails e ON e.id=ea.email_id
                        JOIN sources s ON s.id=e.source_id
-                       WHERE ea.attachment_id=attachments.id AND s.selected=1
+                       JOIN mailboxes m
+                         ON m.source_id=e.source_id AND m.path=e.mailbox_path
+                       WHERE ea.attachment_id=attachments.id
+                         AND s.selected=1 AND m.selected=1
                    )"""
             )
             row = db.execute(
@@ -1523,6 +1635,11 @@ def runtime_loop(
         if recovered:
             LOG.warning("%d opération(s) interrompue(s) récupérée(s)", recovered)
         while not stop.is_set():
+            if is_paused(config):
+                LOG.info("indexation en pause")
+                wake.wait(config.scan_interval_seconds)
+                wake.clear()
+                continue
             state.cycle_started()
             try:
                 scan, processed = run_cycle(config, archive_client, rag_client)
@@ -1558,7 +1675,9 @@ def _status_counts(config: Config) -> dict[str, dict[str, int]]:
 def render_status_page(config: Config, state: RuntimeState) -> str:
     snapshot = state.snapshot()
     sources = source_rows(config)
+    mailboxes = mailbox_rows(config)
     counts = _status_counts(config)
+    paused = is_paused(config)
     csrf = html.escape(str(snapshot["csrf_token"]), quote=True)
 
     source_lines = []
@@ -1578,6 +1697,27 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
             "Vérifier le Secret et OpenArchiver.</p>"
         )
 
+    mailbox_lines = []
+    for row in mailboxes:
+        source_id = str(row["source_id"])
+        path = str(row["path"])
+        token = html.escape(
+            json.dumps([source_id, path], ensure_ascii=False), quote=True
+        )
+        label = html.escape(path or "(sans dossier)")
+        source = html.escape(str(row["source_name"] or source_id))
+        checked = " checked" if int(row["selected"]) else ""
+        mailbox_lines.append(
+            f'<label><input type="checkbox" name="mailbox" value="{token}"'
+            f"{checked}> <strong>{label}</strong> "
+            f'<span class="muted">({source}, {int(row["message_count"])} mails)</span></label>'
+        )
+    if not mailbox_lines:
+        mailbox_lines.append(
+            '<p class="muted">Aucun dossier découvert. Sélectionner une source, '
+            "enregistrer, puis attendre la fin du cycle d’inventaire.</p>"
+        )
+
     def count_lines(table: str) -> str:
         values = counts[table]
         if not values:
@@ -1588,6 +1728,9 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 
     error = html.escape(str(snapshot["last_error"] or "aucune"))
     ready = "prêt" if snapshot["ready"] else "non prêt"
+    pause_label = "Reprendre l’indexation" if paused else "Mettre en pause"
+    pause_action = "resume" if paused else "pause"
+    activity = "en pause" if paused else "active"
     return f"""<!doctype html>
 <html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1600,6 +1743,7 @@ button{{padding:.55rem .9rem;margin:.5rem .5rem 0 0}}code{{background:#f2f2f2;pa
 </style></head><body>
 <h1>Connecteur OpenArchiver → OpenRAG</h1>
 <p>État runtime : <strong>{ready}</strong></p>
+<p>Indexation : <strong>{activity}</strong></p>
 <dl><dt>Dernière erreur</dt><dd class="error">{error}</dd>
 <dt>Mails</dt><dd>{count_lines('emails')}</dd>
 <dt>Pièces jointes</dt><dd>{count_lines('attachments')}</dd></dl>
@@ -1607,8 +1751,15 @@ button{{padding:.55rem .9rem;margin:.5rem .5rem 0 0}}code{{background:#f2f2f2;pa
 <input type="hidden" name="csrf" value="{csrf}">
 {''.join(source_lines)}
 <button type="submit">Enregistrer la sélection et scanner</button></fieldset></form>
+<form method="post" action="/mailboxes"><fieldset><legend>Dossiers IMAP indexés</legend>
+<input type="hidden" name="csrf" value="{csrf}">
+{''.join(mailbox_lines)}
+<button type="submit">Enregistrer les dossiers et scanner</button></fieldset></form>
 <form method="post" action="/scan"><input type="hidden" name="csrf" value="{csrf}">
 <button type="submit">Relancer un cycle</button></form>
+<form method="post" action="/pause"><input type="hidden" name="csrf" value="{csrf}">
+<input type="hidden" name="action" value="{pause_action}">
+<button type="submit">{pause_label}</button></form>
 <p class="muted">Aucune suppression OpenRAG n'est automatique.
 Interface prévue pour un port-forward.</p>
 </body></html>"""
@@ -1618,11 +1769,17 @@ def render_metrics(config: Config, state: RuntimeState) -> str:
     snapshot = state.snapshot()
     counts = _status_counts(config)
     selected = len(selected_source_ids(config))
+    selected_mailboxes = sum(int(row["selected"]) for row in mailbox_rows(config))
+    paused = is_paused(config)
     lines = [
         "# TYPE openarchiver_connector_ready gauge",
         f"openarchiver_connector_ready {1 if snapshot['ready'] else 0}",
         "# TYPE openarchiver_connector_selected_sources gauge",
         f"openarchiver_connector_selected_sources {selected}",
+        "# TYPE openarchiver_connector_selected_mailboxes gauge",
+        f"openarchiver_connector_selected_mailboxes {selected_mailboxes}",
+        "# TYPE openarchiver_connector_paused gauge",
+        f"openarchiver_connector_paused {1 if paused else 0}",
         "# TYPE openarchiver_connector_objects gauge",
     ]
     for kind, values in counts.items():
@@ -1716,6 +1873,27 @@ def make_http_handler(
                     return
                 if path == "/sources":
                     replace_source_selection(config, form.get("source_id", []))
+                    wake.set()
+                    self._redirect()
+                elif path == "/mailboxes":
+                    selections = []
+                    for value in form.get("mailbox", []):
+                        decoded = json.loads(value)
+                        if (
+                            not isinstance(decoded, list)
+                            or len(decoded) != 2
+                            or not all(isinstance(item, str) for item in decoded)
+                        ):
+                            raise ConnectorError("sélection de dossier invalide")
+                        selections.append((decoded[0], decoded[1]))
+                    replace_mailbox_selection(config, selections)
+                    wake.set()
+                    self._redirect()
+                elif path == "/pause":
+                    action = form.get("action", [""])[0]
+                    if action not in {"pause", "resume"}:
+                        raise ConnectorError("action de pause invalide")
+                    set_paused(config, action == "pause")
                     wake.set()
                     self._redirect()
                 elif path == "/scan":

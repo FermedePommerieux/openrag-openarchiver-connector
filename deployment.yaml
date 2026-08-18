@@ -40,7 +40,7 @@ spec:
             - name: STATE_DB
               value: /state/connector.sqlite3
             - name: OPENARCHIVER_BASE_URL
-              value: http://openarchiver.openarchiver.svc.cluster.local:3000/api/v1
+              value: http://openarchiver-api.openarchiver.svc.cluster.local:4000/v1
             - name: OPENARCHIVER_API_KEY_FILE
               value: /var/run/secrets/connector/openarchiver-api-key
             - name: OPENRAG_BASE_URL

@@ -136,6 +136,7 @@ class ConnectorTests(unittest.TestCase):
             "messageIdHeader": f"<{identifier}@example.invalid>",
             "storagePath": f"mail/{identifier}.eml",
             "storageHashSha256": f"hash-{identifier}",
+            "path": "INBOX",
             "sizeBytes": 100,
             "hasAttachments": False,
         }
@@ -170,6 +171,10 @@ class ConnectorTests(unittest.TestCase):
             self.assertEqual(connector.read_secret(loaded.openrag_api_key_file, "RAG"), "rag-secret")
             self.assertEqual(loaded.supported_extensions, frozenset({".pdf", ".xlsx"}))
             self.assertEqual(loaded.ingestion_concurrency, 3)
+            self.assertEqual(
+                loaded.openarchiver_base_url,
+                "http://openarchiver-api.openarchiver.svc.cluster.local:4000/v1",
+            )
 
             defaults = connector.Config.from_env(
                 {
@@ -209,8 +214,10 @@ class ConnectorTests(unittest.TestCase):
                     row["name"] for row in db.execute("PRAGMA table_info(emails)")
                 }
                 db.close()
-            self.assertTrue({"sources", "emails", "attachments", "email_attachments", "settings"} <= tables)
+            self.assertTrue({"sources", "mailboxes", "emails", "attachments", "email_attachments", "settings"} <= tables)
             self.assertIn("sha256", email_columns)
+            self.assertIn("mailbox_path", email_columns)
+            self.assertFalse(connector.is_paused(config))
 
     def test_refresh_and_select_sources(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -283,6 +290,7 @@ class ConnectorTests(unittest.TestCase):
             self.assertTrue(result.complete)
             row = self.rows(config, "emails")[0]
             self.assertEqual(row["source_id"], "root")
+            connector.replace_mailbox_selection(config, [("root", "INBOX")])
             self.assertIsNotNone(connector.claim_next(config, now=1))
 
     def test_pages_moved_trigger_one_stabilisation_pass(self):
@@ -531,6 +539,15 @@ class ConnectorTests(unittest.TestCase):
         connector.set_source_selected(config, data["source_id"], True)
         db = connector.connect_db(config)
         connector._upsert_email(db, data, 1)
+        db.execute(
+            """
+            INSERT OR REPLACE INTO mailboxes(
+                source_id, path, selected, message_count,
+                first_seen_at, last_seen_at
+            ) VALUES (?, ?, 1, 1, 1, 1)
+            """,
+            (data["source_id"], data["mailbox_path"]),
+        )
         db.execute("UPDATE emails SET status=? WHERE id=?", (status, data["id"]))
         db.commit()
         db.close()
@@ -739,6 +756,19 @@ class ConnectorTests(unittest.TestCase):
                 self.assertEqual(connector.selected_source_ids(config), [])
                 self.assertTrue(wake.is_set())
 
+                pause = urllib.request.Request(
+                    base + "/pause",
+                    data=urllib.parse.urlencode(
+                        {
+                            "csrf": state.snapshot()["csrf_token"],
+                            "action": "pause",
+                        }
+                    ).encode("ascii"),
+                )
+                with urllib.request.urlopen(pause) as response:
+                    self.assertEqual(response.status, 200)
+                self.assertTrue(connector.is_paused(config))
+
                 bad = urllib.request.Request(
                     base + "/scan",
                     data=urllib.parse.urlencode({"csrf": "bad"}).encode("ascii"),
@@ -776,6 +806,10 @@ class ConnectorTests(unittest.TestCase):
         self.assertIn("automountServiceAccountToken: false", deployment)
         self.assertIn("readOnlyRootFilesystem: true", deployment)
         self.assertIn("openrag-openarchiver-connector-api", deployment)
+        self.assertIn(
+            "http://openarchiver-api.openarchiver.svc.cluster.local:4000/v1",
+            deployment,
+        )
         self.assertIn("openarchiver-api-key", deployment)
         self.assertIn("openrag-api-key", deployment)
         self.assertIn("type: ClusterIP", service)
@@ -815,6 +849,97 @@ class ConnectorTests(unittest.TestCase):
         self.assertNotIn("kind: Secret", manifests)
         self.assertNotIn("stringData:", manifests)
         self.assertNotIn("data:\n  openarchiver-api-key", manifests)
+
+    def test_mailbox_discovery_selection_and_pause_are_conservative(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory), page_limit=10)
+            self.select(config, "source-1")
+            result = connector.scan_selected_sources(
+                config,
+                FakeArchive(
+                    pages={
+                        ("source-1", 1): {
+                            "items": [
+                                self.mail("inbox", path="INBOX"),
+                                self.mail("archive", path="Archives/2026"),
+                            ],
+                            "total": 2,
+                        }
+                    }
+                ),
+            )
+            self.assertTrue(result.complete)
+            rows = connector.mailbox_rows(config)
+            self.assertEqual(
+                [(row["path"], row["message_count"]) for row in rows],
+                [("Archives/2026", 1), ("INBOX", 1)],
+            )
+            self.assertIsNone(connector.claim_next(config, now=1))
+
+            connector.replace_mailbox_selection(config, [("source-1", "INBOX")])
+            claimed = connector.claim_next(config, now=1)
+            self.assertIsNotNone(claimed)
+            self.assertEqual(claimed.object_id, "inbox")
+
+            connector.replace_mailbox_selection(
+                config,
+                [("source-1", "INBOX"), ("source-1", "Archives/2026")],
+            )
+            connector.set_paused(config, True)
+            self.assertTrue(connector.is_paused(config))
+            self.assertIsNone(connector.claim_next(config, now=1))
+            connector.set_paused(config, False)
+            self.assertEqual(connector.claim_next(config, now=1).object_id, "archive")
+
+    def test_mailbox_selection_rejects_unknown_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            with self.assertRaisesRegex(connector.ConnectorError, "inconnu"):
+                connector.replace_mailbox_selection(
+                    config, [("source-1", "INBOX")]
+                )
+
+    def test_deselected_mailbox_blocks_an_existing_attachment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            self._insert_email(config, self.mail("mail-1", path="INBOX"))
+            connector.inventory_attachments(
+                config,
+                "mail-1",
+                {
+                    "attachments": [
+                        {
+                            "id": "att-1",
+                            "filename": "document.pdf",
+                            "sizeBytes": 4,
+                            "storagePath": "att/path",
+                        }
+                    ]
+                },
+            )
+            db = connector.connect_db(config)
+            db.execute("UPDATE emails SET status='validated'")
+            db.commit()
+            db.close()
+
+            connector.replace_mailbox_selection(config, [])
+            self.assertIsNone(connector.claim_next(config, now=1))
+            connector.replace_mailbox_selection(config, [("source-1", "INBOX")])
+            claimed = connector.claim_next(config, now=1)
+            self.assertIsNotNone(claimed)
+            self.assertEqual((claimed.kind, claimed.object_id), ("attachment", "att-1"))
+
+    def test_openarchiver_backend_has_a_private_service(self):
+        manifest = (
+            MODULE_PATH.parents[3] / "apps/openarchiver/openarchiver.yaml"
+        ).read_text(encoding="utf-8")
+        api_service = manifest.split("  name: openarchiver-api", 1)[1].split(
+            "---", 1
+        )[0]
+        self.assertIn("type: ClusterIP", api_service)
+        self.assertIn("port: 4000", api_service)
+        self.assertIn("targetPort: backend", api_service)
+        self.assertNotIn("NodePort", api_service)
 
     def test_process_mail_downloads_once_then_validates(self):
         with tempfile.TemporaryDirectory() as directory:
