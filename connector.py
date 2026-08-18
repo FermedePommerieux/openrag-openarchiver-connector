@@ -332,19 +332,31 @@ def selected_source_ids(config: Config) -> list[str]:
 
 
 def recover_interrupted(config: Config) -> int:
-    """Remet les opérations interrompues en file sans toucher aux validées."""
+    """Replace les opérations interrompues en échec avec un retry borné."""
+    now = int(time.time())
     recovered = 0
     with database(config) as db:
         for table in ("emails", "attachments"):
-            cursor = db.execute(
-                f"""
-                UPDATE {table}
-                SET status='queued', task_id='', next_retry_at=0,
-                    last_error='opération interrompue; remise en file'
-                WHERE status IN ('downloading', 'ingesting')
-                """
-            )
-            recovered += cursor.rowcount
+            rows = db.execute(
+                f"SELECT id, attempts FROM {table} "
+                "WHERE status IN ('downloading', 'ingesting')"
+            ).fetchall()
+            for row in rows:
+                retry_at = (
+                    now + config.retry_base_seconds
+                    if int(row["attempts"]) < config.max_auto_retries
+                    else 0
+                )
+                db.execute(
+                    f"""
+                    UPDATE {table}
+                    SET status='failed', task_id='', next_retry_at=?,
+                        last_error='opération interrompue par un redémarrage'
+                    WHERE id=?
+                    """,
+                    (retry_at, row["id"]),
+                )
+                recovered += 1
     return recovered
 
 
@@ -732,6 +744,9 @@ def _upsert_email(db: sqlite3.Connection, email: dict[str, object], now: int) ->
             message_id=excluded.message_id, storage_path=excluded.storage_path,
             storage_hash=excluded.storage_hash, size_bytes=excluded.size_bytes,
             has_attachments=excluded.has_attachments,
+            sha256=CASE
+                WHEN emails.fingerprint <> excluded.fingerprint THEN ''
+                ELSE emails.sha256 END,
             status=CASE
                 WHEN emails.fingerprint <> excluded.fingerprint THEN 'queued'
                 WHEN emails.status IN ('missing','unavailable') THEN 'queued'
@@ -846,12 +861,21 @@ def inventory_attachments(
                         WHEN attachments.metadata_fingerprint <> excluded.metadata_fingerprint
                             THEN excluded.status
                         ELSE attachments.status END,
+                    sha256=CASE
+                        WHEN attachments.metadata_fingerprint <> excluded.metadata_fingerprint
+                            THEN '' ELSE attachments.sha256 END,
                     attempts=CASE
                         WHEN attachments.metadata_fingerprint <> excluded.metadata_fingerprint
                             THEN 0 ELSE attachments.attempts END,
                     last_error=CASE
                         WHEN attachments.metadata_fingerprint <> excluded.metadata_fingerprint
                             THEN excluded.last_error ELSE attachments.last_error END,
+                    next_retry_at=CASE
+                        WHEN attachments.metadata_fingerprint <> excluded.metadata_fingerprint
+                            THEN 0 ELSE attachments.next_retry_at END,
+                    task_id=CASE
+                        WHEN attachments.metadata_fingerprint <> excluded.metadata_fingerprint
+                            THEN '' ELSE attachments.task_id END,
                     metadata_fingerprint=excluded.metadata_fingerprint,
                     last_seen_at=excluded.last_seen_at
                 """,
@@ -1080,11 +1104,11 @@ class OpenRAGClient:
             raise ConnectorError("réponse OpenRAG sans task_id")
         return task_id
 
-    def task(self, task_id: str) -> dict[str, object]:
+    def task(self, task_id: str, *, path: str | None = None) -> dict[str, object]:
         encoded = urllib.parse.quote(task_id, safe="")
-        path = self.config.openrag_task_path.format(task_id=encoded)
+        request_path = path or self.config.openrag_task_path.format(task_id=encoded)
         request = urllib.request.Request(
-            self.config.openrag_base_url + path,
+            self.config.openrag_base_url + request_path,
             headers={
                 "X-API-Key": read_secret(self.config.openrag_api_key_file, "OpenRAG"),
                 "Accept": "application/json",
@@ -1105,8 +1129,17 @@ class OpenRAGClient:
 
     def wait(self, task_id: str) -> None:
         deadline = time.monotonic() + self.config.task_timeout_seconds
+        encoded = urllib.parse.quote(task_id, safe="")
+        path = self.config.openrag_task_path.format(task_id=encoded)
+        fallback = f"/v1/tasks/{encoded}"
         while time.monotonic() < deadline:
-            payload = self.task(task_id)
+            try:
+                payload = self.task(task_id, path=path)
+            except HTTPStatusError as error:
+                if error.status == 404 and path != fallback:
+                    path = fallback
+                    continue
+                raise
             status = str(payload.get("status", "")).lower()
             if status == "completed":
                 if _failed_count(payload.get("failed_files")) == 0:
