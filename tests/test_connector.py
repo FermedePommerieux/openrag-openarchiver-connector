@@ -1129,6 +1129,96 @@ class ConnectorTests(unittest.TestCase):
                 [row["id"] for row in connector.source_rows(config)], ["source-1"]
             )
 
+    def test_valid_inventory_is_reused_for_one_hour(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            now = int(time.time())
+            with connector.database(config) as db:
+                db.executemany(
+                    "INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)",
+                    (
+                        ("last_inventory_completed_at", str(now)),
+                        ("last_inventory_sources", "1"),
+                        ("last_inventory_emails", "1"),
+                    ),
+                )
+            archive = FakeArchive()
+            with mock.patch.object(
+                archive,
+                "list_sources",
+                side_effect=AssertionError("inventaire distant inattendu"),
+            ):
+                scan, processed = connector.run_cycle(
+                    config,
+                    archive,
+                    FakeOpenRAG(),
+                    force_inventory=False,
+                )
+
+            self.assertEqual(scan, connector.ScanResult(1, 1, True, False))
+            self.assertEqual(processed, 0)
+            self.assertIsNotNone(connector.cached_inventory(config, now=now + 3599))
+            self.assertIsNone(connector.cached_inventory(config, now=now + 3600))
+
+    def test_existing_inventory_gets_a_legacy_validity_timestamp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            now = int(time.time())
+            self._insert_email(config, self.mail("legacy"))
+            with connector.database(config) as db:
+                db.execute(
+                    "UPDATE emails SET last_seen_at=? WHERE id='legacy'",
+                    (now * 1_000_000_000,),
+                )
+
+            cached = connector.cached_inventory(config, now=now)
+
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached[0], connector.ScanResult(1, 1, True, False))
+            self.assertEqual(cached[1], now)
+
+    def test_unstable_manual_inventory_keeps_recent_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory), page_limit=2)
+            connector.set_source_selected(config, "source-1", True)
+            now = int(time.time())
+            with connector.database(config) as db:
+                db.executemany(
+                    "INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)",
+                    (
+                        ("last_inventory_completed_at", str(now)),
+                        ("last_inventory_sources", "1"),
+                        ("last_inventory_emails", "1"),
+                    ),
+                )
+            first_page = {
+                "items": [self.mail("one"), self.mail("two")],
+                "total": 3,
+                "limit": 2,
+            }
+            moving_page = {"items": [], "total": 4, "limit": 2}
+            archive = FakeArchive(
+                sources=[{"id": "source-1", "name": "Archive", "provider": "imap"}],
+                pages={
+                    ("source-1", 1): [first_page, first_page],
+                    ("source-1", 2): [moving_page, moving_page],
+                },
+            )
+
+            scan, processed = connector.run_cycle(
+                config,
+                archive,
+                FakeOpenRAG(),
+                force_inventory=True,
+            )
+
+            self.assertEqual(scan, connector.ScanResult(1, 1, True, False))
+            self.assertEqual(processed, 0)
+            self.assertEqual(
+                connector.cached_inventory(config, now=now)[1],
+                now,
+            )
+
     def test_http_probes_and_source_selection(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
@@ -1194,6 +1284,7 @@ class ConnectorTests(unittest.TestCase):
                 self.assertEqual(connector.selected_source_ids(config), [])
                 self.assertTrue(wake.is_set())
                 self.assertGreater(state.snapshot()["cycle_requested_at"], 0)
+                self.assertTrue(state.snapshot()["force_inventory_requested"])
                 with urllib.request.urlopen(base + "/") as response:
                     requested_page = response.read().decode("utf-8")
                 self.assertNotIn('http-equiv="refresh"', requested_page)
@@ -1203,7 +1294,7 @@ class ConnectorTests(unittest.TestCase):
                     status_page = response.read().decode("utf-8")
                 self.assertIn("Inventaire demandé, en attente", status_page)
                 self.assertIn('http-equiv="refresh"', status_page)
-                state.cycle_started()
+                self.assertTrue(state.cycle_started())
                 with urllib.request.urlopen(base + "/inventory-status") as response:
                     active_page = response.read().decode("utf-8")
                 self.assertIn("Inventaire en cours — Démarrage", active_page)
@@ -1321,17 +1412,24 @@ class ConnectorTests(unittest.TestCase):
     def test_status_page_separates_selected_queue_from_local_history(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
-            self._insert_email(config, self.mail("selected", "source-1"))
+            self._insert_email(
+                config,
+                self.mail("selected", "source-1", hasAttachments=True),
+            )
             self._insert_email(config, self.mail("historical", "source-2"))
             connector.replace_mailbox_selection(config, [("source-1", "INBOX")])
 
             global_counts = connector._status_counts(config)
             selected_counts = connector._status_counts(config, selected_only=True)
+            attachment_mail_count = connector.selected_mail_with_attachments(config)
             page = connector.render_status_page(config, connector.RuntimeState())
 
         self.assertEqual(global_counts["emails"]["queued"], 2)
         self.assertEqual(selected_counts["emails"]["queued"], 1)
+        self.assertEqual(attachment_mail_count, 1)
         self.assertIn("Mails dans la sélection", page)
+        self.assertIn("Mails avec pièces jointes", page)
+        self.assertIn("pas encore détaillées", page)
         self.assertIn("Historique local conservé : 2 mail(s)", page)
         self.assertIn("Les éléments hors sélection ne sont pas envoyés", page)
 
