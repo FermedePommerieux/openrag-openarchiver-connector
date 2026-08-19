@@ -1148,6 +1148,23 @@ class ConnectorTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
+    def test_status_page_uses_the_openrag_shell_without_external_assets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            state = connector.RuntimeState()
+            state.set_running(True)
+            page = connector.render_status_page(config, state)
+
+        self.assertIn('<div class="app">', page)
+        self.assertIn('class="brand-logo"', page)
+        self.assertIn('aria-label="Navigation"', page)
+        self.assertIn('class="status-grid"', page)
+        self.assertIn("@media(max-width:620px)", page)
+        self.assertIn('name="viewport"', page)
+        self.assertNotIn("<script", page)
+        self.assertNotIn("https://", page)
+        self.assertNotIn("http://", page)
+
     def test_runtime_manifests_expose_the_interface_securely_on_the_lan(self):
         root = MODULE_PATH.parent
         deployment = (root / "deployment.yaml").read_text(encoding="utf-8")

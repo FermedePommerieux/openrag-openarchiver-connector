@@ -2031,12 +2031,30 @@ def inventory_status(snapshot: Mapping[str, object]) -> str:
     return "jamais exécuté depuis le démarrage"
 
 
+OPENRAG_LOGO = """<svg class="brand-logo" viewBox="0 0 200 164" aria-hidden="true">
+<path d="M136.91 6.07c.61 0 1.09.49 1.09 1.1v6.38c0 .6.49 1.09 1.09 1.09h16.32c.6 0 1.09.48 1.09 1.09v7.09c0 .61.48 1.09 1.09 1.09h7.07c.61 0 1.09.49 1.09 1.09v7.51c0 .6.49 1.09 1.09 1.09h7.89c.61 0 1.09.48 1.09 1.09v7.09c0 .61.49 1.09 1.09 1.09h7.08c.6 0 1.09.49 1.09 1.09v14.75c0 .61.48 1.09 1.09 1.09h6.68c.61 0 1.09.49 1.09 1.09V82.1c0 .6-.48 1.09-1.09 1.09h-6.68c-.61 0-1.09.48-1.09 1.09v7.5c0 .61-.49 1.09-1.09 1.09h-7.08c-.6 0-1.09.49-1.09 1.09v7.11c0 .61-.48 1.09-1.09 1.09h-5.08c-.6 0-1.09.49-1.09 1.09V118c0 .61-.48 1.09-1.08 1.09h-7.49c-.61 0-1.09-.48-1.09-1.09V40.69c0-.61-.48-1.09-1.09-1.09h-7.48c-.61 0-1.09.48-1.09 1.09v94.53c0 .6.48 1.09 1.09 1.09h3.46c.61 0 1.09.48 1.09 1.09v19.58c0 .61-.48 1.09-1.09 1.09H49.04c-.61 0-1.09-.48-1.09-1.09V137.4c0-.61.48-1.09 1.09-1.09h3.46c.61 0 1.09-.49 1.09-1.09V40.69c0-.61-.48-1.09-1.09-1.09h-7.48c-.61 0-1.09.48-1.09 1.09v77.22c0 .61-.49 1.09-1.09 1.09h-11.41c-.6 0-1.08-.48-1.08-1.09v-14.75c0-.6-.49-1.09-1.09-1.09h-5.07c-.6 0-1.09-.48-1.09-1.09v-7.11c0-.6-.48-1.09-1.09-1.09h-7.09c-.6 0-1.09-.48-1.09-1.09v-7.5c0-.61-.48-1.09-1.09-1.09H7.15c-.61 0-1.09-.49-1.09-1.1V60.8c0-.6.48-1.09 1.09-1.09h6.68c.61 0 1.09-.48 1.09-1.09V43.87c0-.6.49-1.09 1.09-1.09h7.09c.61 0 1.09-.48 1.09-1.09V34.6c0-.61.49-1.09 1.09-1.09h7.88c.6 0 1.09-.49 1.09-1.1v-7.5c0-.6.48-1.09 1.09-1.09h7.07c.61 0 1.09-.48 1.09-1.09v-7.09c0-.61.49-1.09 1.09-1.09h16.33c.61 0 1.09-.49 1.09-1.09V7.17c0-.61.49-1.1 1.09-1.1h73.81ZM72.34 51.47c-.6 0-1.09.48-1.09 1.09v9.11c0 .6.5 1.09 1.09 1.09h9.09c.6 0 1.09-.5 1.09-1.09v-9.11c0-.61-.49-1.09-1.09-1.09h-9.09Zm46.64 0c-.61 0-1.09.48-1.09 1.09v9.11c0 .6.48 1.09 1.09 1.09h9.09c.59 0 1.07-.5 1.07-1.09v-9.11c0-.61-.48-1.09-1.07-1.09h-9.09Zm-31.79 29.79c-.6 0-1.09.49-1.09 1.09v12.73c0 .61.49 1.1 1.09 1.1h8.17v15.03l-3.89 5.08H79.96c-.6 0-1.08.48-1.08 1.09v16.35c0 .61.48 1.09 1.08 1.09h3.24c-.18.2-.3.46-.3.75v2.25c0 .61.5 1.09 1.09 1.09h6.03c-.61 0-1.09.49-1.09 1.08v2.26c0 .61.48 1.09 1.09 1.09h20.34c.6 0 1.09-.48 1.09-1.09v-2.26c0-.59-.5-1.08-1.09-1.08h6.03c.61 0 1.09-.5 1.09-1.09v-2.25c0-.29-.12-.55-.3-.75h3.24c.6 0 1.08-.48 1.08-1.09v-16.35c0-.61-.48-1.09-1.08-1.09h-11.24l-4.16-5.22V96.19h8.17c.6 0 1.08-.48 1.08-1.09V82.37c0-.61-.48-1.09-1.08-1.09l-.02-.02H87.19Z"/>
+</svg>"""
+
+
+STATUS_PAGE_STYLE = """
+:root{color-scheme:light dark;--background:#fff;--foreground:#09090b;--muted:#f4f4f5;--muted-foreground:#71717a;--border:#e4e4e7;--card:#fff;--sidebar:#fafafa;--primary:#09090b;--primary-foreground:#fff;--danger:#dc2626;--danger-soft:#fef2f2;--success:#059669;--success-soft:#ecfdf5;--warning:#b45309;--warning-soft:#fffbeb;--radius:8px;--shadow:0 1px 2px rgba(0,0,0,.04)}
+*{box-sizing:border-box}html{background:var(--background)}body{margin:0;background:var(--background);color:var(--foreground);font:14px/1.5 Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input{font:inherit}button,input[type=text]{min-height:40px}button{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:1px solid var(--border);border-radius:var(--radius);background:var(--card);color:var(--foreground);padding:9px 14px;font-weight:600;cursor:pointer;transition:background .15s,border-color .15s,transform .05s}button:hover{background:var(--muted)}button:active{transform:translateY(1px)}button:focus-visible,input:focus-visible{outline:2px solid var(--foreground);outline-offset:2px}.primary{border-color:var(--primary);background:var(--primary);color:var(--primary-foreground)}.primary:hover{background:#27272a}.danger-button{border-color:var(--danger);color:var(--danger)}.danger-button:hover{background:var(--danger-soft)}
+.app{min-height:100vh;display:grid;grid-template-rows:64px 1fr;grid-template-columns:224px minmax(0,1fr)}.topbar{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);background:var(--background);padding:0 20px;position:sticky;top:0;z-index:2}.brand{display:flex;align-items:center;gap:10px;font:600 18px/1 ui-monospace,SFMono-Regular,Menlo,monospace}.brand-logo{width:24px;height:22px;fill:currentColor}.connector-chip{border:1px solid var(--border);border-radius:999px;padding:5px 10px;color:var(--muted-foreground);font-size:12px}.sidebar{border-right:1px solid var(--border);background:var(--sidebar);padding:16px}.nav-label{display:block;margin:8px 12px 10px;color:var(--muted-foreground);font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}.nav-item{display:flex;align-items:center;gap:10px;border-radius:var(--radius);padding:11px 12px;background:var(--muted);font-size:13px;font-weight:600}.nav-icon{width:18px;height:18px}.main{min-width:0;padding:32px}.content{max-width:1120px;margin:0 auto}.page-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.eyebrow{margin:0 0 4px;color:var(--muted-foreground);font-size:12px;font-weight:600}.page-heading h1{margin:0;font-size:24px;line-height:1.25;letter-spacing:-.02em}.page-heading p{margin:7px 0 0;color:var(--muted-foreground)}.toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.toolbar form{margin:0}
+.status-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:20px}.stat-card,.card{border:1px solid var(--border);border-radius:var(--radius);background:var(--card);box-shadow:var(--shadow)}.stat-card{padding:16px}.stat-label{display:flex;align-items:center;gap:7px;color:var(--muted-foreground);font-size:12px;font-weight:600}.dot{width:8px;height:8px;border-radius:50%;background:var(--muted-foreground)}.dot.success{background:var(--success)}.dot.warning{background:#f59e0b}.dot.danger{background:var(--danger)}.stat-value{display:block;margin-top:8px;font-size:22px;font-weight:650;letter-spacing:-.03em}.stat-detail{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px}.card{margin-bottom:16px;overflow:hidden}.card-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:18px 20px;border-bottom:1px solid var(--border)}.card-title{margin:0;font-size:15px}.card-description{margin:3px 0 0;color:var(--muted-foreground);font-size:13px}.card-body{padding:20px}.card-footer{display:flex;justify-content:flex-end;padding:14px 20px;border-top:1px solid var(--border);background:var(--sidebar)}.badge{display:inline-flex;align-items:center;border-radius:999px;background:var(--muted);padding:3px 8px;color:var(--muted-foreground);font-size:11px;font-weight:600}.badge.success{background:var(--success-soft);color:var(--success)}.badge.warning{background:var(--warning-soft);color:var(--warning)}.badge.danger{background:var(--danger-soft);color:var(--danger)}
+.inventory-row{display:flex;align-items:center;gap:12px}.inventory-status{display:block;border:0;width:100%;height:24px;background:transparent}.helper{margin:10px 0 0;color:var(--muted-foreground);font-size:12px}.error-alert{display:flex;gap:10px;margin-bottom:16px;border:1px solid #fecaca;border-radius:var(--radius);background:var(--danger-soft);padding:13px 15px;color:#991b1b}.error-alert strong{display:block}.selection-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:320px;overflow:auto}.selection-item{display:flex;align-items:flex-start;gap:11px;margin:0;border:1px solid var(--border);border-radius:var(--radius);padding:12px;cursor:pointer;transition:background .15s,border-color .15s}.selection-item:hover{background:var(--muted)}.selection-item:has(input:checked){border-color:#a1a1aa;background:var(--muted)}.selection-item input{width:16px;height:16px;margin:2px 0 0;accent-color:var(--primary);flex:0 0 auto}.selection-copy{min-width:0}.selection-title{display:block;font-weight:600;overflow-wrap:anywhere}.selection-meta{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px;overflow-wrap:anywhere}.empty{grid-column:1/-1;margin:0;border:1px dashed var(--border);border-radius:var(--radius);padding:22px;text-align:center;color:var(--muted-foreground)}.counts{display:flex;flex-wrap:wrap;gap:6px}.operation-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.danger-card{border-color:#fecaca}.danger-card .card-header{background:var(--danger-soft)}.confirm-row{display:flex;align-items:end;gap:10px}.confirm-row label{flex:1;margin:0;color:var(--muted-foreground);font-size:12px;font-weight:600}.confirm-row input{display:block;width:100%;margin-top:6px;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}code{border-radius:4px;background:var(--muted);padding:2px 5px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.footer-note{padding:8px 0 24px;text-align:center;color:var(--muted-foreground);font-size:12px}
+@media(prefers-color-scheme:dark){:root{--background:#18181b;--foreground:#fafafa;--muted:#27272a;--muted-foreground:#a1a1aa;--border:#3f3f46;--card:#18181b;--sidebar:#111113;--primary:#fafafa;--primary-foreground:#09090b;--danger:#f87171;--danger-soft:#2b1719;--success:#34d399;--success-soft:#10251e;--warning:#fbbf24;--warning-soft:#2b2414;--shadow:none}.primary:hover{background:#e4e4e7}.danger-card,.error-alert{border-color:#7f1d1d}.danger-card .card-header{background:var(--danger-soft)}.error-alert{color:#fecaca}.selection-item:has(input:checked){border-color:#71717a}}
+@media(max-width:900px){.app{grid-template-columns:1fr;grid-template-rows:64px auto 1fr}.sidebar{border-right:0;border-bottom:1px solid var(--border);padding:8px 16px}.nav-label{display:none}.nav-item{width:max-content;padding:8px 12px}.main{padding:24px 18px}.status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.operation-grid{grid-template-columns:1fr}}
+@media(max-width:620px){.connector-chip{display:none}.page-heading{display:block}.toolbar{margin-top:16px}.toolbar button{flex:1}.toolbar form{display:flex;flex:1}.selection-list{grid-template-columns:1fr}.status-grid{grid-template-columns:1fr 1fr}.stat-card{padding:13px}.stat-value{font-size:19px}.card-header,.card-body{padding:16px}.card-footer{padding:12px 16px}.card-footer button{width:100%}.confirm-row{align-items:stretch;flex-direction:column}.confirm-row button{width:100%}}
+"""
+
+
 def render_inventory_status_page(state: RuntimeState) -> str:
     status = html.escape(inventory_status(state.snapshot()))
     return f"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="3">
-<style>body{{font:700 1rem system-ui,sans-serif;margin:0;color:#202124}}</style>
-</head><body>{status}</body></html>"""
+<meta name="color-scheme" content="light dark">
+<style>:root{{color-scheme:light dark}}body{{font:600 13px/24px Inter,ui-sans-serif,system-ui,sans-serif;margin:0;color:#09090b;background:transparent;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}@media(prefers-color-scheme:dark){{body{{color:#fafafa}}}}</style>
+</head><body aria-live="polite">{status}</body></html>"""
 
 
 def render_status_page(config: Config, state: RuntimeState) -> str:
@@ -2054,14 +2072,15 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
         provider = html.escape(str(row["provider"] or "—"))
         checked = " checked" if int(row["selected"]) else ""
         source_lines.append(
-            f'<label><input type="checkbox" name="source_id" value="{source_id}"'
-            f"{checked}> <strong>{label}</strong> "
-            f'<span class="muted">({provider}, {source_id})</span></label>'
+            f'<label class="selection-item"><input type="checkbox" '
+            f'name="source_id" value="{source_id}"{checked}>'
+            f'<span class="selection-copy"><span class="selection-title">{label}</span>'
+            f'<span class="selection-meta">{provider} · {source_id}</span></span></label>'
         )
     if not source_lines:
         source_lines.append(
-            '<p class="muted">Aucune source découverte. '
-            "Vérifier le Secret et OpenArchiver.</p>"
+            '<p class="empty">Aucune source découverte. '
+            "Vérifiez le Secret et la disponibilité d’OpenArchiver.</p>"
         )
 
     mailbox_lines = []
@@ -2075,29 +2094,50 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
         source = html.escape(str(row["source_name"] or source_id))
         checked = " checked" if int(row["selected"]) else ""
         mailbox_lines.append(
-            f'<label><input type="checkbox" name="mailbox" value="{token}"'
-            f"{checked}> <strong>{label}</strong> "
-            f'<span class="muted">({source}, {int(row["message_count"])} mails)</span></label>'
+            f'<label class="selection-item"><input type="checkbox" '
+            f'name="mailbox" value="{token}"{checked}>'
+            f'<span class="selection-copy"><span class="selection-title">{label}</span>'
+            f'<span class="selection-meta">{source} · '
+            f'{int(row["message_count"])} mails</span></span></label>'
         )
     if not mailbox_lines:
         mailbox_lines.append(
-            '<p class="muted">Aucun dossier découvert. Sélectionner une source, '
+            '<p class="empty">Aucun dossier découvert. Sélectionnez une source, '
             "enregistrer, puis attendre la fin du cycle d’inventaire.</p>"
         )
 
-    def count_lines(table: str) -> str:
+    def count_badges(table: str) -> str:
         values = counts[table]
         if not values:
-            return '<span class="muted">aucun objet</span>'
-        return ", ".join(
-            f"{html.escape(status)}={count}" for status, count in sorted(values.items())
+            return '<span class="badge">aucun objet</span>'
+        return "".join(
+            f'<span class="badge">{html.escape(status)} · {count}</span>'
+            for status, count in sorted(values.items())
         )
 
     error = html.escape(str(snapshot["last_error"] or "aucune"))
-    ready = "prêt" if snapshot["ready"] else "non prêt"
+    ready = "Prêt" if snapshot["ready"] else "Attention requise"
     pause_label = "Reprendre l’indexation" if paused else "Mettre en pause"
     pause_action = "resume" if paused else "pause"
-    activity = "en pause" if paused else "active"
+    activity = "En pause" if paused else "Active"
+    selected_sources = sum(int(row["selected"]) for row in sources)
+    selected_mailboxes = sum(int(row["selected"]) for row in mailboxes)
+    email_total = sum(counts["emails"].values())
+    attachment_total = sum(counts["attachments"].values())
+    status_class = "success" if snapshot["ready"] else "danger"
+    activity_class = "warning" if paused else "success"
+    last_completed = int(snapshot["last_cycle_completed_at"])
+    last_sync = (
+        time.strftime("%d/%m/%Y à %H:%M UTC", time.gmtime(last_completed))
+        if last_completed
+        else "Jamais exécutée"
+    )
+    error_alert = ""
+    if snapshot["last_error"]:
+        error_alert = (
+            '<div class="error-alert" role="alert"><span aria-hidden="true">⚠</span>'
+            f'<div><strong>Dernière erreur</strong>{error}</div></div>'
+        )
     if snapshot["reset_requested_at"]:
         reset_status = (
             "Remise à zéro demandée ; attente de la fin des opérations en cours."
@@ -2111,51 +2151,42 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
     return f"""<!doctype html>
 <html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>OpenArchiver vers OpenRAG</title>
-<style>
-body{{font-family:system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#202124}}
-fieldset{{border:1px solid #ccc;border-radius:.5rem;padding:1rem}}label{{display:block;margin:.6rem 0}}
-button{{padding:.55rem .9rem;margin:.5rem .5rem 0 0}}code{{background:#f2f2f2;padding:.1rem .3rem}}
-.muted{{color:#666}}.error{{color:#9b1c1c}}dt{{font-weight:700}}dd{{margin-bottom:.5rem}}
-.danger{{border:1px solid #b91c1c;border-radius:.5rem;padding:1rem;margin-top:1.5rem}}
-.inventory-status{{border:0;width:100%;height:1.6rem;vertical-align:middle}}
-</style></head><body>
-<h1>Connecteur OpenArchiver → OpenRAG</h1>
-<p>État runtime : <strong>{ready}</strong></p>
-<p>Indexation : <strong>{activity}</strong></p>
-<p>Inventaire IMAP :</p>
-<iframe class="inventory-status" src="/inventory-status"
- title="État de l’inventaire IMAP"></iframe>
-<p class="muted">La pause bloque les envois vers OpenRAG, mais autorise
-l’inventaire des sources et dossiers IMAP.</p>
-<form method="get" action="/"><button type="submit">Rafraîchir l’état</button></form>
-<dl><dt>Dernière erreur</dt><dd class="error">{error}</dd>
-<dt>Mails</dt><dd>{count_lines("emails")}</dd>
-<dt>Pièces jointes</dt><dd>{count_lines("attachments")}</dd></dl>
-<form method="post" action="/sources"><fieldset><legend>Sources indexées</legend>
-<input type="hidden" name="csrf" value="{csrf}">
-{"".join(source_lines)}
-<button type="submit">Enregistrer et lancer l’inventaire</button></fieldset></form>
-<form method="post" action="/mailboxes"><fieldset><legend>Dossiers IMAP indexés</legend>
-<input type="hidden" name="csrf" value="{csrf}">
-{"".join(mailbox_lines)}
-<button type="submit">Enregistrer les dossiers et lancer l’inventaire</button></fieldset></form>
-<form method="post" action="/scan"><input type="hidden" name="csrf" value="{csrf}">
-<button type="submit">Relancer l’inventaire</button></form>
-<form method="post" action="/pause"><input type="hidden" name="csrf" value="{csrf}">
-<input type="hidden" name="action" value="{pause_action}">
-<button type="submit">{pause_label}</button></form>
-<section class="danger"><h2>Remise à zéro</h2>
-<p>Efface l’inventaire, les sélections et l’historique local du connecteur.
-Aucun mail OpenArchiver ni document OpenRAG n’est supprimé. Le connecteur reste en pause.</p>
-<p class="muted">{html.escape(reset_status)}</p>
-<form method="post" action="/reset"><input type="hidden" name="csrf" value="{csrf}">
-<label>Saisir <code>RESET</code> pour confirmer
-<input name="confirmation" required pattern="RESET"></label>
-<button type="submit">Remettre la base locale à zéro</button></form></section>
-<p class="muted">Aucune suppression OpenRAG n'est automatique.
-Interface prévue pour un port-forward.</p>
-</body></html>"""
+<meta name="color-scheme" content="light dark">
+<title>Connecteur OpenArchiver · OpenRAG</title>
+<style>{STATUS_PAGE_STYLE}</style></head><body>
+<div class="app">
+<header class="topbar"><div class="brand">{OPENRAG_LOGO}<span>OpenRAG</span></div>
+<span class="connector-chip">OpenArchiver connector</span></header>
+<aside class="sidebar" aria-label="Navigation"><span class="nav-label">Intégrations</span>
+<div class="nav-item"><svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M8 12h8M12 8v8"/><path d="M7 7.5 4.5 5M17 7.5 19.5 5M7 16.5 4.5 19M17 16.5 19.5 19"/><rect x="7" y="7" width="10" height="10" rx="2"/></svg>Connecteur</div></aside>
+<main class="main"><div class="content">
+<div class="page-heading"><div><p class="eyebrow">Connecteurs / OpenArchiver</p>
+<h1>OpenArchiver vers OpenRAG</h1><p>Configurez et supervisez l’indexation de vos archives e-mail.</p></div>
+<div class="toolbar"><form method="get" action="/"><button type="submit">↻&nbsp; Rafraîchir l’état</button></form>
+<form method="post" action="/pause"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="action" value="{pause_action}"><button type="submit">{pause_label}</button></form></div></div>
+{error_alert}
+<section class="status-grid" aria-label="État du connecteur">
+<div class="stat-card"><span class="stat-label"><span class="dot {status_class}"></span>Service</span><strong class="stat-value">{ready}</strong><span class="stat-detail">Dernière synchro : {last_sync}</span></div>
+<div class="stat-card"><span class="stat-label"><span class="dot {activity_class}"></span>Indexation</span><strong class="stat-value">{activity}</strong><span class="stat-detail">{int(snapshot["last_processed"])} objet(s) au dernier cycle</span></div>
+<div class="stat-card"><span class="stat-label">Mails inventoriés</span><strong class="stat-value">{email_total}</strong><span class="stat-detail">{selected_mailboxes} dossier(s) sélectionné(s)</span></div>
+<div class="stat-card"><span class="stat-label">Pièces jointes</span><strong class="stat-value">{attachment_total}</strong><span class="stat-detail">{selected_sources} source(s) active(s)</span></div>
+</section>
+<section class="card"><div class="card-header"><div><h2 class="card-title">Inventaire IMAP</h2><p class="card-description">État du cycle de découverte des sources et dossiers.</p></div><span class="badge {activity_class}">{activity}</span></div>
+<div class="card-body"><div class="inventory-row"><span class="dot {activity_class}"></span><iframe class="inventory-status" src="/inventory-status" title="État de l’inventaire IMAP"></iframe></div>
+<p class="helper">La pause bloque les envois vers OpenRAG, mais autorise l’inventaire des sources et dossiers IMAP.</p>
+<div class="counts" aria-label="Détail des états des mails">{count_badges("emails")}</div></div>
+<div class="card-footer"><form method="post" action="/scan"><input type="hidden" name="csrf" value="{csrf}"><button class="primary" type="submit">Relancer l’inventaire</button></form></div></section>
+<form method="post" action="/sources" class="card"><div class="card-header"><div><h2 class="card-title">Sources indexées</h2><p class="card-description">Choisissez les comptes OpenArchiver à rendre disponibles dans OpenRAG.</p></div><span class="badge">{selected_sources}/{len(sources)} sélectionnée(s)</span></div>
+<div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="selection-list">{"".join(source_lines)}</div></div>
+<div class="card-footer"><button class="primary" type="submit">Enregistrer et lancer l’inventaire</button></div></form>
+<form method="post" action="/mailboxes" class="card"><div class="card-header"><div><h2 class="card-title">Dossiers IMAP indexés</h2><p class="card-description">Affinez l’indexation aux dossiers utiles de chaque source.</p></div><span class="badge">{selected_mailboxes}/{len(mailboxes)} sélectionné(s)</span></div>
+<div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="selection-list">{"".join(mailbox_lines)}</div><div class="counts" aria-label="Détail des états des pièces jointes" style="margin-top:14px">{count_badges("attachments")}</div></div>
+<div class="card-footer"><button class="primary" type="submit">Enregistrer les dossiers et lancer l’inventaire</button></div></form>
+<section class="card danger-card"><div class="card-header"><div><h2 class="card-title">Remise à zéro</h2><p class="card-description">Efface l’inventaire, les sélections et l’historique local uniquement.</p></div><span class="badge danger">Zone sensible</span></div>
+<div class="card-body"><p>Aucun mail OpenArchiver ni document OpenRAG n’est supprimé. Le connecteur reste en pause.</p><p class="helper">{html.escape(reset_status)}</p>
+<form method="post" action="/reset" class="confirm-row"><input type="hidden" name="csrf" value="{csrf}"><label>Saisir <code>RESET</code> pour confirmer<input type="text" name="confirmation" required pattern="RESET" autocomplete="off"></label><button class="danger-button" type="submit">Remettre la base locale à zéro</button></form></div></section>
+<p class="footer-note">Aucune suppression OpenRAG n’est automatique · Interface d’exploitation autonome</p>
+</div></main></div></body></html>"""
 
 
 def render_metrics(config: Config, state: RuntimeState) -> str:
