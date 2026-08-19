@@ -975,6 +975,18 @@ def cached_inventory(
     )
 
 
+def seconds_until_inventory_refresh(
+    config: Config, *, now: int | None = None
+) -> int:
+    """Retourne le délai avant le prochain inventaire automatique."""
+    timestamp = int(time.time()) if now is None else now
+    cached = cached_inventory(config, now=timestamp, allow_expired=True)
+    if cached is None:
+        return 0
+    _scan, completed_at = cached
+    return max(0, completed_at + INVENTORY_VALIDITY_SECONDS - timestamp)
+
+
 def _validate_email(raw: dict[str, object], fallback_source: str) -> dict[str, object]:
     email_id = raw.get("id")
     storage_path = raw.get("storagePath")
@@ -1945,6 +1957,18 @@ def process_queue(
         return sum(pool.map(lambda _index: worker(), range(workers)))
 
 
+def selected_queue_is_busy(config: Config) -> bool:
+    """Indique si la sélection contient encore du travail immédiatement traitable."""
+    counts = _status_counts(config, selected_only=True)
+    active_statuses = {"queued", "downloading", "ingesting"}
+    return any(
+        count
+        for values in counts.values()
+        for status, count in values.items()
+        if status in active_statuses
+    )
+
+
 class RuntimeState:
     """Petit état mémoire pour les probes et l'interface d'exploitation."""
 
@@ -2084,7 +2108,22 @@ def run_cycle(
 ) -> tuple[ScanResult, int]:
     report = progress or (lambda _phase: None)
     cached = cached_inventory(config)
-    if force_inventory or cached is None:
+    latest_inventory = cached or cached_inventory(config, allow_expired=True)
+    finish_existing_queue = (
+        not force_inventory
+        and cached is None
+        and latest_inventory is not None
+        and not is_paused(config)
+        and selected_queue_is_busy(config)
+    )
+    if finish_existing_queue:
+        scan, cached_at = latest_inventory
+        report("Inventaire expiré — fin de l’indexation en cours")
+        LOG.info(
+            "inventaire expiré depuis %s; fin de la file sélectionnée avant actualisation",
+            time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(cached_at)),
+        )
+    elif force_inventory or cached is None:
         report("Actualisation des sources OpenArchiver")
         LOG.info("inventaire: actualisation des sources OpenArchiver")
         refresh_sources(config, openarchiver)
@@ -2209,10 +2248,16 @@ def runtime_loop(
                 continue
             paused = is_paused(config)
             if paused and not state.cycle_pending():
-                LOG.info("indexation en pause; inventaire IMAP manuel en attente")
-                wake.wait(config.scan_interval_seconds)
-                wake.clear()
-                continue
+                inventory_delay = seconds_until_inventory_refresh(config)
+                if inventory_delay > 0:
+                    LOG.info(
+                        "indexation en pause; prochain inventaire IMAP dans %d seconde(s)",
+                        inventory_delay,
+                    )
+                    wake.wait(inventory_delay)
+                    wake.clear()
+                    continue
+                LOG.info("indexation en pause; inventaire IMAP arrivé à échéance")
             if paused:
                 LOG.info("indexation en pause; inventaire IMAP manuel")
             force_inventory = state.cycle_started()
@@ -2245,7 +2290,10 @@ def runtime_loop(
                     scan.emails,
                     processed,
                 )
-                delay = config.scan_interval_seconds
+                delay = min(
+                    config.scan_interval_seconds,
+                    seconds_until_inventory_refresh(config),
+                )
             except Exception as error:
                 state.cycle_failed(error)
                 completed_at = int(state.snapshot()["last_cycle_completed_at"])
@@ -2620,6 +2668,7 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 <div class="card-body"><div class="inventory-row"><span id="inventory-dot" class="dot {inventory_class}"></span><span id="inventory-summary" class="inventory-status" role="status" aria-live="polite" aria-busy="{str(inventory_running).lower()}">{html.escape(inventory_status(snapshot))}</span></div>
 <p id="inventory-completion" class="helper" role="status" hidden></p>
 <p class="helper">{html.escape(inventory_cache_label)}</p>
+<p class="helper">Après une heure, l’inventaire est renouvelé. Si une indexation est en cours, sa file est d’abord terminée ; en pause, seul l’inventaire est relancé.</p>
 <p class="helper">La pause bloque les envois vers OpenRAG, mais autorise l’inventaire des sources et dossiers IMAP.</p>
 <div class="counts" aria-label="États des mails de la sélection"><span class="badge success">Sélection actuelle</span>{count_badges(selected_counts["emails"], "aucun mail")}</div>
 <p class="helper">Historique local conservé : {historical_email_total} mail(s) ; {historical_attachment_total} pièce(s) jointe(s) déjà détaillée(s). Les éléments hors sélection ne sont pas envoyés à OpenRAG.</p></div>

@@ -1159,6 +1159,70 @@ class ConnectorTests(unittest.TestCase):
             self.assertEqual(processed, 0)
             self.assertIsNotNone(connector.cached_inventory(config, now=now + 3599))
             self.assertIsNone(connector.cached_inventory(config, now=now + 3600))
+            self.assertEqual(
+                connector.seconds_until_inventory_refresh(config, now=now + 3599),
+                1,
+            )
+            self.assertEqual(
+                connector.seconds_until_inventory_refresh(config, now=now + 3600),
+                0,
+            )
+
+    def test_expired_inventory_finishes_selected_queue_before_refresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            self._insert_email(config, self.mail("queued-mail"))
+            now = int(time.time())
+            with connector.database(config) as db:
+                db.executemany(
+                    "INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)",
+                    (
+                        ("last_inventory_completed_at", str(now - 3600)),
+                        ("last_inventory_sources", "1"),
+                        ("last_inventory_emails", "1"),
+                    ),
+                )
+            archive = FakeArchive(
+                sources=[{"id": "source-1", "name": "Archive", "provider": "imap"}],
+                pages={
+                    ("source-1", 1): {
+                        "items": [self.mail("queued-mail")],
+                        "total": 1,
+                    }
+                },
+            )
+
+            def finish_queue(*_args):
+                with connector.database(config) as db:
+                    db.execute(
+                        "UPDATE emails SET status='validated' WHERE id='queued-mail'"
+                    )
+                return 1
+
+            with mock.patch.object(
+                connector, "process_queue", side_effect=finish_queue
+            ) as process_queue:
+                scan, processed = connector.run_cycle(
+                    config,
+                    archive,
+                    FakeOpenRAG(),
+                    force_inventory=False,
+                )
+
+            self.assertEqual(scan, connector.ScanResult(1, 1, True, False))
+            self.assertEqual(processed, 1)
+            process_queue.assert_called_once()
+            self.assertEqual(archive.calls, [])
+
+            scan, processed = connector.run_cycle(
+                config,
+                archive,
+                FakeOpenRAG(),
+                force_inventory=False,
+            )
+            self.assertEqual(scan, connector.ScanResult(1, 1, True, False))
+            self.assertEqual(processed, 0)
+            self.assertEqual(archive.calls, [("source-1", 1, 2)])
 
     def test_existing_inventory_gets_a_legacy_validity_timestamp(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1640,7 +1704,7 @@ class ConnectorTests(unittest.TestCase):
                 db.close()
             self.assertEqual(counts, {table: 0 for table in counts})
 
-    def test_paused_runtime_manually_inventories_without_indexing(self):
+    def test_paused_runtime_inventories_when_due_without_indexing(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory), scan_interval_seconds=3600)
             self.select(config, "source-1")
@@ -1670,10 +1734,6 @@ class ConnectorTests(unittest.TestCase):
                 daemon=True,
             )
             thread.start()
-            time.sleep(0.05)
-            self.assertEqual(connector.mailbox_rows(config), [])
-            state.cycle_requested()
-            wake.set()
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline and not connector.mailbox_rows(config):
                 time.sleep(0.01)
