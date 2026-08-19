@@ -64,7 +64,6 @@ STOP = threading.Event()
 WAKE = threading.Event()
 SCHEMA_VERSION = 2
 SCHEMA_LOCK = threading.Lock()
-INVENTORY_VALIDITY_SECONDS = 3600
 
 
 class ConnectorError(RuntimeError):
@@ -795,7 +794,10 @@ def refresh_sources(
 
 
 def _scan_source_pass(
-    config: Config, client: OpenArchiverClient, source_id: str
+    config: Config,
+    client: OpenArchiverClient,
+    source_id: str,
+    progress: Callable[[int, int], None] | None = None,
 ) -> tuple[dict[str, dict[str, object]], int]:
     found: dict[str, dict[str, object]] = {}
     page = 1
@@ -818,6 +820,8 @@ def _scan_source_pass(
         for raw in items:
             email = _validate_email(_require_object(raw, "mail"), source_id)
             found[str(email["id"])] = email
+        if progress is not None:
+            progress(len(found), total)
         if page * response_limit >= total:
             break
         if not items:
@@ -827,12 +831,17 @@ def _scan_source_pass(
 
 
 def _stable_source_inventory(
-    config: Config, client: OpenArchiverClient, source_id: str
+    config: Config,
+    client: OpenArchiverClient,
+    source_id: str,
+    progress: Callable[[int, int], None] | None = None,
 ) -> tuple[dict[str, dict[str, object]], bool]:
     repeated = False
     for attempt in range(2):
         try:
-            found, total = _scan_source_pass(config, client, source_id)
+            found, total = _scan_source_pass(
+                config, client, source_id, progress=progress
+            )
             coherent = len(found) == total
         except IncompleteScanError:
             found, coherent = {}, False
@@ -846,7 +855,11 @@ def _stable_source_inventory(
     raise AssertionError("boucle de stabilisation invalide")
 
 
-def scan_selected_sources(config: Config, client: OpenArchiverClient) -> ScanResult:
+def scan_selected_sources(
+    config: Config,
+    client: OpenArchiverClient,
+    progress: Callable[[str, int, int], None] | None = None,
+) -> ScanResult:
     source_ids = selected_source_ids(config)
     # Le marqueur nanoseconde évite de confondre deux scans lancés dans la même
     # seconde lors du classement conservatif des absences.
@@ -855,7 +868,18 @@ def scan_selected_sources(config: Config, client: OpenArchiverClient) -> ScanRes
     repeated = False
     try:
         for source_id in source_ids:
-            found, source_repeated = _stable_source_inventory(config, client, source_id)
+            found, source_repeated = _stable_source_inventory(
+                config,
+                client,
+                source_id,
+                progress=(
+                    lambda current, total, current_source=source_id: progress(
+                        f"Inventaire de la source {current_source}", current, total
+                    )
+                    if progress is not None
+                    else None
+                ),
+            )
             repeated = repeated or source_repeated
             global_emails.update(found)
     except IncompleteScanError as error:
@@ -922,7 +946,9 @@ def cached_inventory(
     now: int | None = None,
     allow_expired: bool = False,
 ) -> tuple[ScanResult, int] | None:
-    timestamp = int(time.time()) if now is None else now
+    # Paramètres conservés pour compatibilité avec les appels antérieurs : un
+    # inventaire d'archives ne vieillit plus automatiquement.
+    del now, allow_expired
     with database(config) as db:
         values = {
             str(row["key"]): str(row["value"])
@@ -962,8 +988,6 @@ def cached_inventory(
             )
     if not completed_at:
         return None
-    if not allow_expired and timestamp - completed_at >= INVENTORY_VALIDITY_SECONDS:
-        return None
     return (
         ScanResult(
             int(values.get("last_inventory_sources", "0") or 0),
@@ -973,18 +997,6 @@ def cached_inventory(
         ),
         completed_at,
     )
-
-
-def seconds_until_inventory_refresh(
-    config: Config, *, now: int | None = None
-) -> int:
-    """Retourne le délai avant le prochain inventaire automatique."""
-    timestamp = int(time.time()) if now is None else now
-    cached = cached_inventory(config, now=timestamp, allow_expired=True)
-    if cached is None:
-        return 0
-    _scan, completed_at = cached
-    return max(0, completed_at + INVENTORY_VALIDITY_SECONDS - timestamp)
 
 
 def _validate_email(raw: dict[str, object], fallback_source: str) -> dict[str, object]:
@@ -1939,10 +1951,17 @@ def process_queue(
     config: Config,
     openarchiver: OpenArchiverClient,
     openrag: OpenRAGClient,
+    progress: Callable[[int, int], None] | None = None,
 ) -> int:
     workers = min(config.ingestion_concurrency, config.ingestion_concurrency_max)
+    progress_lock = threading.Lock()
+    processed_total = 0
+    initial_total = selected_queue_pending_count(config)
+    if progress is not None:
+        progress(0, initial_total)
 
     def worker() -> int:
+        nonlocal processed_total
         processed = 0
         while True:
             item = claim_next(config)
@@ -1950,6 +1969,11 @@ def process_queue(
                 return processed
             process_work_item(config, item, openarchiver, openrag)
             processed += 1
+            if progress is not None:
+                with progress_lock:
+                    processed_total += 1
+                    current = processed_total
+                progress(current, max(initial_total, current))
 
     with ThreadPoolExecutor(
         max_workers=workers, thread_name_prefix="openarchiver-ingest"
@@ -1957,11 +1981,10 @@ def process_queue(
         return sum(pool.map(lambda _index: worker(), range(workers)))
 
 
-def selected_queue_is_busy(config: Config) -> bool:
-    """Indique si la sélection contient encore du travail immédiatement traitable."""
+def selected_queue_pending_count(config: Config) -> int:
     counts = _status_counts(config, selected_only=True)
     active_statuses = {"queued", "downloading", "ingesting"}
-    return any(
+    return sum(
         count
         for values in counts.values()
         for status, count in values.items()
@@ -1982,6 +2005,8 @@ class RuntimeState:
         self.force_inventory_requested = False
         self.cycle_in_progress = False
         self.cycle_phase = ""
+        self.progress_current = 0
+        self.progress_total = 0
         self.last_error = ""
         self.last_scan: ScanResult | None = None
         self.last_processed = 0
@@ -2016,12 +2041,20 @@ class RuntimeState:
             self.force_inventory_requested = False
             self.cycle_in_progress = True
             self.cycle_phase = "Démarrage de l’inventaire"
+            self.progress_current = 0
+            self.progress_total = 0
             return force_inventory
 
-    def cycle_progress(self, phase: str) -> None:
+    def cycle_progress(
+        self, phase: str, current: int | None = None, total: int | None = None
+    ) -> None:
         with self.lock:
             if self.cycle_in_progress:
                 self.cycle_phase = phase
+                if current is not None:
+                    self.progress_current = max(0, current)
+                if total is not None:
+                    self.progress_total = max(0, total)
 
     def cycle_requested(self, *, force_inventory: bool = False) -> None:
         with self.lock:
@@ -2054,6 +2087,8 @@ class RuntimeState:
             self.last_scan = None
             self.last_processed = 0
             self.cycle_phase = ""
+            self.progress_current = 0
+            self.progress_total = 0
             self.ready = True
 
     def reset_failed(self, error: Exception) -> None:
@@ -2089,6 +2124,8 @@ class RuntimeState:
                 "force_inventory_requested": self.force_inventory_requested,
                 "cycle_in_progress": self.cycle_in_progress,
                 "cycle_phase": self.cycle_phase,
+                "progress_current": self.progress_current,
+                "progress_total": self.progress_total,
                 "last_error": self.last_error,
                 "last_scan": self.last_scan,
                 "last_processed": self.last_processed,
@@ -2103,40 +2140,18 @@ def run_cycle(
     config: Config,
     openarchiver: OpenArchiverClient,
     openrag: OpenRAGClient,
-    progress: Callable[[str], None] | None = None,
+    progress: Callable[[str, int | None, int | None], None] | None = None,
     force_inventory: bool = True,
 ) -> tuple[ScanResult, int]:
-    report = progress or (lambda _phase: None)
+    report = progress or (lambda _phase, _current=None, _total=None: None)
     cached = cached_inventory(config)
-    latest_inventory = cached or cached_inventory(config, allow_expired=True)
-    paused = is_paused(config)
-    finish_existing_queue = (
-        not force_inventory
-        and cached is None
-        and latest_inventory is not None
-        and selected_queue_is_busy(config)
-    )
-    if finish_existing_queue:
-        scan, cached_at = latest_inventory
-        if paused:
-            report("Inventaire expiré — file en attente, actualisation différée")
-            LOG.info(
-                "inventaire expiré depuis %s; file sélectionnée non vide et indexation en pause",
-                time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(cached_at)),
-            )
-        else:
-            report("Inventaire expiré — fin de l’indexation en cours")
-            LOG.info(
-                "inventaire expiré depuis %s; fin de la file sélectionnée avant actualisation",
-                time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(cached_at)),
-            )
-    elif force_inventory or cached is None:
-        report("Actualisation des sources OpenArchiver")
+    if force_inventory or cached is None:
+        report("Actualisation des sources OpenArchiver", 0, 0)
         LOG.info("inventaire: actualisation des sources OpenArchiver")
         refresh_sources(config, openarchiver)
-        report("Lecture des messages des sources sélectionnées")
+        report("Lecture des messages des sources sélectionnées", 0, 0)
         LOG.info("inventaire: lecture des sources sélectionnées")
-        scan = scan_selected_sources(config, openarchiver)
+        scan = scan_selected_sources(config, openarchiver, progress=report)
         if not scan.complete:
             if cached is None:
                 with database(config) as db:
@@ -2146,25 +2161,35 @@ def run_cycle(
                 detail = str(row[0]) if row else "inventaire incomplet"
                 raise IncompleteScanError(f"{detail}; ingestion différée")
             scan, cached_at = cached
-            report("Inventaire instable — utilisation de l’instantané valide")
+            report(
+                "Inventaire instable — utilisation de l’instantané valide", 0, 0
+            )
             LOG.warning(
                 "inventaire instable; instantané valide du %s réutilisé",
                 time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(cached_at)),
             )
     else:
         scan, cached_at = cached
-        report("Utilisation de l’inventaire valide")
+        report("Utilisation de l’inventaire conservé", 0, 0)
         LOG.info(
             "inventaire valide du %s réutilisé",
             time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(cached_at)),
         )
-    report("Traitement de la file vers OpenRAG")
+    queue_total = selected_queue_pending_count(config)
+    report("Traitement de la file vers OpenRAG", 0, queue_total)
     LOG.info(
         "inventaire terminé: sources=%d mails=%d; traitement de la file",
         scan.sources,
         scan.emails,
     )
-    processed = process_queue(config, openarchiver, openrag)
+    processed = process_queue(
+        config,
+        openarchiver,
+        openrag,
+        progress=lambda current, total: report(
+            "Traitement de la file vers OpenRAG", current, total
+        ),
+    )
     return scan, processed
 
 
@@ -2255,23 +2280,12 @@ def runtime_loop(
                 continue
             paused = is_paused(config)
             if paused and not state.cycle_pending():
-                inventory_delay = seconds_until_inventory_refresh(config)
-                if inventory_delay > 0:
-                    LOG.info(
-                        "indexation en pause; prochain inventaire IMAP dans %d seconde(s)",
-                        inventory_delay,
-                    )
-                    wake.wait(inventory_delay)
-                    wake.clear()
-                    continue
-                if selected_queue_is_busy(config):
-                    LOG.info(
-                        "indexation en pause; inventaire expiré mais file sélectionnée non vide"
-                    )
+                if cached_inventory(config) is not None:
+                    LOG.info("indexation en pause; inventaire IMAP conservé")
                     wake.wait(config.scan_interval_seconds)
                     wake.clear()
                     continue
-                LOG.info("indexation en pause; inventaire IMAP arrivé à échéance")
+                LOG.info("indexation en pause; inventaire IMAP initial")
             if paused:
                 LOG.info("indexation en pause; inventaire IMAP manuel")
             force_inventory = state.cycle_started()
@@ -2304,10 +2318,7 @@ def runtime_loop(
                     scan.emails,
                     processed,
                 )
-                delay = min(
-                    config.scan_interval_seconds,
-                    seconds_until_inventory_refresh(config),
-                )
+                delay = config.scan_interval_seconds
             except Exception as error:
                 state.cycle_failed(error)
                 completed_at = int(state.snapshot()["last_cycle_completed_at"])
@@ -2431,7 +2442,7 @@ STATUS_PAGE_STYLE = """
 *{box-sizing:border-box}html{background:var(--background)}body{margin:0;background:var(--background);color:var(--foreground);font:14px/1.5 Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input{font:inherit}button,input[type=text],input[type=password]{min-height:40px}button{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:1px solid var(--border);border-radius:var(--radius);background:var(--card);color:var(--foreground);padding:9px 14px;font-weight:600;cursor:pointer;transition:background .15s,border-color .15s,transform .05s}button:hover{background:var(--muted)}button:active{transform:translateY(1px)}button:focus-visible,input:focus-visible{outline:2px solid var(--foreground);outline-offset:2px}.primary{border-color:var(--primary);background:var(--primary);color:var(--primary-foreground)}.primary:hover{background:#27272a}.danger-button{border-color:var(--danger);color:var(--danger)}.danger-button:hover{background:var(--danger-soft)}
 .app{min-height:100vh;display:grid;grid-template-rows:64px 1fr;grid-template-columns:224px minmax(0,1fr)}.topbar{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);background:var(--background);padding:0 20px;position:sticky;top:0;z-index:2}.brand{display:flex;align-items:center;gap:10px;font:600 18px/1 ui-monospace,SFMono-Regular,Menlo,monospace}.brand-logo{width:24px;height:22px;fill:currentColor}.connector-chip{border:1px solid var(--border);border-radius:999px;padding:5px 10px;color:var(--muted-foreground);font-size:12px}.sidebar{border-right:1px solid var(--border);background:var(--sidebar);padding:16px}.nav-label{display:block;margin:8px 12px 10px;color:var(--muted-foreground);font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}.nav-item{display:flex;align-items:center;gap:10px;border-radius:var(--radius);padding:11px 12px;background:var(--muted);font-size:13px;font-weight:600}.nav-icon{width:18px;height:18px}.main{min-width:0;padding:32px}.content{max-width:1120px;margin:0 auto}.page-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.eyebrow{margin:0 0 4px;color:var(--muted-foreground);font-size:12px;font-weight:600}.page-heading h1{margin:0;font-size:24px;line-height:1.25;letter-spacing:-.02em}.page-heading p{margin:7px 0 0;color:var(--muted-foreground)}.toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.toolbar form{margin:0}
 .status-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:20px}.stat-card,.card{border:1px solid var(--border);border-radius:var(--radius);background:var(--card);box-shadow:var(--shadow)}.stat-card{padding:16px}.stat-label{display:flex;align-items:center;gap:7px;color:var(--muted-foreground);font-size:12px;font-weight:600}.dot{width:8px;height:8px;border-radius:50%;background:var(--muted-foreground)}.dot.success{background:var(--success)}.dot.warning{background:#f59e0b}.dot.danger{background:var(--danger)}.stat-value{display:block;margin-top:8px;font-size:22px;font-weight:650;letter-spacing:-.03em}.stat-detail{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px}.card{margin-bottom:16px;overflow:hidden}.card-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:18px 20px;border-bottom:1px solid var(--border)}.card-title{margin:0;font-size:15px}.card-description{margin:3px 0 0;color:var(--muted-foreground);font-size:13px}.card-body{padding:20px}.card-footer{display:flex;justify-content:flex-end;padding:14px 20px;border-top:1px solid var(--border);background:var(--sidebar)}.badge{display:inline-flex;align-items:center;border-radius:999px;background:var(--muted);padding:3px 8px;color:var(--muted-foreground);font-size:11px;font-weight:600}.badge.success{background:var(--success-soft);color:var(--success)}.badge.warning{background:var(--warning-soft);color:var(--warning)}.badge.danger{background:var(--danger-soft);color:var(--danger)}
-.inventory-row{display:flex;align-items:center;gap:12px}.inventory-status{display:block;width:100%;min-height:24px;font-weight:600}.inventory-status.running{color:var(--success)}.helper{margin:10px 0 0;color:var(--muted-foreground);font-size:12px}.error-alert{display:flex;gap:10px;margin-bottom:16px;border:1px solid #fecaca;border-radius:var(--radius);background:var(--danger-soft);padding:13px 15px;color:#991b1b}.error-alert strong{display:block}.selection-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:320px;overflow:auto}.selection-item{display:flex;align-items:flex-start;gap:11px;margin:0;border:1px solid var(--border);border-radius:var(--radius);padding:12px;cursor:pointer;transition:background .15s,border-color .15s}.selection-item:hover{background:var(--muted)}.selection-item:has(input:checked){border-color:#a1a1aa;background:var(--muted)}.selection-item input{width:16px;height:16px;margin:2px 0 0;accent-color:var(--primary);flex:0 0 auto}.selection-copy{min-width:0}.selection-title{display:block;font-weight:600;overflow-wrap:anywhere}.selection-meta{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px;overflow-wrap:anywhere}.empty{grid-column:1/-1;margin:0;border:1px dashed var(--border);border-radius:var(--radius);padding:22px;text-align:center;color:var(--muted-foreground)}.counts{display:flex;flex-wrap:wrap;gap:6px}.operation-grid,.secret-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.secret-field{display:grid;gap:6px;color:var(--muted-foreground);font-size:12px;font-weight:600}.secret-field input{width:100%;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}.danger-card{border-color:#fecaca}.danger-card .card-header{background:var(--danger-soft)}.confirm-row{display:flex;align-items:end;gap:10px}.confirm-row label{flex:1;margin:0;color:var(--muted-foreground);font-size:12px;font-weight:600}.confirm-row input{display:block;width:100%;margin-top:6px;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}code{border-radius:4px;background:var(--muted);padding:2px 5px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.footer-note{padding:8px 0 24px;text-align:center;color:var(--muted-foreground);font-size:12px}
+.inventory-row{display:flex;align-items:center;gap:12px}.inventory-status{display:block;width:100%;min-height:24px;font-weight:600}.inventory-status.running{color:var(--success)}.progress-wrap{margin-top:12px}.progress-track{height:10px;overflow:hidden;border-radius:999px;background:var(--muted)}.progress-bar{height:100%;width:0;border-radius:inherit;background:var(--success);transition:width .25s ease}.progress-bar.indeterminate{width:35%;animation:progress-slide 1.2s ease-in-out infinite}.progress-label{display:block;margin-top:5px;color:var(--muted-foreground);font-size:12px;text-align:right}@keyframes progress-slide{0%{transform:translateX(-110%)}100%{transform:translateX(300%)}}.helper{margin:10px 0 0;color:var(--muted-foreground);font-size:12px}.error-alert{display:flex;gap:10px;margin-bottom:16px;border:1px solid #fecaca;border-radius:var(--radius);background:var(--danger-soft);padding:13px 15px;color:#991b1b}.error-alert strong{display:block}.selection-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:320px;overflow:auto}.selection-item{display:flex;align-items:flex-start;gap:11px;margin:0;border:1px solid var(--border);border-radius:var(--radius);padding:12px;cursor:pointer;transition:background .15s,border-color .15s}.selection-item:hover{background:var(--muted)}.selection-item:has(input:checked){border-color:#a1a1aa;background:var(--muted)}.selection-item input{width:16px;height:16px;margin:2px 0 0;accent-color:var(--primary);flex:0 0 auto}.selection-copy{min-width:0}.selection-title{display:block;font-weight:600;overflow-wrap:anywhere}.selection-meta{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px;overflow-wrap:anywhere}.empty{grid-column:1/-1;margin:0;border:1px dashed var(--border);border-radius:var(--radius);padding:22px;text-align:center;color:var(--muted-foreground)}.counts{display:flex;flex-wrap:wrap;gap:6px}.operation-grid,.secret-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.secret-field{display:grid;gap:6px;color:var(--muted-foreground);font-size:12px;font-weight:600}.secret-field input{width:100%;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}.danger-card{border-color:#fecaca}.danger-card .card-header{background:var(--danger-soft)}.confirm-row{display:flex;align-items:end;gap:10px}.confirm-row label{flex:1;margin:0;color:var(--muted-foreground);font-size:12px;font-weight:600}.confirm-row input{display:block;width:100%;margin-top:6px;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}code{border-radius:4px;background:var(--muted);padding:2px 5px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.footer-note{padding:8px 0 24px;text-align:center;color:var(--muted-foreground);font-size:12px}
 @media(prefers-color-scheme:dark){:root{--background:#18181b;--foreground:#fafafa;--muted:#27272a;--muted-foreground:#a1a1aa;--border:#3f3f46;--card:#18181b;--sidebar:#111113;--primary:#fafafa;--primary-foreground:#09090b;--danger:#f87171;--danger-soft:#2b1719;--success:#34d399;--success-soft:#10251e;--warning:#fbbf24;--warning-soft:#2b2414;--shadow:none}.primary:hover{background:#e4e4e7}.danger-card,.error-alert{border-color:#7f1d1d}.danger-card .card-header{background:var(--danger-soft)}.error-alert{color:#fecaca}.selection-item:has(input:checked){border-color:#71717a}}
 @media(max-width:900px){.app{grid-template-columns:1fr;grid-template-rows:64px auto 1fr}.sidebar{border-right:0;border-bottom:1px solid var(--border);padding:8px 16px}.nav-label{display:none}.nav-item{width:max-content;padding:8px 12px}.main{padding:24px 18px}.status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.operation-grid,.secret-grid{grid-template-columns:1fr}}
 @media(max-width:620px){.connector-chip{display:none}.page-heading{display:block}.toolbar{margin-top:16px}.toolbar button{flex:1}.toolbar form{display:flex;flex:1}.selection-list{grid-template-columns:1fr}.status-grid{grid-template-columns:1fr 1fr}.stat-card{padding:13px}.stat-value{font-size:19px}.card-header,.card-body{padding:16px}.card-footer{padding:12px 16px}.card-footer button{width:100%}.confirm-row{align-items:stretch;flex-direction:column}.confirm-row button{width:100%}}
@@ -2461,6 +2472,8 @@ def render_live_status(state: RuntimeState) -> str:
             "last_error": str(snapshot["last_error"] or ""),
             "ready": bool(snapshot["ready"]),
             "last_processed": int(snapshot["last_processed"]),
+            "progress_current": int(snapshot["progress_current"]),
+            "progress_total": int(snapshot["progress_total"]),
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -2476,6 +2489,9 @@ UI_SCRIPT = r"""(() => {
   const service = document.getElementById("service-status");
   const lastSync = document.getElementById("last-sync");
   const processed = document.getElementById("last-processed");
+  const progressWrap = document.getElementById("cycle-progress");
+  const progressBar = document.getElementById("cycle-progress-bar");
+  const progressLabel = document.getElementById("cycle-progress-label");
   if (!badge || !summary || !dot || !button || !completion) return;
   let observedActive = document.body.dataset.cycleActive === "true";
   const update = async () => {
@@ -2508,6 +2524,22 @@ UI_SCRIPT = r"""(() => {
           "Dernière synchro : Jamais exécutée";
       }
       if (processed) processed.textContent = status.last_processed + " objet(s) au dernier cycle";
+      if (progressWrap && progressBar && progressLabel) {
+        const current = Number(status.progress_current || 0);
+        const total = Number(status.progress_total || 0);
+        progressWrap.hidden = !active;
+        progressBar.classList.toggle("indeterminate", active && total <= 0);
+        progressBar.style.width = total > 0 ? Math.min(100, current * 100 / total) + "%" : "";
+        progressLabel.textContent = total > 0 ? current + " / " + total + " · " + Math.round(current * 100 / total) + " %" : "Préparation…";
+        progressWrap.setAttribute("aria-valuemin", "0");
+        if (total > 0) {
+          progressWrap.setAttribute("aria-valuemax", String(total));
+          progressWrap.setAttribute("aria-valuenow", String(Math.min(current, total)));
+        } else {
+          progressWrap.removeAttribute("aria-valuemax");
+          progressWrap.removeAttribute("aria-valuenow");
+        }
+      }
       if (observedActive && !active && !requested) {
         completion.hidden = false;
         completion.textContent = failed ?
@@ -2611,14 +2643,12 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
     historical_attachment_total = sum(counts["attachments"].values())
     if inventory_cache:
         _cached_scan, inventory_completed_at = inventory_cache
-        inventory_expires_at = inventory_completed_at + INVENTORY_VALIDITY_SECONDS
         inventory_cache_label = (
-            "Inventaire valide jusqu’au "
+            "Inventaire conservé depuis le "
             + time.strftime(
-                "%Y-%m-%d %H:%M:%S UTC", time.gmtime(inventory_expires_at)
+                "%Y-%m-%d %H:%M:%S UTC", time.gmtime(inventory_completed_at)
             )
-            if int(time.time()) < inventory_expires_at
-            else "Dernier inventaire expiré ; le prochain cycle le reconstruira."
+            + " ; il sera remplacé uniquement sur demande manuelle."
         )
     else:
         inventory_cache_label = "Aucun inventaire complet disponible."
@@ -2680,9 +2710,10 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 </section>
 <section class="card"><div class="card-header"><div><h2 class="card-title">Inventaire IMAP</h2><p class="card-description">État du cycle de découverte des sources et dossiers.</p></div><span id="inventory-badge" class="badge {inventory_class}">{inventory_activity}</span></div>
 <div class="card-body"><div class="inventory-row"><span id="inventory-dot" class="dot {inventory_class}"></span><span id="inventory-summary" class="inventory-status" role="status" aria-live="polite" aria-busy="{str(inventory_running).lower()}">{html.escape(inventory_status(snapshot))}</span></div>
+<div id="cycle-progress" class="progress-wrap" role="progressbar" aria-label="Progression du cycle" hidden><div class="progress-track"><div id="cycle-progress-bar" class="progress-bar"></div></div><span id="cycle-progress-label" class="progress-label">Préparation…</span></div>
 <p id="inventory-completion" class="helper" role="status" hidden></p>
 <p class="helper">{html.escape(inventory_cache_label)}</p>
-<p class="helper">Après une heure, l’inventaire est renouvelé seulement si la file sélectionnée est vide. Sinon il attend la fin de l’indexation ; en pause, une demande manuelle peut le forcer.</p>
+<p class="helper">Les archives sont traitées comme un instantané stable. Utilisez « Relancer l’inventaire » pour rechercher explicitement de nouveaux éléments.</p>
 <p class="helper">La pause bloque les envois vers OpenRAG, mais autorise l’inventaire des sources et dossiers IMAP.</p>
 <div class="counts" aria-label="États des mails de la sélection"><span class="badge success">Sélection actuelle</span>{count_badges(selected_counts["emails"], "aucun mail")}</div>
 <p class="helper">Historique local conservé : {historical_email_total} mail(s) ; {historical_attachment_total} pièce(s) jointe(s) déjà détaillée(s). Les éléments hors sélection ne sont pas envoyés à OpenRAG.</p></div>

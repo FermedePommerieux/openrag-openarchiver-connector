@@ -409,8 +409,22 @@ class ConnectorTests(unittest.TestCase):
                     ("source-1", 2): {"items": [self.mail("c")], "total": 3},
                 }
             )
-            result = connector.scan_selected_sources(config, client)
+            progress = []
+            result = connector.scan_selected_sources(
+                config,
+                client,
+                progress=lambda phase, current, total: progress.append(
+                    (phase, current, total)
+                ),
+            )
             self.assertEqual(result, connector.ScanResult(1, 3, True, False))
+            self.assertEqual(
+                progress,
+                [
+                    ("Inventaire de la source source-1", 2, 3),
+                    ("Inventaire de la source source-1", 3, 3),
+                ],
+            )
             self.assertEqual(
                 [row["status"] for row in self.rows(config, "emails")], ["queued"] * 3
             )
@@ -1129,7 +1143,7 @@ class ConnectorTests(unittest.TestCase):
                 [row["id"] for row in connector.source_rows(config)], ["source-1"]
             )
 
-    def test_valid_inventory_is_reused_for_one_hour(self):
+    def test_inventory_is_reused_until_a_manual_refresh(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
             now = int(time.time())
@@ -1157,18 +1171,11 @@ class ConnectorTests(unittest.TestCase):
 
             self.assertEqual(scan, connector.ScanResult(1, 1, True, False))
             self.assertEqual(processed, 0)
-            self.assertIsNotNone(connector.cached_inventory(config, now=now + 3599))
-            self.assertIsNone(connector.cached_inventory(config, now=now + 3600))
-            self.assertEqual(
-                connector.seconds_until_inventory_refresh(config, now=now + 3599),
-                1,
-            )
-            self.assertEqual(
-                connector.seconds_until_inventory_refresh(config, now=now + 3600),
-                0,
+            self.assertIsNotNone(
+                connector.cached_inventory(config, now=now + 365 * 24 * 3600)
             )
 
-    def test_expired_inventory_finishes_selected_queue_before_refresh(self):
+    def test_old_inventory_processes_queue_without_automatic_refresh(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
             self._insert_email(config, self.mail("queued-mail"))
@@ -1192,7 +1199,7 @@ class ConnectorTests(unittest.TestCase):
                 },
             )
 
-            def finish_queue(*_args):
+            def finish_queue(*_args, **_kwargs):
                 with connector.database(config) as db:
                     db.execute(
                         "UPDATE emails SET status='validated' WHERE id='queued-mail'"
@@ -1219,6 +1226,16 @@ class ConnectorTests(unittest.TestCase):
                 archive,
                 FakeOpenRAG(),
                 force_inventory=False,
+            )
+            self.assertEqual(scan, connector.ScanResult(1, 1, True, False))
+            self.assertEqual(processed, 0)
+            self.assertEqual(archive.calls, [])
+
+            scan, processed = connector.run_cycle(
+                config,
+                archive,
+                FakeOpenRAG(),
+                force_inventory=True,
             )
             self.assertEqual(scan, connector.ScanResult(1, 1, True, False))
             self.assertEqual(processed, 0)
@@ -1579,11 +1596,17 @@ class ConnectorTests(unittest.TestCase):
         self.assertIn('type="button" disabled', page)
         self.assertIn(">En pause<", page)
 
-        state.cycle_progress("Lecture des messages des sources sélectionnées")
+        state.cycle_progress("Lecture des messages des sources sélectionnées", 5, 10)
         self.assertIn(
             "Lecture des messages des sources sélectionnées",
             connector.inventory_status(state.snapshot()),
         )
+        live = json.loads(connector.render_live_status(state))
+        self.assertEqual(live["progress_current"], 5)
+        self.assertEqual(live["progress_total"], 10)
+        self.assertIn('id="cycle-progress"', page)
+        self.assertIn('id="cycle-progress-bar"', page)
+        self.assertIn('id="cycle-progress-label"', page)
         self.assertNotIn('<script src="http', page)
         self.assertNotIn("https://", page)
         self.assertNotIn("http://", page)
@@ -1749,7 +1772,7 @@ class ConnectorTests(unittest.TestCase):
                 db.close()
             self.assertEqual(counts, {table: 0 for table in counts})
 
-    def test_paused_runtime_inventories_when_due_without_indexing(self):
+    def test_paused_runtime_creates_initial_inventory_without_indexing(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory), scan_interval_seconds=3600)
             self.select(config, "source-1")
