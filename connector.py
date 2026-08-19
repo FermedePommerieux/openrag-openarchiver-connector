@@ -62,6 +62,8 @@ DEFAULT_EXTENSIONS = ".asc,.asciidoc,.adoc,.csv,.docx,.htm,.html,.md,.pdf,.txt,.
 SAFE_EXTENSION = re.compile(r"^\.[a-z0-9]{1,10}$")
 STOP = threading.Event()
 WAKE = threading.Event()
+SCHEMA_VERSION = 1
+SCHEMA_LOCK = threading.Lock()
 
 
 class ConnectorError(RuntimeError):
@@ -328,9 +330,15 @@ def connect_db(config: Config) -> sqlite3.Connection:
     db = sqlite3.connect(config.state_db, timeout=30)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA busy_timeout=30000")
-    db.execute("PRAGMA journal_mode=WAL")
-    db.executescript(
-        """
+    with SCHEMA_LOCK:
+        version = int(db.execute("PRAGMA user_version").fetchone()[0])
+        if version >= SCHEMA_VERSION:
+            return db
+        journal_mode = str(db.execute("PRAGMA journal_mode").fetchone()[0])
+        if journal_mode.lower() != "wal":
+            db.execute("PRAGMA journal_mode=WAL")
+        db.executescript(
+            """
         CREATE TABLE IF NOT EXISTS sources (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL DEFAULT '',
@@ -412,19 +420,20 @@ def connect_db(config: Config) -> sqlite3.Connection:
             ON emails(status, next_retry_at);
         CREATE INDEX IF NOT EXISTS attachments_queue
             ON attachments(status, next_retry_at);
-        """
-    )
-    email_columns = {
-        str(row["name"]) for row in db.execute("PRAGMA table_info(emails)")
-    }
-    if "sha256" not in email_columns:
-        db.execute("ALTER TABLE emails ADD COLUMN sha256 TEXT NOT NULL DEFAULT ''")
-    if "mailbox_path" not in email_columns:
-        db.execute(
-            "ALTER TABLE emails ADD COLUMN mailbox_path TEXT NOT NULL DEFAULT ''"
+            """
         )
-    db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES ('paused','0')")
-    db.commit()
+        email_columns = {
+            str(row["name"]) for row in db.execute("PRAGMA table_info(emails)")
+        }
+        if "sha256" not in email_columns:
+            db.execute("ALTER TABLE emails ADD COLUMN sha256 TEXT NOT NULL DEFAULT ''")
+        if "mailbox_path" not in email_columns:
+            db.execute(
+                "ALTER TABLE emails ADD COLUMN mailbox_path TEXT NOT NULL DEFAULT ''"
+            )
+        db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES ('paused','0')")
+        db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        db.commit()
     return db
 
 
@@ -1836,6 +1845,9 @@ def _record_failure(config: Config, item: WorkItem, error: Exception) -> None:
 def _safe_error(error: Exception) -> str:
     if isinstance(error, (ConnectorError, TimeoutError, ValueError)):
         return str(error)[:1000]
+    if isinstance(error, sqlite3.Error):
+        detail = " ".join(str(error).split())
+        return f"{error.__class__.__name__}: {detail}"[:1000]
     return error.__class__.__name__
 
 

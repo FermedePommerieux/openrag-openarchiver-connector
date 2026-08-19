@@ -2,6 +2,7 @@ import importlib.util
 import io
 import json
 import logging
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -277,7 +278,40 @@ class ConnectorTests(unittest.TestCase):
             )
             self.assertIn("sha256", email_columns)
             self.assertIn("mailbox_path", email_columns)
+            version_db = connector.connect_db(config)
+            try:
+                self.assertEqual(
+                    version_db.execute("PRAGMA user_version").fetchone()[0],
+                    connector.SCHEMA_VERSION,
+                )
+            finally:
+                version_db.close()
             self.assertFalse(connector.is_paused(config))
+
+    def test_database_connections_do_not_repeat_migrations_during_a_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            writer = connector.connect_db(config)
+            writer.execute("BEGIN IMMEDIATE")
+            try:
+                reader = connector.connect_db(config)
+                try:
+                    self.assertEqual(
+                        reader.execute("SELECT COUNT(*) FROM settings").fetchone()[0],
+                        1,
+                    )
+                finally:
+                    reader.close()
+            finally:
+                writer.rollback()
+                writer.close()
+
+    def test_sqlite_errors_keep_safe_operational_detail(self):
+        error = sqlite3.OperationalError("database is locked")
+        self.assertEqual(
+            connector._safe_error(error),
+            "OperationalError: database is locked",
+        )
 
     def test_legacy_markdown_mail_is_requeued_as_original_eml(self):
         with tempfile.TemporaryDirectory() as directory:
