@@ -2109,20 +2109,27 @@ def run_cycle(
     report = progress or (lambda _phase: None)
     cached = cached_inventory(config)
     latest_inventory = cached or cached_inventory(config, allow_expired=True)
+    paused = is_paused(config)
     finish_existing_queue = (
         not force_inventory
         and cached is None
         and latest_inventory is not None
-        and not is_paused(config)
         and selected_queue_is_busy(config)
     )
     if finish_existing_queue:
         scan, cached_at = latest_inventory
-        report("Inventaire expiré — fin de l’indexation en cours")
-        LOG.info(
-            "inventaire expiré depuis %s; fin de la file sélectionnée avant actualisation",
-            time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(cached_at)),
-        )
+        if paused:
+            report("Inventaire expiré — file en attente, actualisation différée")
+            LOG.info(
+                "inventaire expiré depuis %s; file sélectionnée non vide et indexation en pause",
+                time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(cached_at)),
+            )
+        else:
+            report("Inventaire expiré — fin de l’indexation en cours")
+            LOG.info(
+                "inventaire expiré depuis %s; fin de la file sélectionnée avant actualisation",
+                time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(cached_at)),
+            )
     elif force_inventory or cached is None:
         report("Actualisation des sources OpenArchiver")
         LOG.info("inventaire: actualisation des sources OpenArchiver")
@@ -2255,6 +2262,13 @@ def runtime_loop(
                         inventory_delay,
                     )
                     wake.wait(inventory_delay)
+                    wake.clear()
+                    continue
+                if selected_queue_is_busy(config):
+                    LOG.info(
+                        "indexation en pause; inventaire expiré mais file sélectionnée non vide"
+                    )
+                    wake.wait(config.scan_interval_seconds)
                     wake.clear()
                     continue
                 LOG.info("indexation en pause; inventaire IMAP arrivé à échéance")
@@ -2668,7 +2682,7 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 <div class="card-body"><div class="inventory-row"><span id="inventory-dot" class="dot {inventory_class}"></span><span id="inventory-summary" class="inventory-status" role="status" aria-live="polite" aria-busy="{str(inventory_running).lower()}">{html.escape(inventory_status(snapshot))}</span></div>
 <p id="inventory-completion" class="helper" role="status" hidden></p>
 <p class="helper">{html.escape(inventory_cache_label)}</p>
-<p class="helper">Après une heure, l’inventaire est renouvelé. Si une indexation est en cours, sa file est d’abord terminée ; en pause, seul l’inventaire est relancé.</p>
+<p class="helper">Après une heure, l’inventaire est renouvelé seulement si la file sélectionnée est vide. Sinon il attend la fin de l’indexation ; en pause, une demande manuelle peut le forcer.</p>
 <p class="helper">La pause bloque les envois vers OpenRAG, mais autorise l’inventaire des sources et dossiers IMAP.</p>
 <div class="counts" aria-label="États des mails de la sélection"><span class="badge success">Sélection actuelle</span>{count_badges(selected_counts["emails"], "aucun mail")}</div>
 <p class="helper">Historique local conservé : {historical_email_total} mail(s) ; {historical_attachment_total} pièce(s) jointe(s) déjà détaillée(s). Les éléments hors sélection ne sont pas envoyés à OpenRAG.</p></div>

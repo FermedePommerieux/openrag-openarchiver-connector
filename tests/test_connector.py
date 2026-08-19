@@ -1224,6 +1224,51 @@ class ConnectorTests(unittest.TestCase):
             self.assertEqual(processed, 0)
             self.assertEqual(archive.calls, [("source-1", 1, 2)])
 
+    def test_paused_nonempty_queue_blocks_automatic_but_not_manual_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            self._insert_email(config, self.mail("queued-mail"))
+            connector.set_paused(config, True)
+            now = int(time.time())
+            with connector.database(config) as db:
+                db.executemany(
+                    "INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)",
+                    (
+                        ("last_inventory_completed_at", str(now - 3600)),
+                        ("last_inventory_sources", "1"),
+                        ("last_inventory_emails", "1"),
+                    ),
+                )
+            archive = FakeArchive(
+                sources=[{"id": "source-1", "name": "Archive", "provider": "imap"}],
+                pages={
+                    ("source-1", 1): {
+                        "items": [self.mail("queued-mail")],
+                        "total": 1,
+                    }
+                },
+            )
+
+            scan, processed = connector.run_cycle(
+                config,
+                archive,
+                FakeOpenRAG(),
+                force_inventory=False,
+            )
+            self.assertEqual(scan, connector.ScanResult(1, 1, True, False))
+            self.assertEqual(processed, 0)
+            self.assertEqual(archive.calls, [])
+
+            scan, processed = connector.run_cycle(
+                config,
+                archive,
+                FakeOpenRAG(),
+                force_inventory=True,
+            )
+            self.assertEqual(scan, connector.ScanResult(1, 1, True, False))
+            self.assertEqual(processed, 0)
+            self.assertEqual(archive.calls, [("source-1", 1, 2)])
+
     def test_existing_inventory_gets_a_legacy_validity_timestamp(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
