@@ -801,7 +801,7 @@ def _scan_source_pass(
 ) -> tuple[dict[str, dict[str, object]], int]:
     found: dict[str, dict[str, object]] = {}
     page = 1
-    announced_total: int | None = None
+    latest_total = 0
     while True:
         payload = client.list_emails(source_id, page, config.page_limit)
         items = payload.get("items")
@@ -813,44 +813,40 @@ def _scan_source_pass(
             raise IncompleteScanError(
                 f"limite de pagination invalide pour la source {source_id}"
             )
-        if announced_total is None:
-            announced_total = total
-        elif total != announced_total:
-            raise IncompleteScanError(f"total instable pour la source {source_id}")
+        latest_total = total
         for raw in items:
             email = _validate_email(_require_object(raw, "mail"), source_id)
             found[str(email["id"])] = email
         if progress is not None:
-            progress(len(found), total)
+            progress(len(found), max(total, len(found)))
         if page * response_limit >= total:
             break
         if not items:
             break
         page += 1
-    return found, announced_total or 0
+    return found, latest_total
 
 
-def _stable_source_inventory(
+def _source_inventory(
     config: Config,
     client: OpenArchiverClient,
     source_id: str,
     progress: Callable[[int, int], None] | None = None,
 ) -> tuple[dict[str, dict[str, object]], bool]:
+    """Retente uniquement une réponse invalide, sans exiger un total stable."""
     repeated = False
     for attempt in range(2):
         try:
-            found, total = _scan_source_pass(
+            found, _latest_total = _scan_source_pass(
                 config, client, source_id, progress=progress
             )
-            coherent = len(found) == total
         except IncompleteScanError:
-            found, coherent = {}, False
-        if coherent:
+            repeated = True
+        else:
             return found, repeated
-        repeated = True
         if attempt == 1:
             raise IncompleteScanError(
-                f"inventaire incohérent après deux passages pour la source {source_id}"
+                f"pagination invalide après deux tentatives pour la source {source_id}"
             )
     raise AssertionError("boucle de stabilisation invalide")
 
@@ -868,7 +864,7 @@ def scan_selected_sources(
     repeated = False
     try:
         for source_id in source_ids:
-            found, source_repeated = _stable_source_inventory(
+            found, source_repeated = _source_inventory(
                 config,
                 client,
                 source_id,
@@ -916,16 +912,6 @@ def scan_selected_sources(
             )
         for email in global_emails.values():
             _upsert_email(db, email, scan_started)
-        if source_ids:
-            placeholders = ",".join("?" for _ in source_ids)
-            db.execute(
-                f"""
-                UPDATE emails SET status='missing'
-                WHERE source_id IN ({placeholders}) AND last_seen_at < ?
-                  AND status NOT IN ('downloading','ingesting')
-                """,
-                (*source_ids, scan_started),
-            )
         db.execute(
             "INSERT OR REPLACE INTO settings(key,value) VALUES ('last_scan_error','')"
         )

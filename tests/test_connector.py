@@ -463,28 +463,32 @@ class ConnectorTests(unittest.TestCase):
             connector.replace_mailbox_selection(config, [("root", "INBOX")])
             self.assertIsNotNone(connector.claim_next(config, now=1))
 
-    def test_pages_moved_trigger_one_stabilisation_pass(self):
+    def test_total_can_move_during_pagination(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
             self.select(config, "source-1")
             client = FakeArchive(
                 pages={
-                    ("source-1", 1): [
-                        {"items": [self.mail("a"), self.mail("b")], "total": 3},
-                        {"items": [self.mail("a"), self.mail("b")], "total": 3},
-                    ],
-                    ("source-1", 2): [
-                        {"items": [self.mail("b")], "total": 3},
-                        {"items": [self.mail("c")], "total": 3},
-                    ],
+                    ("source-1", 1): {
+                        "items": [self.mail("a"), self.mail("b")],
+                        "total": 3,
+                    },
+                    ("source-1", 2): {
+                        "items": [self.mail("c"), self.mail("d")],
+                        "total": 4,
+                    },
                 }
             )
             result = connector.scan_selected_sources(config, client)
             self.assertTrue(result.complete)
-            self.assertTrue(result.repeated)
-            self.assertEqual(result.emails, 3)
+            self.assertFalse(result.repeated)
+            self.assertEqual(result.emails, 4)
+            self.assertEqual(
+                client.calls,
+                [("source-1", 1, 2), ("source-1", 2, 2)],
+            )
 
-    def test_incomplete_second_pass_does_not_mark_missing(self):
+    def test_total_mismatch_is_accepted_and_does_not_mark_missing(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
             self.select(config, "source-1")
@@ -506,7 +510,8 @@ class ConnectorTests(unittest.TestCase):
                 }
             )
             result = connector.scan_selected_sources(config, broken)
-            self.assertFalse(result.complete)
+            self.assertTrue(result.complete)
+            self.assertEqual(result.emails, 1)
             self.assertNotIn(
                 "missing", [row["status"] for row in self.rows(config, "emails")]
             )
@@ -1303,7 +1308,7 @@ class ConnectorTests(unittest.TestCase):
             self.assertEqual(cached[0], connector.ScanResult(1, 1, True, False))
             self.assertEqual(cached[1], now)
 
-    def test_unstable_manual_inventory_keeps_recent_snapshot(self):
+    def test_manual_inventory_accepts_a_total_change(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory), page_limit=2)
             connector.set_source_selected(config, "source-1", True)
@@ -1326,8 +1331,8 @@ class ConnectorTests(unittest.TestCase):
             archive = FakeArchive(
                 sources=[{"id": "source-1", "name": "Archive", "provider": "imap"}],
                 pages={
-                    ("source-1", 1): [first_page, first_page],
-                    ("source-1", 2): [moving_page, moving_page],
+                    ("source-1", 1): first_page,
+                    ("source-1", 2): moving_page,
                 },
             )
 
@@ -1338,11 +1343,12 @@ class ConnectorTests(unittest.TestCase):
                 force_inventory=True,
             )
 
-            self.assertEqual(scan, connector.ScanResult(1, 1, True, False))
+            self.assertEqual(scan, connector.ScanResult(1, 2, True, False))
             self.assertEqual(processed, 0)
+            self.assertEqual(connector.cached_inventory(config, now=now)[0], scan)
             self.assertEqual(
-                connector.cached_inventory(config, now=now)[1],
-                now,
+                archive.calls,
+                [("source-1", 1, 2), ("source-1", 2, 2)],
             )
 
     def test_http_probes_and_source_selection(self):
