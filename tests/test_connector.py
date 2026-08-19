@@ -284,6 +284,10 @@ class ConnectorTests(unittest.TestCase):
                     version_db.execute("PRAGMA user_version").fetchone()[0],
                     connector.SCHEMA_VERSION,
                 )
+                self.assertEqual(
+                    version_db.execute("PRAGMA journal_mode").fetchone()[0],
+                    "delete",
+                )
             finally:
                 version_db.close()
             self.assertFalse(connector.is_paused(config))
@@ -305,6 +309,27 @@ class ConnectorTests(unittest.TestCase):
             finally:
                 writer.rollback()
                 writer.close()
+
+    def test_database_migrates_wal_to_delete_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            legacy = connector.connect_db(config)
+            legacy.execute("PRAGMA user_version=1")
+            self.assertEqual(legacy.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+            legacy.close()
+
+            migrated = connector.connect_db(config)
+            try:
+                self.assertEqual(
+                    migrated.execute("PRAGMA journal_mode").fetchone()[0],
+                    "delete",
+                )
+                self.assertEqual(
+                    migrated.execute("PRAGMA user_version").fetchone()[0],
+                    connector.SCHEMA_VERSION,
+                )
+            finally:
+                migrated.close()
 
     def test_sqlite_errors_keep_safe_operational_detail(self):
         error = sqlite3.OperationalError("database is locked")
@@ -1176,12 +1201,14 @@ class ConnectorTests(unittest.TestCase):
                 self.assertIn('src="/inventory-status"', requested_page)
                 with urllib.request.urlopen(base + "/inventory-status") as response:
                     status_page = response.read().decode("utf-8")
-                self.assertIn("demandé, en attente", status_page)
+                self.assertIn("Inventaire demandé, en attente", status_page)
                 self.assertIn('http-equiv="refresh"', status_page)
                 state.cycle_started()
                 with urllib.request.urlopen(base + "/inventory-status") as response:
                     active_page = response.read().decode("utf-8")
-                self.assertIn("en cours depuis", active_page)
+                self.assertIn("Inventaire en cours depuis", active_page)
+                self.assertIn('class="running"', active_page)
+                self.assertIn('aria-busy="true"', active_page)
 
                 pause = urllib.request.Request(
                     base + "/pause",
@@ -1243,6 +1270,19 @@ class ConnectorTests(unittest.TestCase):
         self.assertIn('class="status-grid"', page)
         self.assertIn("@media(max-width:620px)", page)
         self.assertIn('name="viewport"', page)
+
+    def test_status_page_makes_running_inventory_explicit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            connector.set_paused(config, True)
+            state = connector.RuntimeState()
+            state.cycle_started()
+            page = connector.render_status_page(config, state)
+
+        self.assertIn("Inventaire en cours…", page)
+        self.assertIn("Inventaire en cours depuis", connector.inventory_status(state.snapshot()))
+        self.assertIn('type="button" disabled', page)
+        self.assertIn(">En pause<", page)
         self.assertNotIn("<script", page)
         self.assertNotIn("https://", page)
         self.assertNotIn("http://", page)

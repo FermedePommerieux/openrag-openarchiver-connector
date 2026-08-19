@@ -62,7 +62,7 @@ DEFAULT_EXTENSIONS = ".asc,.asciidoc,.adoc,.csv,.docx,.htm,.html,.md,.pdf,.txt,.
 SAFE_EXTENSION = re.compile(r"^\.[a-z0-9]{1,10}$")
 STOP = threading.Event()
 WAKE = threading.Event()
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCHEMA_LOCK = threading.Lock()
 
 
@@ -335,8 +335,12 @@ def connect_db(config: Config) -> sqlite3.Connection:
         if version >= SCHEMA_VERSION:
             return db
         journal_mode = str(db.execute("PRAGMA journal_mode").fetchone()[0])
-        if journal_mode.lower() != "wal":
-            db.execute("PRAGMA journal_mode=WAL")
+        if journal_mode.lower() != "delete":
+            selected_mode = str(db.execute("PRAGMA journal_mode=DELETE").fetchone()[0])
+            if selected_mode.lower() != "delete":
+                raise sqlite3.OperationalError(
+                    f"journal SQLite inattendu: {selected_mode}"
+                )
         db.executescript(
             """
         CREATE TABLE IF NOT EXISTS sources (
@@ -1974,10 +1978,17 @@ def run_cycle(
     openarchiver: OpenArchiverClient,
     openrag: OpenRAGClient,
 ) -> tuple[ScanResult, int]:
+    LOG.info("inventaire: actualisation des sources OpenArchiver")
     refresh_sources(config, openarchiver)
+    LOG.info("inventaire: lecture des sources sélectionnées")
     scan = scan_selected_sources(config, openarchiver)
     if not scan.complete:
         raise IncompleteScanError("inventaire incomplet; ingestion différée")
+    LOG.info(
+        "inventaire terminé: sources=%d mails=%d; traitement de la file",
+        scan.sources,
+        scan.emails,
+    )
     processed = process_queue(config, openarchiver, openrag)
     return scan, processed
 
@@ -2057,11 +2068,11 @@ def inventory_status(snapshot: Mapping[str, object]) -> str:
     completed_at = int(snapshot["last_cycle_completed_at"])
     requested_at = int(snapshot["cycle_requested_at"])
     if bool(snapshot["cycle_in_progress"]):
-        return "en cours depuis " + time.strftime(
+        return "Inventaire en cours depuis " + time.strftime(
             "%Y-%m-%d %H:%M:%S UTC", time.gmtime(started_at)
         )
     if requested_at:
-        return "demandé, en attente de démarrage"
+        return "Inventaire demandé, en attente de démarrage"
     if completed_at:
         last_scan = snapshot["last_scan"]
         detail = ""
@@ -2093,12 +2104,15 @@ STATUS_PAGE_STYLE = """
 
 
 def render_inventory_status_page(state: RuntimeState) -> str:
-    status = html.escape(inventory_status(state.snapshot()))
+    snapshot = state.snapshot()
+    running = bool(snapshot["cycle_in_progress"])
+    status = html.escape(inventory_status(snapshot))
+    body_class = "running" if running else ""
     return f"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="3">
 <meta name="color-scheme" content="light dark">
-<style>:root{{color-scheme:light dark}}body{{font:600 13px/24px Inter,ui-sans-serif,system-ui,sans-serif;margin:0;color:#09090b;background:transparent;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}@media(prefers-color-scheme:dark){{body{{color:#fafafa}}}}</style>
-</head><body aria-live="polite">{status}</body></html>"""
+<style>:root{{color-scheme:light dark}}body{{font:600 13px/24px Inter,ui-sans-serif,system-ui,sans-serif;margin:0;color:#09090b;background:transparent;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}body.running{{color:#059669}}body.running::before{{content:"";display:inline-block;width:8px;height:8px;margin-right:8px;border-radius:50%;background:#10b981;animation:pulse 1.2s ease-in-out infinite}}@keyframes pulse{{50%{{opacity:.3;transform:scale(.75)}}}}@media(prefers-color-scheme:dark){{body{{color:#fafafa}}body.running{{color:#34d399}}}}</style>
+</head><body class="{body_class}" aria-live="polite" aria-busy="{str(running).lower()}">{status}</body></html>"""
 
 
 def render_status_page(config: Config, state: RuntimeState) -> str:
@@ -2164,6 +2178,20 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
     pause_label = "Reprendre l’indexation" if paused else "Mettre en pause"
     pause_action = "resume" if paused else "pause"
     activity = "En pause" if paused else "Active"
+    inventory_running = bool(snapshot["cycle_in_progress"])
+    inventory_requested = bool(snapshot["cycle_requested_at"])
+    if inventory_running:
+        inventory_activity = "Inventaire en cours…"
+        inventory_class = "success running"
+        scan_button = '<button class="primary" type="button" disabled>Inventaire en cours…</button>'
+    elif inventory_requested:
+        inventory_activity = "Inventaire demandé"
+        inventory_class = "warning"
+        scan_button = '<button class="primary" type="button" disabled>Inventaire demandé…</button>'
+    else:
+        inventory_activity = "En attente"
+        inventory_class = "warning" if paused else "success"
+        scan_button = '<button class="primary" type="submit">Relancer l’inventaire</button>'
     selected_sources = sum(int(row["selected"]) for row in sources)
     selected_mailboxes = sum(int(row["selected"]) for row in mailboxes)
     email_total = sum(counts["emails"].values())
@@ -2223,11 +2251,11 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 <div class="stat-card"><span class="stat-label">Mails inventoriés</span><strong class="stat-value">{email_total}</strong><span class="stat-detail">{selected_mailboxes} dossier(s) sélectionné(s)</span></div>
 <div class="stat-card"><span class="stat-label">Pièces jointes</span><strong class="stat-value">{attachment_total}</strong><span class="stat-detail">{selected_sources} source(s) active(s)</span></div>
 </section>
-<section class="card"><div class="card-header"><div><h2 class="card-title">Inventaire IMAP</h2><p class="card-description">État du cycle de découverte des sources et dossiers.</p></div><span class="badge {activity_class}">{activity}</span></div>
-<div class="card-body"><div class="inventory-row"><span class="dot {activity_class}"></span><iframe class="inventory-status" src="/inventory-status" title="État de l’inventaire IMAP"></iframe></div>
+<section class="card"><div class="card-header"><div><h2 class="card-title">Inventaire IMAP</h2><p class="card-description">État du cycle de découverte des sources et dossiers.</p></div><span class="badge {inventory_class}">{inventory_activity}</span></div>
+<div class="card-body"><div class="inventory-row"><span class="dot {inventory_class}"></span><iframe class="inventory-status" src="/inventory-status" title="État de l’inventaire IMAP"></iframe></div>
 <p class="helper">La pause bloque les envois vers OpenRAG, mais autorise l’inventaire des sources et dossiers IMAP.</p>
 <div class="counts" aria-label="Détail des états des mails">{count_badges("emails")}</div></div>
-<div class="card-footer"><form method="post" action="/scan"><input type="hidden" name="csrf" value="{csrf}"><button class="primary" type="submit">Relancer l’inventaire</button></form></div></section>
+<div class="card-footer"><form method="post" action="/scan"><input type="hidden" name="csrf" value="{csrf}">{scan_button}</form></div></section>
 <form method="post" action="/secrets" class="card" autocomplete="off"><div class="card-header"><div><h2 class="card-title">Clés API</h2><p class="card-description">Renouvelez séparément les accès OpenArchiver et OpenRAG.</p></div><span class="badge">OpenArchiver : {openarchiver_key_state} · OpenRAG : {openrag_key_state}</span></div>
 <div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="secret-grid"><label class="secret-field">Nouvelle clé OpenArchiver<input type="password" name="openarchiver_key" autocomplete="new-password"></label><label class="secret-field">Nouvelle clé OpenRAG<input type="password" name="openrag_key" autocomplete="new-password"></label></div><p class="helper">Laissez un champ vide pour conserver sa valeur actuelle. Les clés ne sont jamais réaffichées ni enregistrées dans SQLite.</p></div>
 <div class="card-footer"><button class="primary" type="submit">Enregistrer les clés renseignées</button></div></form>
