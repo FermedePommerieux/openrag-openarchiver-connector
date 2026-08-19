@@ -1318,6 +1318,44 @@ class ConnectorTests(unittest.TestCase):
         self.assertIn('id="inventory-button"', page)
         self.assertIn('id="inventory-completion"', page)
 
+    def test_status_page_separates_selected_queue_from_local_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            self._insert_email(config, self.mail("selected", "source-1"))
+            self._insert_email(config, self.mail("historical", "source-2"))
+            connector.replace_mailbox_selection(config, [("source-1", "INBOX")])
+
+            global_counts = connector._status_counts(config)
+            selected_counts = connector._status_counts(config, selected_only=True)
+            page = connector.render_status_page(config, connector.RuntimeState())
+
+        self.assertEqual(global_counts["emails"]["queued"], 2)
+        self.assertEqual(selected_counts["emails"]["queued"], 1)
+        self.assertIn("Mails dans la sélection", page)
+        self.assertIn("Historique local conservé : 2 mail(s)", page)
+        self.assertIn("Les éléments hors sélection ne sont pas envoyés", page)
+
+    def test_last_cycle_is_restored_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            scan = connector.ScanResult(1, 1, True, False)
+            connector.persist_cycle_outcome(
+                config,
+                completed_at=123456,
+                scan=scan,
+                processed=1,
+                error="",
+            )
+            restored = connector.RuntimeState()
+            connector.restore_cycle_outcome(config, restored)
+
+            snapshot = restored.snapshot()
+            self.assertEqual(snapshot["last_cycle_completed_at"], 123456)
+            self.assertEqual(snapshot["last_scan"], scan)
+            self.assertEqual(snapshot["last_processed"], 1)
+            self.assertTrue(snapshot["ready"])
+            self.assertIn("terminé le", connector.inventory_status(snapshot))
+
     def test_status_page_makes_running_inventory_explicit(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))

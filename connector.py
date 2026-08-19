@@ -1901,6 +1901,20 @@ class RuntimeState:
         with self.lock:
             self.running = value
 
+    def restore_cycle(
+        self,
+        completed_at: int,
+        scan: ScanResult | None,
+        processed: int,
+        error: str,
+    ) -> None:
+        with self.lock:
+            self.last_cycle_completed_at = completed_at
+            self.last_scan = scan
+            self.last_processed = processed
+            self.last_error = error
+            self.ready = bool(completed_at and not error)
+
     def cycle_started(self) -> None:
         with self.lock:
             self.last_cycle_started_at = int(time.time())
@@ -2009,6 +2023,61 @@ def run_cycle(
     return scan, processed
 
 
+def persist_cycle_outcome(
+    config: Config,
+    *,
+    completed_at: int,
+    scan: ScanResult | None,
+    processed: int,
+    error: str,
+) -> None:
+    values = {
+        "last_cycle_completed_at": str(completed_at),
+        "last_cycle_sources": str(scan.sources if scan else 0),
+        "last_cycle_emails": str(scan.emails if scan else 0),
+        "last_cycle_processed": str(processed),
+        "last_cycle_error": error,
+    }
+    with database(config) as db:
+        db.executemany(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)",
+            values.items(),
+        )
+
+
+def restore_cycle_outcome(config: Config, state: RuntimeState) -> None:
+    with database(config) as db:
+        values = {
+            str(row["key"]): str(row["value"])
+            for row in db.execute(
+                """SELECT key, value FROM settings
+                   WHERE key IN (
+                       'last_cycle_completed_at', 'last_cycle_sources',
+                       'last_cycle_emails', 'last_cycle_processed',
+                       'last_cycle_error'
+                   )"""
+            )
+        }
+    completed_at = int(values.get("last_cycle_completed_at", "0") or 0)
+    if not completed_at:
+        return
+    error = values.get("last_cycle_error", "")
+    scan = None
+    if not error:
+        scan = ScanResult(
+            int(values.get("last_cycle_sources", "0") or 0),
+            int(values.get("last_cycle_emails", "0") or 0),
+            True,
+            False,
+        )
+    state.restore_cycle(
+        completed_at,
+        scan,
+        int(values.get("last_cycle_processed", "0") or 0),
+        error,
+    )
+
+
 def runtime_loop(
     config: Config,
     state: RuntimeState,
@@ -2056,6 +2125,20 @@ def runtime_loop(
                     progress=state.cycle_progress,
                 )
                 state.cycle_succeeded(scan, processed)
+                completed_at = int(state.snapshot()["last_cycle_completed_at"])
+                try:
+                    persist_cycle_outcome(
+                        config,
+                        completed_at=completed_at,
+                        scan=scan,
+                        processed=processed,
+                        error="",
+                    )
+                except sqlite3.Error as persistence_error:
+                    LOG.error(
+                        "persistance de l’état du cycle en échec: %s",
+                        _safe_error(persistence_error),
+                    )
                 LOG.info(
                     "cycle terminé: sources=%d mails=%d traités=%d",
                     scan.sources,
@@ -2065,6 +2148,20 @@ def runtime_loop(
                 delay = config.scan_interval_seconds
             except Exception as error:
                 state.cycle_failed(error)
+                completed_at = int(state.snapshot()["last_cycle_completed_at"])
+                try:
+                    persist_cycle_outcome(
+                        config,
+                        completed_at=completed_at,
+                        scan=None,
+                        processed=0,
+                        error=_safe_error(error),
+                    )
+                except sqlite3.Error as persistence_error:
+                    LOG.error(
+                        "persistance de l’échec du cycle impossible: %s",
+                        _safe_error(persistence_error),
+                    )
                 LOG.error("cycle en échec: %s", _safe_error(error))
                 delay = config.cycle_retry_seconds
             wake.wait(delay)
@@ -2073,12 +2170,35 @@ def runtime_loop(
         state.set_running(False)
 
 
-def _status_counts(config: Config) -> dict[str, dict[str, int]]:
+def _status_counts(
+    config: Config, *, selected_only: bool = False
+) -> dict[str, dict[str, int]]:
     result: dict[str, dict[str, int]] = {"emails": {}, "attachments": {}}
     with database(config) as db:
         for table in result:
+            selection_clause = ""
+            if selected_only and table == "emails":
+                selection_clause = """WHERE EXISTS (
+                    SELECT 1 FROM sources s
+                    JOIN mailboxes m
+                      ON m.source_id=emails.source_id
+                     AND m.path=emails.mailbox_path
+                    WHERE s.id=emails.source_id
+                      AND s.selected=1 AND m.selected=1
+                )"""
+            elif selected_only:
+                selection_clause = """WHERE EXISTS (
+                    SELECT 1 FROM email_attachments ea
+                    JOIN emails e ON e.id=ea.email_id
+                    JOIN sources s ON s.id=e.source_id
+                    JOIN mailboxes m
+                      ON m.source_id=e.source_id AND m.path=e.mailbox_path
+                    WHERE ea.attachment_id=attachments.id
+                      AND s.selected=1 AND m.selected=1
+                )"""
             for row in db.execute(
-                f"SELECT status, COUNT(*) AS count FROM {table} GROUP BY status"
+                f"""SELECT status, COUNT(*) AS count FROM {table}
+                    {selection_clause} GROUP BY status"""
             ):
                 result[table][str(row["status"])] = int(row["count"])
     return result
@@ -2214,6 +2334,7 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
     sources = source_rows(config)
     mailboxes = mailbox_rows(config)
     counts = _status_counts(config)
+    selected_counts = _status_counts(config, selected_only=True)
     paused = is_paused(config)
     csrf = html.escape(str(snapshot["csrf_token"]), quote=True)
 
@@ -2258,10 +2379,9 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
             "enregistrer, puis attendre la fin du cycle d’inventaire.</p>"
         )
 
-    def count_badges(table: str) -> str:
-        values = counts[table]
+    def count_badges(values: Mapping[str, int], empty: str) -> str:
         if not values:
-            return '<span class="badge">aucun objet</span>'
+            return f'<span class="badge">{html.escape(empty)}</span>'
         return "".join(
             f'<span class="badge">{html.escape(status)} · {count}</span>'
             for status, count in sorted(values.items())
@@ -2288,8 +2408,10 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
         scan_button = '<button id="inventory-button" class="primary" type="submit">Relancer l’inventaire</button>'
     selected_sources = sum(int(row["selected"]) for row in sources)
     selected_mailboxes = sum(int(row["selected"]) for row in mailboxes)
-    email_total = sum(counts["emails"].values())
-    attachment_total = sum(counts["attachments"].values())
+    email_total = sum(selected_counts["emails"].values())
+    attachment_total = sum(selected_counts["attachments"].values())
+    historical_email_total = sum(counts["emails"].values())
+    historical_attachment_total = sum(counts["attachments"].values())
     openarchiver_key_state = (
         "Configurée"
         if secret_is_configured(config.openarchiver_api_key_file)
@@ -2343,14 +2465,15 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 <section class="status-grid" aria-label="État du connecteur">
 <div class="stat-card"><span class="stat-label"><span class="dot {status_class}"></span>Service</span><strong class="stat-value">{ready}</strong><span class="stat-detail">Dernière synchro : {last_sync}</span></div>
 <div class="stat-card"><span class="stat-label"><span class="dot {activity_class}"></span>Indexation</span><strong class="stat-value">{activity}</strong><span class="stat-detail">{int(snapshot["last_processed"])} objet(s) au dernier cycle</span></div>
-<div class="stat-card"><span class="stat-label">Mails inventoriés</span><strong class="stat-value">{email_total}</strong><span class="stat-detail">{selected_mailboxes} dossier(s) sélectionné(s)</span></div>
-<div class="stat-card"><span class="stat-label">Pièces jointes</span><strong class="stat-value">{attachment_total}</strong><span class="stat-detail">{selected_sources} source(s) active(s)</span></div>
+<div class="stat-card"><span class="stat-label">Mails dans la sélection</span><strong class="stat-value">{email_total}</strong><span class="stat-detail">{selected_mailboxes} dossier(s) sélectionné(s)</span></div>
+<div class="stat-card"><span class="stat-label">Pièces jointes sélectionnées</span><strong class="stat-value">{attachment_total}</strong><span class="stat-detail">{selected_sources} source(s) active(s)</span></div>
 </section>
 <section class="card"><div class="card-header"><div><h2 class="card-title">Inventaire IMAP</h2><p class="card-description">État du cycle de découverte des sources et dossiers.</p></div><span id="inventory-badge" class="badge {inventory_class}">{inventory_activity}</span></div>
 <div class="card-body"><div class="inventory-row"><span id="inventory-dot" class="dot {inventory_class}"></span><span id="inventory-summary" class="inventory-status" role="status" aria-live="polite" aria-busy="{str(inventory_running).lower()}">{html.escape(inventory_status(snapshot))}</span></div>
 <p id="inventory-completion" class="helper" role="status" hidden></p>
 <p class="helper">La pause bloque les envois vers OpenRAG, mais autorise l’inventaire des sources et dossiers IMAP.</p>
-<div class="counts" aria-label="Détail des états des mails">{count_badges("emails")}</div></div>
+<div class="counts" aria-label="États des mails de la sélection"><span class="badge success">Sélection actuelle</span>{count_badges(selected_counts["emails"], "aucun mail")}</div>
+<p class="helper">Historique local conservé : {historical_email_total} mail(s), dont {historical_attachment_total} pièce(s) jointe(s). Les éléments hors sélection ne sont pas envoyés à OpenRAG.</p></div>
 <div class="card-footer"><form method="post" action="/scan"><input type="hidden" name="csrf" value="{csrf}">{scan_button}</form></div></section>
 <form method="post" action="/secrets" class="card" autocomplete="off"><div class="card-header"><div><h2 class="card-title">Clés API</h2><p class="card-description">Renouvelez séparément les accès OpenArchiver et OpenRAG.</p></div><span class="badge">OpenArchiver : {openarchiver_key_state} · OpenRAG : {openrag_key_state}</span></div>
 <div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="secret-grid"><label class="secret-field">Nouvelle clé OpenArchiver<input type="password" name="openarchiver_key" autocomplete="new-password"></label><label class="secret-field">Nouvelle clé OpenRAG<input type="password" name="openrag_key" autocomplete="new-password"></label></div><p class="helper">Laissez un champ vide pour conserver sa valeur actuelle. Les clés ne sont jamais réaffichées ni enregistrées dans SQLite.</p></div>
@@ -2359,7 +2482,7 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 <div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="selection-list">{"".join(source_lines)}</div></div>
 <div class="card-footer"><button class="primary" type="submit">Enregistrer et lancer l’inventaire</button></div></form>
 <form method="post" action="/mailboxes" class="card"><div class="card-header"><div><h2 class="card-title">Dossiers IMAP indexés</h2><p class="card-description">Affinez l’indexation aux dossiers utiles de chaque source.</p></div><span class="badge">{selected_mailboxes}/{len(mailboxes)} sélectionné(s)</span></div>
-<div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="selection-list">{"".join(mailbox_lines)}</div><div class="counts" aria-label="Détail des états des pièces jointes" style="margin-top:14px">{count_badges("attachments")}</div></div>
+<div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="selection-list">{"".join(mailbox_lines)}</div><div class="counts" aria-label="États des pièces jointes de la sélection" style="margin-top:14px"><span class="badge success">Sélection actuelle</span>{count_badges(selected_counts["attachments"], "aucune pièce jointe")}</div></div>
 <div class="card-footer"><button class="primary" type="submit">Enregistrer les dossiers</button></div></form>
 <section class="card danger-card"><div class="card-header"><div><h2 class="card-title">Remise à zéro</h2><p class="card-description">Efface l’inventaire, les sélections et l’historique local uniquement.</p></div><span class="badge danger">Zone sensible</span></div>
 <div class="card-body"><p>Aucun mail OpenArchiver ni document OpenRAG n’est supprimé. Le connecteur reste en pause.</p><p class="helper">{html.escape(reset_status)}</p>
@@ -2582,6 +2705,7 @@ def main() -> None:
     STOP.clear()
     WAKE.clear()
     state = RuntimeState()
+    restore_cycle_outcome(config, state)
 
     def stop_service(_signum: int, _frame: object) -> None:
         STOP.set()
