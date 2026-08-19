@@ -2480,6 +2480,37 @@ UI_SCRIPT = r"""(() => {
   const progressLabel = document.getElementById("cycle-progress-label");
   if (!badge || !summary || !dot || !button || !completion) return;
   let observedActive = document.body.dataset.cycleActive === "true";
+  const refreshInventoryDisplay = async () => {
+    const response = await fetch("/?inventory-fragment=1", {cache: "no-store"});
+    if (!response.ok) throw new Error("actualisation de l’inventaire impossible");
+    const fresh = new DOMParser().parseFromString(await response.text(), "text/html");
+    const currentMailboxList = document.getElementById("mailbox-selection-list");
+    const freshMailboxList = fresh.getElementById("mailbox-selection-list");
+    if (currentMailboxList && freshMailboxList) {
+      const choices = new Map(Array.from(
+        currentMailboxList.querySelectorAll('input[name="mailbox"]')
+      ).map(input => [input.value, input.checked]));
+      freshMailboxList.querySelectorAll('input[name="mailbox"]').forEach(input => {
+        if (choices.has(input.value)) input.checked = choices.get(input.value);
+      });
+      currentMailboxList.innerHTML = freshMailboxList.innerHTML;
+    }
+    [
+      "mailbox-selection-badge",
+      "mail-count",
+      "mailbox-selected-count",
+      "selected-attachment-mail-count",
+      "detailed-attachment-count",
+      "inventory-cache-label",
+      "email-status-counts",
+      "history-summary",
+      "attachment-status-counts"
+    ].forEach(id => {
+      const current = document.getElementById(id);
+      const replacement = fresh.getElementById(id);
+      if (current && replacement) current.innerHTML = replacement.innerHTML;
+    });
+  };
   const update = async () => {
     try {
       const response = await fetch("/status.json", {cache: "no-store"});
@@ -2527,10 +2558,12 @@ UI_SCRIPT = r"""(() => {
         }
       }
       if (observedActive && !active && !requested) {
+        await refreshInventoryDisplay();
         completion.hidden = false;
         completion.textContent = failed ?
           "Inventaire interrompu. Le détail est affiché ci-dessus ; vos champs et sélections ont été conservés." :
-          "Inventaire terminé. Vos champs et sélections ont été conservés. Vous pouvez actualiser les listes et compteurs quand vous le souhaitez.";
+          "Inventaire terminé. Les dossiers et compteurs ont été actualisés ; vos champs et sélections ont été conservés.";
+        observedActive = false;
       }
     } catch (_error) {
       // La prochaine interrogation reprendra automatiquement.
@@ -2691,18 +2724,18 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 <section class="status-grid" aria-label="État du connecteur">
 <div class="stat-card"><span class="stat-label"><span class="dot {status_class}"></span>Service</span><strong id="service-status" class="stat-value">{ready}</strong><span id="last-sync" class="stat-detail">Dernière synchro : {last_sync}</span></div>
 <div class="stat-card"><span class="stat-label"><span class="dot {activity_class}"></span>Indexation</span><strong class="stat-value">{activity}</strong><span id="last-processed" class="stat-detail">{int(snapshot["last_processed"])} objet(s) au dernier cycle</span></div>
-<div class="stat-card"><span class="stat-label">Mails dans la sélection</span><strong class="stat-value">{email_total}</strong><span class="stat-detail">{selected_mailboxes} dossier(s) sélectionné(s)</span></div>
-<div class="stat-card"><span class="stat-label">Mails avec pièces jointes</span><strong class="stat-value">{selected_attachment_mails}</strong><span class="stat-detail">{attachment_total} pièce(s) déjà détaillée(s)</span></div>
+<div class="stat-card"><span class="stat-label">Mails dans la sélection</span><strong id="mail-count" class="stat-value">{email_total}</strong><span id="mailbox-selected-count" class="stat-detail">{selected_mailboxes} dossier(s) sélectionné(s)</span></div>
+<div class="stat-card"><span class="stat-label">Mails avec pièces jointes</span><strong id="selected-attachment-mail-count" class="stat-value">{selected_attachment_mails}</strong><span id="detailed-attachment-count" class="stat-detail">{attachment_total} pièce(s) déjà détaillée(s)</span></div>
 </section>
 <section class="card"><div class="card-header"><div><h2 class="card-title">Inventaire IMAP</h2><p class="card-description">État du cycle de découverte des sources et dossiers.</p></div><span id="inventory-badge" class="badge {inventory_class}">{inventory_activity}</span></div>
 <div class="card-body"><div class="inventory-row"><span id="inventory-dot" class="dot {inventory_class}"></span><span id="inventory-summary" class="inventory-status" role="status" aria-live="polite" aria-busy="{str(inventory_running).lower()}">{html.escape(inventory_status(snapshot))}</span></div>
 <div id="cycle-progress" class="progress-wrap" role="progressbar" aria-label="Progression du cycle" hidden><div class="progress-track"><div id="cycle-progress-bar" class="progress-bar"></div></div><span id="cycle-progress-label" class="progress-label">Préparation…</span></div>
 <p id="inventory-completion" class="helper" role="status" hidden></p>
-<p class="helper">{html.escape(inventory_cache_label)}</p>
+<p id="inventory-cache-label" class="helper">{html.escape(inventory_cache_label)}</p>
 <p class="helper">Les archives sont traitées comme un instantané stable. Utilisez « Relancer l’inventaire » pour rechercher explicitement de nouveaux éléments.</p>
 <p class="helper">La pause bloque les envois vers OpenRAG, mais autorise l’inventaire des sources et dossiers IMAP.</p>
-<div class="counts" aria-label="États des mails de la sélection"><span class="badge success">Sélection actuelle</span>{count_badges(selected_counts["emails"], "aucun mail")}</div>
-<p class="helper">Historique local conservé : {historical_email_total} mail(s) ; {historical_attachment_total} pièce(s) jointe(s) déjà détaillée(s). Les éléments hors sélection ne sont pas envoyés à OpenRAG.</p></div>
+<div id="email-status-counts" class="counts" aria-label="États des mails de la sélection"><span class="badge success">Sélection actuelle</span>{count_badges(selected_counts["emails"], "aucun mail")}</div>
+<p id="history-summary" class="helper">Historique local conservé : {historical_email_total} mail(s) ; {historical_attachment_total} pièce(s) jointe(s) déjà détaillée(s). Les éléments hors sélection ne sont pas envoyés à OpenRAG.</p></div>
 <div class="card-footer"><form method="post" action="/scan"><input type="hidden" name="csrf" value="{csrf}">{scan_button}</form></div></section>
 <form method="post" action="/secrets" class="card" autocomplete="off"><div class="card-header"><div><h2 class="card-title">Clés API</h2><p class="card-description">Renouvelez séparément les accès OpenArchiver et OpenRAG.</p></div><span class="badge">OpenArchiver : {openarchiver_key_state} · OpenRAG : {openrag_key_state}</span></div>
 <div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="secret-grid"><label class="secret-field">Nouvelle clé OpenArchiver<input type="password" name="openarchiver_key" autocomplete="new-password"></label><label class="secret-field">Nouvelle clé OpenRAG<input type="password" name="openrag_key" autocomplete="new-password"></label></div><p class="helper">Laissez un champ vide pour conserver sa valeur actuelle. Les clés ne sont jamais réaffichées ni enregistrées dans SQLite.</p></div>
@@ -2710,8 +2743,8 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 <form method="post" action="/sources" class="card"><div class="card-header"><div><h2 class="card-title">Sources indexées</h2><p class="card-description">Choisissez les comptes OpenArchiver à rendre disponibles dans OpenRAG.</p></div><span class="badge">{selected_sources}/{len(sources)} sélectionnée(s)</span></div>
 <div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="selection-list">{"".join(source_lines)}</div></div>
 <div class="card-footer"><button class="primary" type="submit">Enregistrer et lancer l’inventaire</button></div></form>
-<form method="post" action="/mailboxes" class="card"><div class="card-header"><div><h2 class="card-title">Dossiers IMAP indexés</h2><p class="card-description">Affinez l’indexation aux dossiers utiles de chaque source.</p></div><span class="badge">{selected_mailboxes}/{len(mailboxes)} sélectionné(s)</span></div>
-<div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="selection-list">{"".join(mailbox_lines)}</div><div class="counts" aria-label="États des pièces jointes détaillées de la sélection" style="margin-top:14px"><span class="badge success">Pièces jointes détaillées</span>{count_badges(selected_counts["attachments"], "pas encore détaillées")}</div></div>
+<form method="post" action="/mailboxes" class="card"><div class="card-header"><div><h2 class="card-title">Dossiers IMAP indexés</h2><p class="card-description">Affinez l’indexation aux dossiers utiles de chaque source.</p></div><span id="mailbox-selection-badge" class="badge">{selected_mailboxes}/{len(mailboxes)} sélectionné(s)</span></div>
+<div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div id="mailbox-selection-list" class="selection-list">{"".join(mailbox_lines)}</div><div id="attachment-status-counts" class="counts" aria-label="États des pièces jointes détaillées de la sélection" style="margin-top:14px"><span class="badge success">Pièces jointes détaillées</span>{count_badges(selected_counts["attachments"], "pas encore détaillées")}</div></div>
 <div class="card-footer"><button class="primary" type="submit">Enregistrer les dossiers</button></div></form>
 <section class="card danger-card"><div class="card-header"><div><h2 class="card-title">Remise à zéro</h2><p class="card-description">Efface l’inventaire, les sélections et l’historique local uniquement.</p></div><span class="badge danger">Zone sensible</span></div>
 <div class="card-body"><p>Aucun mail OpenArchiver ni document OpenRAG n’est supprimé. Le connecteur reste en pause.</p><p class="helper">{html.escape(reset_status)}</p>

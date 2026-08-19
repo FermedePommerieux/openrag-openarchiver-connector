@@ -1540,6 +1540,12 @@ class ConnectorTests(unittest.TestCase):
         self.assertIn('id="inventory-dot"', page)
         self.assertIn('id="inventory-button"', page)
         self.assertIn('id="inventory-completion"', page)
+        self.assertIn('id="mailbox-selection-list"', page)
+        self.assertIn('id="mailbox-selection-badge"', page)
+        self.assertIn('fetch("/?inventory-fragment=1"', connector.UI_SCRIPT)
+        self.assertIn("new DOMParser()", connector.UI_SCRIPT)
+        self.assertIn("choices.has(input.value)", connector.UI_SCRIPT)
+        self.assertIn("observedActive = false", connector.UI_SCRIPT)
 
     def test_status_page_separates_selected_queue_from_local_history(self):
         with tempfile.TemporaryDirectory() as directory:
