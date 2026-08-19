@@ -27,7 +27,7 @@ spec:
       containers:
         - name: connector
           # KISS : réutilise l'image Python OpenRAG déjà présente dans le cluster.
-          image: ghcr.io/fermedepommerieux/openrag-compose/openrag-backend:b57976c4d907bb23b08a510cdf5b6bd6cd09789c
+          image: ghcr.io/fermedepommerieux/openrag-compose/openrag-backend:350cf4b395e3d92be1f8a405d94a73552b9e1aa2
           imagePullPolicy: IfNotPresent
           command:
             - python
