@@ -77,13 +77,13 @@ spec:
             - name: OPENARCHIVER_API_KEY_FILE
               value: /state/secrets/openarchiver-api-key
             - name: OPENARCHIVER_SOURCE_URL_TEMPLATE
-              value: ""
+              value: "https://openarchiver.ferme-de-pommerieux.fr/dashboard/archived-emails/{email_id}"
             - name: OPENRAG_BASE_URL
               value: http://openrag-backend.openrag.svc.cluster.local:8000
             - name: OPENRAG_INGEST_PATH
               value: /v1/documents/ingest-path
             - name: OPENRAG_INGEST_MODE
-              value: auto
+              value: api
             - name: OPENRAG_UPLOAD_PATH
               value: /v1/documents/ingest
             - name: OPENRAG_INGEST_DIRECTORY

@@ -1643,6 +1643,11 @@ class ConnectorTests(unittest.TestCase):
         self.assertIn("OPENRAG_INGEST_DIRECTORY", deployment)
         self.assertIn("/shared/openrag-documents/openarchiver", deployment)
         self.assertIn("/v1/documents/ingest-path", deployment)
+        self.assertIn(
+            "https://openarchiver.ferme-de-pommerieux.fr/dashboard/archived-emails/{email_id}",
+            deployment,
+        )
+        self.assertIn("name: OPENRAG_INGEST_MODE\n              value: api", deployment)
         self.assertIn("claimName: openrag-shared", deployment)
         self.assertIn("type: ClusterIP", service)
         self.assertNotIn("NodePort", service)
