@@ -218,6 +218,26 @@ class ConnectorTests(unittest.TestCase):
                 ),
             )
 
+    def test_secret_rotation_is_atomic_private_and_never_rendered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            connector.write_secret(
+                config.openarchiver_api_key_file, "nouvelle-cle-oa", "OpenArchiver"
+            )
+            connector.write_secret(
+                config.openrag_api_key_file, "nouvelle-cle-rag", "OpenRAG"
+            )
+            self.assertEqual(
+                connector.read_secret(config.openarchiver_api_key_file, "OpenArchiver"),
+                "nouvelle-cle-oa",
+            )
+            self.assertEqual(config.openarchiver_api_key_file.stat().st_mode & 0o777, 0o600)
+            page = connector.render_status_page(config, connector.RuntimeState())
+            self.assertIn("OpenArchiver : Configurée", page)
+            self.assertIn("OpenRAG : Configurée", page)
+            self.assertNotIn("nouvelle-cle-oa", page)
+            self.assertNotIn("nouvelle-cle-rag", page)
+
     def test_rejects_non_internal_or_non_http_urls(self):
         invalid = (
             {"OPENARCHIVER_BASE_URL": "https://openarchiver.svc/api/v1"},
@@ -1077,6 +1097,34 @@ class ConnectorTests(unittest.TestCase):
                 with urllib.request.urlopen(base + "/") as response:
                     page = response.read().decode("utf-8")
                 self.assertIn("source-1", page)
+                self.assertIn("Clés API", page)
+
+                secrets_request = urllib.request.Request(
+                    base + "/secrets",
+                    data=urllib.parse.urlencode(
+                        {
+                            "csrf": state.snapshot()["csrf_token"],
+                            "openarchiver_key": "oa-rotated",
+                            "openrag_key": "rag-rotated",
+                        }
+                    ).encode("ascii"),
+                )
+                with urllib.request.urlopen(secrets_request) as response:
+                    rotated_page = response.read().decode("utf-8")
+                self.assertEqual(
+                    connector.read_secret(
+                        config.openarchiver_api_key_file, "OpenArchiver"
+                    ),
+                    "oa-rotated",
+                )
+                self.assertEqual(
+                    connector.read_secret(config.openrag_api_key_file, "OpenRAG"),
+                    "rag-rotated",
+                )
+                self.assertNotIn("oa-rotated", rotated_page)
+                self.assertNotIn("rag-rotated", rotated_page)
+                self.assertTrue(wake.is_set())
+                wake.clear()
 
                 body = urllib.parse.urlencode(
                     {"csrf": state.snapshot()["csrf_token"]}
@@ -1189,6 +1237,11 @@ class ConnectorTests(unittest.TestCase):
         )
         self.assertIn("openarchiver-api-key", deployment)
         self.assertIn("openrag-api-key", deployment)
+        self.assertIn("name: bootstrap-api-keys", deployment)
+        self.assertIn("optional: true", deployment)
+        self.assertIn("/state/secrets/openarchiver-api-key", deployment)
+        self.assertIn("/state/secrets/openrag-api-key", deployment)
+        self.assertIn("chmod 0600", deployment)
         self.assertIn("OPENRAG_INGEST_DIRECTORY", deployment)
         self.assertIn("/shared/openrag-documents/openarchiver", deployment)
         self.assertIn("/v1/documents/ingest-path", deployment)

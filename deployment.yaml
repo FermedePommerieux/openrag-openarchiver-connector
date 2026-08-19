@@ -24,6 +24,39 @@ spec:
         fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
+      initContainers:
+        - name: bootstrap-api-keys
+          image: ghcr.io/fermedepommerieux/openrag-compose/openrag-backend:350cf4b395e3d92be1f8a405d94a73552b9e1aa2
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -ec
+          args:
+            - |
+              umask 077
+              mkdir -p /state/secrets
+              for name in openarchiver-api-key openrag-api-key; do
+                if [ ! -s "/state/secrets/${name}" ] && [ -s "/bootstrap/${name}" ]; then
+                  cp "/bootstrap/${name}" "/state/secrets/${name}"
+                fi
+              done
+              chmod 0700 /state/secrets
+              find /state/secrets -type f -exec chmod 0600 {} \;
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: state
+              mountPath: /state
+            - name: bootstrap-api-keys
+              mountPath: /bootstrap
+              readOnly: true
       containers:
         - name: connector
           # KISS : réutilise l'image Python OpenRAG déjà présente dans le cluster.
@@ -42,7 +75,7 @@ spec:
             - name: OPENARCHIVER_BASE_URL
               value: http://openarchiver-api.openarchiver.svc.cluster.local:4000/v1
             - name: OPENARCHIVER_API_KEY_FILE
-              value: /var/run/secrets/connector/openarchiver-api-key
+              value: /state/secrets/openarchiver-api-key
             - name: OPENARCHIVER_SOURCE_URL_TEMPLATE
               value: ""
             - name: OPENRAG_BASE_URL
@@ -58,7 +91,7 @@ spec:
             - name: OPENRAG_TASK_PATH
               value: /v1/tasks/{task_id}/enhanced
             - name: OPENRAG_API_KEY_FILE
-              value: /var/run/secrets/connector/openrag-api-key
+              value: /state/secrets/openrag-api-key
             - name: SCAN_INTERVAL_SECONDS
               value: "3600"
             - name: CYCLE_RETRY_SECONDS
@@ -129,9 +162,6 @@ spec:
               readOnly: true
             - name: state
               mountPath: /state
-            - name: api-keys
-              mountPath: /var/run/secrets/connector
-              readOnly: true
             - name: shared
               mountPath: /shared
       volumes:
@@ -142,10 +172,11 @@ spec:
         - name: state
           persistentVolumeClaim:
             claimName: openrag-openarchiver-connector-state
-        - name: api-keys
+        - name: bootstrap-api-keys
           secret:
             secretName: openrag-openarchiver-connector-api
-            defaultMode: 0400
+            optional: true
+            defaultMode: 0440
             items:
               - key: openarchiver-api-key
                 path: openarchiver-api-key
