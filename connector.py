@@ -1888,6 +1888,7 @@ class RuntimeState:
         self.last_cycle_completed_at = 0
         self.cycle_requested_at = 0
         self.cycle_in_progress = False
+        self.cycle_phase = ""
         self.last_error = ""
         self.last_scan: ScanResult | None = None
         self.last_processed = 0
@@ -1905,6 +1906,12 @@ class RuntimeState:
             self.last_cycle_started_at = int(time.time())
             self.cycle_requested_at = 0
             self.cycle_in_progress = True
+            self.cycle_phase = "Démarrage de l’inventaire"
+
+    def cycle_progress(self, phase: str) -> None:
+        with self.lock:
+            if self.cycle_in_progress:
+                self.cycle_phase = phase
 
     def cycle_requested(self) -> None:
         with self.lock:
@@ -1932,6 +1939,7 @@ class RuntimeState:
             self.last_error = ""
             self.last_scan = None
             self.last_processed = 0
+            self.cycle_phase = ""
             self.ready = True
 
     def reset_failed(self, error: Exception) -> None:
@@ -1946,6 +1954,7 @@ class RuntimeState:
             self.last_processed = processed
             self.ready = True
             self.cycle_in_progress = False
+            self.cycle_phase = ""
 
     def cycle_failed(self, error: Exception) -> None:
         with self.lock:
@@ -1953,6 +1962,7 @@ class RuntimeState:
             self.last_error = _safe_error(error)
             self.ready = False
             self.cycle_in_progress = False
+            self.cycle_phase = ""
 
     def snapshot(self) -> dict[str, object]:
         with self.lock:
@@ -1963,6 +1973,7 @@ class RuntimeState:
                 "last_cycle_completed_at": self.last_cycle_completed_at,
                 "cycle_requested_at": self.cycle_requested_at,
                 "cycle_in_progress": self.cycle_in_progress,
+                "cycle_phase": self.cycle_phase,
                 "last_error": self.last_error,
                 "last_scan": self.last_scan,
                 "last_processed": self.last_processed,
@@ -1977,13 +1988,18 @@ def run_cycle(
     config: Config,
     openarchiver: OpenArchiverClient,
     openrag: OpenRAGClient,
+    progress: Callable[[str], None] | None = None,
 ) -> tuple[ScanResult, int]:
+    report = progress or (lambda _phase: None)
+    report("Actualisation des sources OpenArchiver")
     LOG.info("inventaire: actualisation des sources OpenArchiver")
     refresh_sources(config, openarchiver)
+    report("Lecture des messages des sources sélectionnées")
     LOG.info("inventaire: lecture des sources sélectionnées")
     scan = scan_selected_sources(config, openarchiver)
     if not scan.complete:
         raise IncompleteScanError("inventaire incomplet; ingestion différée")
+    report("Traitement de la file vers OpenRAG")
     LOG.info(
         "inventaire terminé: sources=%d mails=%d; traitement de la file",
         scan.sources,
@@ -2033,7 +2049,12 @@ def runtime_loop(
                 LOG.info("indexation en pause; inventaire IMAP manuel")
             state.cycle_started()
             try:
-                scan, processed = run_cycle(config, archive_client, rag_client)
+                scan, processed = run_cycle(
+                    config,
+                    archive_client,
+                    rag_client,
+                    progress=state.cycle_progress,
+                )
                 state.cycle_succeeded(scan, processed)
                 LOG.info(
                     "cycle terminé: sources=%d mails=%d traités=%d",
@@ -2068,12 +2089,24 @@ def inventory_status(snapshot: Mapping[str, object]) -> str:
     completed_at = int(snapshot["last_cycle_completed_at"])
     requested_at = int(snapshot["cycle_requested_at"])
     if bool(snapshot["cycle_in_progress"]):
-        return "Inventaire en cours depuis " + time.strftime(
-            "%Y-%m-%d %H:%M:%S UTC", time.gmtime(started_at)
+        phase = str(snapshot.get("cycle_phase") or "Inventaire en cours")
+        return (
+            "Inventaire en cours — "
+            + phase
+            + " — démarré le "
+            + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(started_at))
         )
     if requested_at:
         return "Inventaire demandé, en attente de démarrage"
     if completed_at:
+        last_error = str(snapshot.get("last_error") or "")
+        if last_error:
+            return (
+                "Inventaire interrompu le "
+                + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(completed_at))
+                + " — "
+                + last_error
+            )
         last_scan = snapshot["last_scan"]
         detail = ""
         if isinstance(last_scan, ScanResult):
@@ -2096,7 +2129,7 @@ STATUS_PAGE_STYLE = """
 *{box-sizing:border-box}html{background:var(--background)}body{margin:0;background:var(--background);color:var(--foreground);font:14px/1.5 Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input{font:inherit}button,input[type=text],input[type=password]{min-height:40px}button{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:1px solid var(--border);border-radius:var(--radius);background:var(--card);color:var(--foreground);padding:9px 14px;font-weight:600;cursor:pointer;transition:background .15s,border-color .15s,transform .05s}button:hover{background:var(--muted)}button:active{transform:translateY(1px)}button:focus-visible,input:focus-visible{outline:2px solid var(--foreground);outline-offset:2px}.primary{border-color:var(--primary);background:var(--primary);color:var(--primary-foreground)}.primary:hover{background:#27272a}.danger-button{border-color:var(--danger);color:var(--danger)}.danger-button:hover{background:var(--danger-soft)}
 .app{min-height:100vh;display:grid;grid-template-rows:64px 1fr;grid-template-columns:224px minmax(0,1fr)}.topbar{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);background:var(--background);padding:0 20px;position:sticky;top:0;z-index:2}.brand{display:flex;align-items:center;gap:10px;font:600 18px/1 ui-monospace,SFMono-Regular,Menlo,monospace}.brand-logo{width:24px;height:22px;fill:currentColor}.connector-chip{border:1px solid var(--border);border-radius:999px;padding:5px 10px;color:var(--muted-foreground);font-size:12px}.sidebar{border-right:1px solid var(--border);background:var(--sidebar);padding:16px}.nav-label{display:block;margin:8px 12px 10px;color:var(--muted-foreground);font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}.nav-item{display:flex;align-items:center;gap:10px;border-radius:var(--radius);padding:11px 12px;background:var(--muted);font-size:13px;font-weight:600}.nav-icon{width:18px;height:18px}.main{min-width:0;padding:32px}.content{max-width:1120px;margin:0 auto}.page-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.eyebrow{margin:0 0 4px;color:var(--muted-foreground);font-size:12px;font-weight:600}.page-heading h1{margin:0;font-size:24px;line-height:1.25;letter-spacing:-.02em}.page-heading p{margin:7px 0 0;color:var(--muted-foreground)}.toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.toolbar form{margin:0}
 .status-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:20px}.stat-card,.card{border:1px solid var(--border);border-radius:var(--radius);background:var(--card);box-shadow:var(--shadow)}.stat-card{padding:16px}.stat-label{display:flex;align-items:center;gap:7px;color:var(--muted-foreground);font-size:12px;font-weight:600}.dot{width:8px;height:8px;border-radius:50%;background:var(--muted-foreground)}.dot.success{background:var(--success)}.dot.warning{background:#f59e0b}.dot.danger{background:var(--danger)}.stat-value{display:block;margin-top:8px;font-size:22px;font-weight:650;letter-spacing:-.03em}.stat-detail{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px}.card{margin-bottom:16px;overflow:hidden}.card-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:18px 20px;border-bottom:1px solid var(--border)}.card-title{margin:0;font-size:15px}.card-description{margin:3px 0 0;color:var(--muted-foreground);font-size:13px}.card-body{padding:20px}.card-footer{display:flex;justify-content:flex-end;padding:14px 20px;border-top:1px solid var(--border);background:var(--sidebar)}.badge{display:inline-flex;align-items:center;border-radius:999px;background:var(--muted);padding:3px 8px;color:var(--muted-foreground);font-size:11px;font-weight:600}.badge.success{background:var(--success-soft);color:var(--success)}.badge.warning{background:var(--warning-soft);color:var(--warning)}.badge.danger{background:var(--danger-soft);color:var(--danger)}
-.inventory-row{display:flex;align-items:center;gap:12px}.inventory-status{display:block;border:0;width:100%;height:24px;background:transparent}.helper{margin:10px 0 0;color:var(--muted-foreground);font-size:12px}.error-alert{display:flex;gap:10px;margin-bottom:16px;border:1px solid #fecaca;border-radius:var(--radius);background:var(--danger-soft);padding:13px 15px;color:#991b1b}.error-alert strong{display:block}.selection-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:320px;overflow:auto}.selection-item{display:flex;align-items:flex-start;gap:11px;margin:0;border:1px solid var(--border);border-radius:var(--radius);padding:12px;cursor:pointer;transition:background .15s,border-color .15s}.selection-item:hover{background:var(--muted)}.selection-item:has(input:checked){border-color:#a1a1aa;background:var(--muted)}.selection-item input{width:16px;height:16px;margin:2px 0 0;accent-color:var(--primary);flex:0 0 auto}.selection-copy{min-width:0}.selection-title{display:block;font-weight:600;overflow-wrap:anywhere}.selection-meta{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px;overflow-wrap:anywhere}.empty{grid-column:1/-1;margin:0;border:1px dashed var(--border);border-radius:var(--radius);padding:22px;text-align:center;color:var(--muted-foreground)}.counts{display:flex;flex-wrap:wrap;gap:6px}.operation-grid,.secret-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.secret-field{display:grid;gap:6px;color:var(--muted-foreground);font-size:12px;font-weight:600}.secret-field input{width:100%;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}.danger-card{border-color:#fecaca}.danger-card .card-header{background:var(--danger-soft)}.confirm-row{display:flex;align-items:end;gap:10px}.confirm-row label{flex:1;margin:0;color:var(--muted-foreground);font-size:12px;font-weight:600}.confirm-row input{display:block;width:100%;margin-top:6px;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}code{border-radius:4px;background:var(--muted);padding:2px 5px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.footer-note{padding:8px 0 24px;text-align:center;color:var(--muted-foreground);font-size:12px}
+.inventory-row{display:flex;align-items:center;gap:12px}.inventory-status{display:block;width:100%;min-height:24px;font-weight:600}.inventory-status.running{color:var(--success)}.helper{margin:10px 0 0;color:var(--muted-foreground);font-size:12px}.error-alert{display:flex;gap:10px;margin-bottom:16px;border:1px solid #fecaca;border-radius:var(--radius);background:var(--danger-soft);padding:13px 15px;color:#991b1b}.error-alert strong{display:block}.selection-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:320px;overflow:auto}.selection-item{display:flex;align-items:flex-start;gap:11px;margin:0;border:1px solid var(--border);border-radius:var(--radius);padding:12px;cursor:pointer;transition:background .15s,border-color .15s}.selection-item:hover{background:var(--muted)}.selection-item:has(input:checked){border-color:#a1a1aa;background:var(--muted)}.selection-item input{width:16px;height:16px;margin:2px 0 0;accent-color:var(--primary);flex:0 0 auto}.selection-copy{min-width:0}.selection-title{display:block;font-weight:600;overflow-wrap:anywhere}.selection-meta{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px;overflow-wrap:anywhere}.empty{grid-column:1/-1;margin:0;border:1px dashed var(--border);border-radius:var(--radius);padding:22px;text-align:center;color:var(--muted-foreground)}.counts{display:flex;flex-wrap:wrap;gap:6px}.operation-grid,.secret-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.secret-field{display:grid;gap:6px;color:var(--muted-foreground);font-size:12px;font-weight:600}.secret-field input{width:100%;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}.danger-card{border-color:#fecaca}.danger-card .card-header{background:var(--danger-soft)}.confirm-row{display:flex;align-items:end;gap:10px}.confirm-row label{flex:1;margin:0;color:var(--muted-foreground);font-size:12px;font-weight:600}.confirm-row input{display:block;width:100%;margin-top:6px;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}code{border-radius:4px;background:var(--muted);padding:2px 5px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.footer-note{padding:8px 0 24px;text-align:center;color:var(--muted-foreground);font-size:12px}
 @media(prefers-color-scheme:dark){:root{--background:#18181b;--foreground:#fafafa;--muted:#27272a;--muted-foreground:#a1a1aa;--border:#3f3f46;--card:#18181b;--sidebar:#111113;--primary:#fafafa;--primary-foreground:#09090b;--danger:#f87171;--danger-soft:#2b1719;--success:#34d399;--success-soft:#10251e;--warning:#fbbf24;--warning-soft:#2b2414;--shadow:none}.primary:hover{background:#e4e4e7}.danger-card,.error-alert{border-color:#7f1d1d}.danger-card .card-header{background:var(--danger-soft)}.error-alert{color:#fecaca}.selection-item:has(input:checked){border-color:#71717a}}
 @media(max-width:900px){.app{grid-template-columns:1fr;grid-template-rows:64px auto 1fr}.sidebar{border-right:0;border-bottom:1px solid var(--border);padding:8px 16px}.nav-label{display:none}.nav-item{width:max-content;padding:8px 12px}.main{padding:24px 18px}.status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.operation-grid,.secret-grid{grid-template-columns:1fr}}
 @media(max-width:620px){.connector-chip{display:none}.page-heading{display:block}.toolbar{margin-top:16px}.toolbar button{flex:1}.toolbar form{display:flex;flex:1}.selection-list{grid-template-columns:1fr}.status-grid{grid-template-columns:1fr 1fr}.stat-card{padding:13px}.stat-value{font-size:19px}.card-header,.card-body{padding:16px}.card-footer{padding:12px 16px}.card-footer button{width:100%}.confirm-row{align-items:stretch;flex-direction:column}.confirm-row button{width:100%}}
@@ -2113,6 +2146,67 @@ def render_inventory_status_page(state: RuntimeState) -> str:
 <meta name="color-scheme" content="light dark">
 <style>:root{{color-scheme:light dark}}body{{font:600 13px/24px Inter,ui-sans-serif,system-ui,sans-serif;margin:0;color:#09090b;background:transparent;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}body.running{{color:#059669}}body.running::before{{content:"";display:inline-block;width:8px;height:8px;margin-right:8px;border-radius:50%;background:#10b981;animation:pulse 1.2s ease-in-out infinite}}@keyframes pulse{{50%{{opacity:.3;transform:scale(.75)}}}}@media(prefers-color-scheme:dark){{body{{color:#fafafa}}body.running{{color:#34d399}}}}</style>
 </head><body class="{body_class}" aria-live="polite" aria-busy="{str(running).lower()}">{status}</body></html>"""
+
+
+def render_live_status(state: RuntimeState) -> str:
+    snapshot = state.snapshot()
+    return json.dumps(
+        {
+            "inventory_status": inventory_status(snapshot),
+            "cycle_in_progress": bool(snapshot["cycle_in_progress"]),
+            "cycle_requested": bool(snapshot["cycle_requested_at"]),
+            "cycle_completed_at": int(snapshot["last_cycle_completed_at"]),
+            "last_error": str(snapshot["last_error"] or ""),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ) + "\n"
+
+
+UI_SCRIPT = r"""(() => {
+  const badge = document.getElementById("inventory-badge");
+  const summary = document.getElementById("inventory-summary");
+  const dot = document.getElementById("inventory-dot");
+  const button = document.getElementById("inventory-button");
+  const completion = document.getElementById("inventory-completion");
+  if (!badge || !summary || !dot || !button || !completion) return;
+  let observedActive = document.body.dataset.cycleActive === "true";
+  const update = async () => {
+    try {
+      const response = await fetch("/status.json", {cache: "no-store"});
+      if (!response.ok) return;
+      const status = await response.json();
+      const active = Boolean(status.cycle_in_progress);
+      const requested = Boolean(status.cycle_requested);
+      const failed = Boolean(status.last_error);
+      observedActive = observedActive || active || requested;
+      summary.textContent = status.inventory_status;
+      summary.setAttribute("aria-busy", active ? "true" : "false");
+      summary.classList.toggle("running", active);
+      const stateClass = active ? "success" : (failed ? "danger" : "warning");
+      badge.className = "badge " + stateClass;
+      dot.className = "dot " + stateClass;
+      badge.textContent = active ? "Inventaire en cours…" :
+        (requested ? "Inventaire demandé" :
+          (failed ? "Inventaire interrompu" : "En attente"));
+      button.disabled = active || requested;
+      button.type = active || requested ? "button" : "submit";
+      button.textContent = active ? "Inventaire en cours…" :
+        (requested ? "Inventaire demandé…" : "Relancer l’inventaire");
+      if (observedActive && !active && !requested) {
+        completion.hidden = false;
+        completion.textContent = failed ?
+          "Inventaire interrompu. Le détail est affiché ci-dessus ; vos champs et sélections ont été conservés." :
+          "Inventaire terminé. Vos champs et sélections ont été conservés. Vous pouvez actualiser les listes et compteurs quand vous le souhaitez.";
+      }
+    } catch (_error) {
+      // La prochaine interrogation reprendra automatiquement.
+    }
+  };
+  window.setInterval(update, 2000);
+  update();
+})();
+"""
 
 
 def render_status_page(config: Config, state: RuntimeState) -> str:
@@ -2183,15 +2277,15 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
     if inventory_running:
         inventory_activity = "Inventaire en cours…"
         inventory_class = "success running"
-        scan_button = '<button class="primary" type="button" disabled>Inventaire en cours…</button>'
+        scan_button = '<button id="inventory-button" class="primary" type="button" disabled>Inventaire en cours…</button>'
     elif inventory_requested:
         inventory_activity = "Inventaire demandé"
         inventory_class = "warning"
-        scan_button = '<button class="primary" type="button" disabled>Inventaire demandé…</button>'
+        scan_button = '<button id="inventory-button" class="primary" type="button" disabled>Inventaire demandé…</button>'
     else:
         inventory_activity = "En attente"
         inventory_class = "warning" if paused else "success"
-        scan_button = '<button class="primary" type="submit">Relancer l’inventaire</button>'
+        scan_button = '<button id="inventory-button" class="primary" type="submit">Relancer l’inventaire</button>'
     selected_sources = sum(int(row["selected"]) for row in sources)
     selected_mailboxes = sum(int(row["selected"]) for row in mailboxes)
     email_total = sum(counts["emails"].values())
@@ -2233,7 +2327,8 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>Connecteur OpenArchiver · OpenRAG</title>
-<style>{STATUS_PAGE_STYLE}</style></head><body>
+<style>{STATUS_PAGE_STYLE}</style><script src="/ui.js" defer></script></head>
+<body data-cycle-active="{str(inventory_running or inventory_requested).lower()}" data-cycle-completed="{last_completed}">
 <div class="app">
 <header class="topbar"><div class="brand">{OPENRAG_LOGO}<span>OpenRAG</span></div>
 <span class="connector-chip">OpenArchiver connector</span></header>
@@ -2251,8 +2346,9 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 <div class="stat-card"><span class="stat-label">Mails inventoriés</span><strong class="stat-value">{email_total}</strong><span class="stat-detail">{selected_mailboxes} dossier(s) sélectionné(s)</span></div>
 <div class="stat-card"><span class="stat-label">Pièces jointes</span><strong class="stat-value">{attachment_total}</strong><span class="stat-detail">{selected_sources} source(s) active(s)</span></div>
 </section>
-<section class="card"><div class="card-header"><div><h2 class="card-title">Inventaire IMAP</h2><p class="card-description">État du cycle de découverte des sources et dossiers.</p></div><span class="badge {inventory_class}">{inventory_activity}</span></div>
-<div class="card-body"><div class="inventory-row"><span class="dot {inventory_class}"></span><iframe class="inventory-status" src="/inventory-status" title="État de l’inventaire IMAP"></iframe></div>
+<section class="card"><div class="card-header"><div><h2 class="card-title">Inventaire IMAP</h2><p class="card-description">État du cycle de découverte des sources et dossiers.</p></div><span id="inventory-badge" class="badge {inventory_class}">{inventory_activity}</span></div>
+<div class="card-body"><div class="inventory-row"><span id="inventory-dot" class="dot {inventory_class}"></span><span id="inventory-summary" class="inventory-status" role="status" aria-live="polite" aria-busy="{str(inventory_running).lower()}">{html.escape(inventory_status(snapshot))}</span></div>
+<p id="inventory-completion" class="helper" role="status" hidden></p>
 <p class="helper">La pause bloque les envois vers OpenRAG, mais autorise l’inventaire des sources et dossiers IMAP.</p>
 <div class="counts" aria-label="Détail des états des mails">{count_badges("emails")}</div></div>
 <div class="card-footer"><form method="post" action="/scan"><input type="hidden" name="csrf" value="{csrf}">{scan_button}</form></div></section>
@@ -2264,7 +2360,7 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 <div class="card-footer"><button class="primary" type="submit">Enregistrer et lancer l’inventaire</button></div></form>
 <form method="post" action="/mailboxes" class="card"><div class="card-header"><div><h2 class="card-title">Dossiers IMAP indexés</h2><p class="card-description">Affinez l’indexation aux dossiers utiles de chaque source.</p></div><span class="badge">{selected_mailboxes}/{len(mailboxes)} sélectionné(s)</span></div>
 <div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="selection-list">{"".join(mailbox_lines)}</div><div class="counts" aria-label="Détail des états des pièces jointes" style="margin-top:14px">{count_badges("attachments")}</div></div>
-<div class="card-footer"><button class="primary" type="submit">Enregistrer les dossiers et lancer l’inventaire</button></div></form>
+<div class="card-footer"><button class="primary" type="submit">Enregistrer les dossiers et lancer l’indexation</button></div></form>
 <section class="card danger-card"><div class="card-header"><div><h2 class="card-title">Remise à zéro</h2><p class="card-description">Efface l’inventaire, les sélections et l’historique local uniquement.</p></div><span class="badge danger">Zone sensible</span></div>
 <div class="card-body"><p>Aucun mail OpenArchiver ni document OpenRAG n’est supprimé. Le connecteur reste en pause.</p><p class="helper">{html.escape(reset_status)}</p>
 <form method="post" action="/reset" class="confirm-row"><input type="hidden" name="csrf" value="{csrf}"><label>Saisir <code>RESET</code> pour confirmer<input type="text" name="confirmation" required pattern="RESET" autocomplete="off"></label><button class="danger-button" type="submit">Remettre la base locale à zéro</button></form></div></section>
@@ -2316,7 +2412,8 @@ def make_http_handler(
             self.send_header(
                 "Content-Security-Policy",
                 "default-src 'none'; style-src 'unsafe-inline'; "
-                "frame-src 'self'; form-action 'self'",
+                "script-src 'self'; connect-src 'self'; frame-src 'self'; "
+                "form-action 'self'",
             )
             self.end_headers()
             self.wfile.write(payload)
@@ -2359,6 +2456,18 @@ def make_http_handler(
                         200,
                         render_inventory_status_page(state),
                         "text/html; charset=utf-8",
+                    )
+                elif path == "/status.json":
+                    self._send(
+                        200,
+                        render_live_status(state),
+                        "application/json; charset=utf-8",
+                    )
+                elif path == "/ui.js":
+                    self._send(
+                        200,
+                        UI_SCRIPT,
+                        "text/javascript; charset=utf-8",
                     )
                 elif path == "/":
                     self._send(
@@ -2423,6 +2532,7 @@ def make_http_handler(
                             raise ConnectorError("sélection de dossier invalide")
                         selections.append((decoded[0], decoded[1]))
                     replace_mailbox_selection(config, selections)
+                    set_paused(config, False)
                     state.cycle_requested()
                     wake.set()
                     self._redirect()

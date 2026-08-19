@@ -1198,7 +1198,7 @@ class ConnectorTests(unittest.TestCase):
                     requested_page = response.read().decode("utf-8")
                 self.assertNotIn('http-equiv="refresh"', requested_page)
                 self.assertIn("Rafraîchir l’état", requested_page)
-                self.assertIn('src="/inventory-status"', requested_page)
+                self.assertIn('id="inventory-summary"', requested_page)
                 with urllib.request.urlopen(base + "/inventory-status") as response:
                     status_page = response.read().decode("utf-8")
                 self.assertIn("Inventaire demandé, en attente", status_page)
@@ -1206,9 +1206,22 @@ class ConnectorTests(unittest.TestCase):
                 state.cycle_started()
                 with urllib.request.urlopen(base + "/inventory-status") as response:
                     active_page = response.read().decode("utf-8")
-                self.assertIn("Inventaire en cours depuis", active_page)
+                self.assertIn("Inventaire en cours — Démarrage", active_page)
                 self.assertIn('class="running"', active_page)
                 self.assertIn('aria-busy="true"', active_page)
+                with urllib.request.urlopen(base + "/status.json") as response:
+                    live_status = json.loads(response.read())
+                self.assertTrue(live_status["cycle_in_progress"])
+                self.assertIn(
+                    "Démarrage de l’inventaire",
+                    live_status["inventory_status"],
+                )
+                with urllib.request.urlopen(base + "/ui.js") as response:
+                    ui_script = response.read().decode("utf-8")
+                self.assertIn('fetch("/status.json"', ui_script)
+                self.assertNotIn("window.location.reload()", ui_script)
+                self.assertIn("champs et sélections ont été conservés", ui_script)
+                self.assertIn("Inventaire interrompu", ui_script)
 
                 pause = urllib.request.Request(
                     base + "/pause",
@@ -1222,6 +1235,31 @@ class ConnectorTests(unittest.TestCase):
                 with urllib.request.urlopen(pause) as response:
                     self.assertEqual(response.status, 200)
                 self.assertTrue(connector.is_paused(config))
+
+                now = int(time.time())
+                with connector.database(config) as db:
+                    db.execute(
+                        """INSERT INTO mailboxes(
+                               source_id, path, first_seen_at, last_seen_at
+                           ) VALUES (?, ?, ?, ?)""",
+                        ("source-1", "INBOX", now, now),
+                    )
+                mailboxes = urllib.request.Request(
+                    base + "/mailboxes",
+                    data=urllib.parse.urlencode(
+                        {
+                            "csrf": state.snapshot()["csrf_token"],
+                            "mailbox": json.dumps(["source-1", "INBOX"]),
+                        }
+                    ).encode("ascii"),
+                )
+                with urllib.request.urlopen(mailboxes) as response:
+                    mailbox_page = response.read().decode("utf-8")
+                self.assertFalse(connector.is_paused(config))
+                self.assertIn(
+                    "Enregistrer les dossiers et lancer l’indexation",
+                    mailbox_page,
+                )
 
                 reset = urllib.request.Request(
                     base + "/reset",
@@ -1270,6 +1308,11 @@ class ConnectorTests(unittest.TestCase):
         self.assertIn('class="status-grid"', page)
         self.assertIn("@media(max-width:620px)", page)
         self.assertIn('name="viewport"', page)
+        self.assertIn('<script src="/ui.js" defer></script>', page)
+        self.assertIn('id="inventory-summary"', page)
+        self.assertIn('id="inventory-dot"', page)
+        self.assertIn('id="inventory-button"', page)
+        self.assertIn('id="inventory-completion"', page)
 
     def test_status_page_makes_running_inventory_explicit(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1280,10 +1323,19 @@ class ConnectorTests(unittest.TestCase):
             page = connector.render_status_page(config, state)
 
         self.assertIn("Inventaire en cours…", page)
-        self.assertIn("Inventaire en cours depuis", connector.inventory_status(state.snapshot()))
+        self.assertIn(
+            "Inventaire en cours — Démarrage de l’inventaire — démarré le",
+            connector.inventory_status(state.snapshot()),
+        )
         self.assertIn('type="button" disabled', page)
         self.assertIn(">En pause<", page)
-        self.assertNotIn("<script", page)
+
+        state.cycle_progress("Lecture des messages des sources sélectionnées")
+        self.assertIn(
+            "Lecture des messages des sources sélectionnées",
+            connector.inventory_status(state.snapshot()),
+        )
+        self.assertNotIn('<script src="http', page)
         self.assertNotIn("https://", page)
         self.assertNotIn("http://", page)
 
