@@ -1244,6 +1244,7 @@ class ConnectorTests(unittest.TestCase):
                            ) VALUES (?, ?, ?, ?)""",
                         ("source-1", "INBOX", now, now),
                     )
+                wake.clear()
                 mailboxes = urllib.request.Request(
                     base + "/mailboxes",
                     data=urllib.parse.urlencode(
@@ -1255,9 +1256,12 @@ class ConnectorTests(unittest.TestCase):
                 )
                 with urllib.request.urlopen(mailboxes) as response:
                     mailbox_page = response.read().decode("utf-8")
-                self.assertFalse(connector.is_paused(config))
-                self.assertIn(
-                    "Enregistrer les dossiers et lancer l’indexation",
+                self.assertTrue(connector.is_paused(config))
+                self.assertFalse(wake.is_set())
+                self.assertEqual(state.snapshot()["cycle_requested_at"], 0)
+                self.assertIn("Enregistrer les dossiers", mailbox_page)
+                self.assertNotIn(
+                    "Enregistrer les dossiers et lancer",
                     mailbox_page,
                 )
 

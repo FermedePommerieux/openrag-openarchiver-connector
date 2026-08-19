@@ -2360,7 +2360,7 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 <div class="card-footer"><button class="primary" type="submit">Enregistrer et lancer l’inventaire</button></div></form>
 <form method="post" action="/mailboxes" class="card"><div class="card-header"><div><h2 class="card-title">Dossiers IMAP indexés</h2><p class="card-description">Affinez l’indexation aux dossiers utiles de chaque source.</p></div><span class="badge">{selected_mailboxes}/{len(mailboxes)} sélectionné(s)</span></div>
 <div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="selection-list">{"".join(mailbox_lines)}</div><div class="counts" aria-label="Détail des états des pièces jointes" style="margin-top:14px">{count_badges("attachments")}</div></div>
-<div class="card-footer"><button class="primary" type="submit">Enregistrer les dossiers et lancer l’indexation</button></div></form>
+<div class="card-footer"><button class="primary" type="submit">Enregistrer les dossiers</button></div></form>
 <section class="card danger-card"><div class="card-header"><div><h2 class="card-title">Remise à zéro</h2><p class="card-description">Efface l’inventaire, les sélections et l’historique local uniquement.</p></div><span class="badge danger">Zone sensible</span></div>
 <div class="card-body"><p>Aucun mail OpenArchiver ni document OpenRAG n’est supprimé. Le connecteur reste en pause.</p><p class="helper">{html.escape(reset_status)}</p>
 <form method="post" action="/reset" class="confirm-row"><input type="hidden" name="csrf" value="{csrf}"><label>Saisir <code>RESET</code> pour confirmer<input type="text" name="confirmation" required pattern="RESET" autocomplete="off"></label><button class="danger-button" type="submit">Remettre la base locale à zéro</button></form></div></section>
@@ -2532,9 +2532,6 @@ def make_http_handler(
                             raise ConnectorError("sélection de dossier invalide")
                         selections.append((decoded[0], decoded[1]))
                     replace_mailbox_selection(config, selections)
-                    set_paused(config, False)
-                    state.cycle_requested()
-                    wake.set()
                     self._redirect()
                 elif path == "/pause":
                     action = form.get("action", [""])[0]
