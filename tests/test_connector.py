@@ -1103,6 +1103,49 @@ class ConnectorTests(unittest.TestCase):
                     email_id="mail-1",
                 )
 
+    def test_mail_and_attachments_are_distinct_documents_with_the_same_source_url(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(
+                Path(directory),
+                openarchiver_source_url_template=(
+                    "https://openarchiver.example.test/dashboard/archived-emails/"
+                    "{email_id}"
+                ),
+            )
+            email_url = connector.render_remote_source_url(
+                config,
+                kind="email",
+                object_id="mail-1",
+                storage_path="emails/mail-1.eml",
+                email_id="mail-1",
+            )
+            attachment_urls = [
+                connector.render_remote_source_url(
+                    config,
+                    kind="attachment",
+                    object_id=attachment_id,
+                    storage_path=f"attachments/{attachment_id}.pdf",
+                    email_id="mail-1",
+                )
+                for attachment_id in ("attachment-1", "attachment-2")
+            ]
+
+            self.assertEqual(attachment_urls, [email_url, email_url])
+            self.assertEqual(
+                len(
+                    {
+                        connector.mail_openrag_filename("mail-1"),
+                        connector.attachment_openrag_filename(
+                            "attachment-1", "facture.pdf"
+                        ),
+                        connector.attachment_openrag_filename(
+                            "attachment-2", "annexe.pdf"
+                        ),
+                    }
+                ),
+                3,
+            )
+
     def test_auto_mode_falls_back_to_multipart_and_reuses_it(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
