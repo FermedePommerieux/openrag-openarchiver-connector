@@ -115,7 +115,7 @@ spec:
             - name: INGESTION_CONCURRENCY_FALLBACK
               value: "2"
             - name: INGESTION_CONCURRENCY_MAX
-              value: "8"
+              value: "4"
             - name: INGESTION_PREFETCH_PER_WORKER
               value: "2"
             - name: DOCLING_METRICS_URL
@@ -156,7 +156,7 @@ spec:
               memory: 64Mi
             limits:
               cpu: 500m
-              memory: 512Mi
+              memory: 768Mi
           securityContext:
             runAsNonRoot: true
             runAsUser: 1000
