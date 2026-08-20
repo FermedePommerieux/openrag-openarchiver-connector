@@ -46,7 +46,7 @@ from typing import Callable, Iterable, Iterator, Mapping, Sequence
 LOG = logging.getLogger("openarchiver-openrag-connector")
 CHUNK_SIZE = 1024 * 1024
 ACTIVE_STATUSES = ("downloading", "ingesting")
-QUEUE_STATUSES = ("queued", "failed")
+QUEUE_STATUSES = ("queued", "failed", "lost")
 ALL_STATUSES = (
     "discovered",
     "queued",
@@ -54,6 +54,7 @@ ALL_STATUSES = (
     "ingesting",
     "validated",
     "failed",
+    "lost",
     "non_indexable",
     "missing",
     "unavailable",
@@ -78,6 +79,10 @@ class HTTPStatusError(ConnectorError):
     def __init__(self, status: int, operation: str) -> None:
         self.status = status
         super().__init__(f"{operation}: HTTP {status}")
+
+
+class LostTaskError(ConnectorError):
+    """La tâche soumise n'existe plus dans le registre OpenRAG."""
 
 
 class IncompleteScanError(ConnectorError):
@@ -586,6 +591,75 @@ def replace_mailbox_selection(
             requested,
         )
     return requested
+
+
+def retryable_rows(
+    config: Config, status: str, *, limit: int = 200
+) -> list[sqlite3.Row]:
+    """Liste bornée des objets réindexables appartenant à la sélection active."""
+    if status not in {"failed", "lost"}:
+        raise ConnectorError("statut de réindexation invalide")
+    with database(config) as db:
+        return list(
+            db.execute(
+                """
+                SELECT 'email' AS kind, e.id, e.openrag_filename, e.attempts,
+                       e.next_retry_at, e.last_error
+                FROM emails e
+                WHERE e.status=? AND EXISTS (
+                    SELECT 1 FROM sources s
+                    JOIN mailboxes m
+                      ON m.source_id=e.source_id AND m.path=e.mailbox_path
+                    WHERE s.id=e.source_id AND s.selected=1 AND m.selected=1
+                )
+                UNION ALL
+                SELECT 'attachment' AS kind, a.id, a.openrag_filename, a.attempts,
+                       a.next_retry_at, a.last_error
+                FROM attachments a
+                WHERE a.status=? AND EXISTS (
+                    SELECT 1 FROM email_attachments ea
+                    JOIN emails e ON e.id=ea.email_id
+                    JOIN sources s ON s.id=e.source_id
+                    JOIN mailboxes m
+                      ON m.source_id=e.source_id AND m.path=e.mailbox_path
+                    WHERE ea.attachment_id=a.id
+                      AND s.selected=1 AND m.selected=1
+                )
+                ORDER BY next_retry_at, kind, id
+                LIMIT ?
+                """,
+                (status, status, max(1, min(limit, 500))),
+            )
+        )
+
+
+def requeue_objects(
+    config: Config, objects: Iterable[tuple[str, str, str]]
+) -> int:
+    """Remet en file uniquement les objets failed/lost explicitement choisis."""
+    requested = list(dict.fromkeys(objects))
+    if not requested or len(requested) > 500:
+        raise ConnectorError("sélection de réindexation invalide")
+    updated = 0
+    with database(config) as db:
+        for kind, object_id, expected_status in requested:
+            if kind not in {"email", "attachment"} or expected_status not in {
+                "failed",
+                "lost",
+            }:
+                raise ConnectorError("objet de réindexation invalide")
+            table = "emails" if kind == "email" else "attachments"
+            cursor = db.execute(
+                f"""
+                UPDATE {table}
+                SET status='queued', attempts=0, next_retry_at=0,
+                    last_error='', task_id=''
+                WHERE id=? AND status=?
+                """,
+                (object_id, expected_status),
+            )
+            updated += cursor.rowcount
+    return updated
 
 
 def replace_source_selection(config: Config, source_ids: Iterable[str]) -> list[str]:
@@ -1697,6 +1771,8 @@ class OpenRAGClient:
                 if error.status == 404 and path != fallback:
                     path = fallback
                     continue
+                if error.status == 404:
+                    raise LostTaskError(f"tâche OpenRAG inconnue: {task_id}") from None
                 raise
             status = str(payload.get("status", "")).lower()
             if status == "completed":
@@ -1755,11 +1831,14 @@ def claim_next(config: Config, *, now: int | None = None) -> WorkItem | None:
                 SELECT id, attempts FROM {table}
                 WHERE ({selection_clause}) AND (
                     status='queued' OR (
-                        status='failed' AND attempts < ?
+                        status IN ('failed','lost') AND attempts < ?
                         AND next_retry_at > 0 AND next_retry_at <= ?
                     )
                 )
-                ORDER BY CASE status WHEN 'queued' THEN 0 ELSE 1 END,
+                ORDER BY CASE status
+                           WHEN 'lost' THEN 0
+                           WHEN 'queued' THEN 1
+                           ELSE 2 END,
                          next_retry_at, id
                 LIMIT 1
                 """,
@@ -1773,7 +1852,7 @@ def claim_next(config: Config, *, now: int | None = None) -> WorkItem | None:
                 UPDATE {table}
                 SET status='downloading', attempts=?, next_retry_at=0,
                     last_error='', task_id=''
-                WHERE id=? AND attempts=? AND status IN ('queued','failed')
+                WHERE id=? AND attempts=? AND status IN ('queued','failed','lost')
                 """,
                 (attempts, row["id"], row["attempts"]),
             )
@@ -1921,6 +2000,8 @@ def process_work_item(
             "status='validated', last_success_at=?, last_error='', next_retry_at=0",
             (int(time.time()),),
         )
+    except LostTaskError as error:
+        _record_lost(config, item, error)
     except FileTooLargeError as error:
         if item.kind == "attachment":
             _set_object_state(
@@ -1952,6 +2033,24 @@ def _record_failure(config: Config, item: WorkItem, error: Exception) -> None:
         item.object_id,
         "status='failed', last_error=?, next_retry_at=?",
         (message, retry_at),
+    )
+
+
+def _record_lost(config: Config, item: WorkItem, error: LostTaskError) -> None:
+    if item.attempts < config.max_auto_retries:
+        delay = min(
+            config.retry_max_seconds,
+            config.retry_base_seconds * (2 ** (item.attempts - 1)),
+        )
+        retry_at = int(time.time()) + delay
+    else:
+        retry_at = 0
+    _set_object_state(
+        config,
+        item.kind,
+        item.object_id,
+        "status='lost', last_error=?, next_retry_at=?",
+        (_safe_error(error), retry_at),
     )
 
 
@@ -2612,6 +2711,7 @@ STATUS_PAGE_STYLE = """
 .app{min-height:100vh;display:grid;grid-template-rows:64px 1fr;grid-template-columns:224px minmax(0,1fr)}.topbar{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);background:var(--background);padding:0 20px;position:sticky;top:0;z-index:2}.brand{display:flex;align-items:center;gap:10px;font:600 18px/1 ui-monospace,SFMono-Regular,Menlo,monospace}.brand-logo{width:24px;height:22px;fill:currentColor}.connector-chip{border:1px solid var(--border);border-radius:999px;padding:5px 10px;color:var(--muted-foreground);font-size:12px}.sidebar{border-right:1px solid var(--border);background:var(--sidebar);padding:16px}.nav-label{display:block;margin:8px 12px 10px;color:var(--muted-foreground);font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}.nav-item{display:flex;align-items:center;gap:10px;border-radius:var(--radius);padding:11px 12px;background:var(--muted);font-size:13px;font-weight:600}.nav-icon{width:18px;height:18px}.main{min-width:0;padding:32px}.content{max-width:1120px;margin:0 auto}.page-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.eyebrow{margin:0 0 4px;color:var(--muted-foreground);font-size:12px;font-weight:600}.page-heading h1{margin:0;font-size:24px;line-height:1.25;letter-spacing:-.02em}.page-heading p{margin:7px 0 0;color:var(--muted-foreground)}.toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.toolbar form{margin:0}
 .status-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:20px}.stat-card,.card{border:1px solid var(--border);border-radius:var(--radius);background:var(--card);box-shadow:var(--shadow)}.stat-card{padding:16px}.stat-label{display:flex;align-items:center;gap:7px;color:var(--muted-foreground);font-size:12px;font-weight:600}.dot{width:8px;height:8px;border-radius:50%;background:var(--muted-foreground)}.dot.success{background:var(--success)}.dot.warning{background:#f59e0b}.dot.danger{background:var(--danger)}.stat-value{display:block;margin-top:8px;font-size:22px;font-weight:650;letter-spacing:-.03em}.stat-detail{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px}.card{margin-bottom:16px;overflow:hidden}.card-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:18px 20px;border-bottom:1px solid var(--border)}.card-title{margin:0;font-size:15px}.card-description{margin:3px 0 0;color:var(--muted-foreground);font-size:13px}.card-body{padding:20px}.card-footer{display:flex;justify-content:flex-end;padding:14px 20px;border-top:1px solid var(--border);background:var(--sidebar)}.badge{display:inline-flex;align-items:center;border-radius:999px;background:var(--muted);padding:3px 8px;color:var(--muted-foreground);font-size:11px;font-weight:600}.badge.success{background:var(--success-soft);color:var(--success)}.badge.warning{background:var(--warning-soft);color:var(--warning)}.badge.danger{background:var(--danger-soft);color:var(--danger)}
 .inventory-row{display:flex;align-items:center;gap:12px}.inventory-status{display:block;width:100%;min-height:24px;font-weight:600}.inventory-status.running{color:var(--success)}.progress-wrap{margin-top:12px}.progress-track{height:10px;overflow:hidden;border-radius:999px;background:var(--muted)}.progress-bar{height:100%;width:0;border-radius:inherit;background:var(--success);transition:width .25s ease}.progress-bar.indeterminate{width:35%;animation:progress-slide 1.2s ease-in-out infinite}.progress-label{display:block;margin-top:5px;color:var(--muted-foreground);font-size:12px;text-align:right}@keyframes progress-slide{0%{transform:translateX(-110%)}100%{transform:translateX(300%)}}.helper{margin:10px 0 0;color:var(--muted-foreground);font-size:12px}.error-alert{display:flex;gap:10px;margin-bottom:16px;border:1px solid #fecaca;border-radius:var(--radius);background:var(--danger-soft);padding:13px 15px;color:#991b1b}.error-alert strong{display:block}.selection-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:320px;overflow:auto}.selection-item{display:flex;align-items:flex-start;gap:11px;margin:0;border:1px solid var(--border);border-radius:var(--radius);padding:12px;cursor:pointer;transition:background .15s,border-color .15s}.selection-item:hover{background:var(--muted)}.selection-item:has(input:checked){border-color:#a1a1aa;background:var(--muted)}.selection-item input{width:16px;height:16px;margin:2px 0 0;accent-color:var(--primary);flex:0 0 auto}.selection-copy{min-width:0}.selection-title{display:block;font-weight:600;overflow-wrap:anywhere}.selection-meta{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px;overflow-wrap:anywhere}.empty{grid-column:1/-1;margin:0;border:1px dashed var(--border);border-radius:var(--radius);padding:22px;text-align:center;color:var(--muted-foreground)}.counts{display:flex;flex-wrap:wrap;gap:6px}.operation-grid,.secret-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.secret-field{display:grid;gap:6px;color:var(--muted-foreground);font-size:12px;font-weight:600}.secret-field input{width:100%;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}.danger-card{border-color:#fecaca}.danger-card .card-header{background:var(--danger-soft)}.confirm-row{display:flex;align-items:end;gap:10px}.confirm-row label{flex:1;margin:0;color:var(--muted-foreground);font-size:12px;font-weight:600}.confirm-row input{display:block;width:100%;margin-top:6px;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}code{border-radius:4px;background:var(--muted);padding:2px 5px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.footer-note{padding:8px 0 24px;text-align:center;color:var(--muted-foreground);font-size:12px}
+.retry-tabs{position:relative}.tab-toggle{position:absolute;opacity:0;pointer-events:none}.tab-label{display:inline-flex;margin:0 6px 14px 0;border:1px solid var(--border);border-radius:999px;padding:7px 12px;color:var(--muted-foreground);cursor:pointer;font-weight:600}.tab-panel{display:none}.retry-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px}.retry-select-all{display:flex;align-items:center;gap:8px;color:var(--muted-foreground);font-size:12px}.retry-select-all input{width:16px;height:16px;accent-color:var(--primary)}#retry-tab-lost:checked~label[for="retry-tab-lost"],#retry-tab-failed:checked~label[for="retry-tab-failed"]{border-color:var(--primary);background:var(--primary);color:var(--primary-foreground)}#retry-tab-lost:checked~.tab-panels>#retry-panel-lost,#retry-tab-failed:checked~.tab-panels>#retry-panel-failed{display:block}
 @media(prefers-color-scheme:dark){:root{--background:#18181b;--foreground:#fafafa;--muted:#27272a;--muted-foreground:#a1a1aa;--border:#3f3f46;--card:#18181b;--sidebar:#111113;--primary:#fafafa;--primary-foreground:#09090b;--danger:#f87171;--danger-soft:#2b1719;--success:#34d399;--success-soft:#10251e;--warning:#fbbf24;--warning-soft:#2b2414;--shadow:none}.primary:hover{background:#e4e4e7}.danger-card,.error-alert{border-color:#7f1d1d}.danger-card .card-header{background:var(--danger-soft)}.error-alert{color:#fecaca}.selection-item:has(input:checked){border-color:#71717a}}
 @media(max-width:900px){.app{grid-template-columns:1fr;grid-template-rows:64px auto 1fr}.sidebar{border-right:0;border-bottom:1px solid var(--border);padding:8px 16px}.nav-label{display:none}.nav-item{width:max-content;padding:8px 12px}.main{padding:24px 18px}.status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.operation-grid,.secret-grid{grid-template-columns:1fr}}
 @media(max-width:620px){.connector-chip{display:none}.page-heading{display:block}.toolbar{margin-top:16px}.toolbar button{flex:1}.toolbar form{display:flex;flex:1}.selection-list{grid-template-columns:1fr}.status-grid{grid-template-columns:1fr 1fr}.stat-card{padding:13px}.stat-value{font-size:19px}.card-header,.card-body{padding:16px}.card-footer{padding:12px 16px}.card-footer button{width:100%}.confirm-row{align-items:stretch;flex-direction:column}.confirm-row button{width:100%}}
@@ -2771,6 +2871,14 @@ UI_SCRIPT = r"""(() => {
       // Le flux SSE ou la prochaine vérification reprendra automatiquement.
     }
   };
+  document.querySelectorAll(".retry-select-all input").forEach(control => {
+    control.addEventListener("change", () => {
+      const status = control.dataset.retryStatus;
+      document.querySelectorAll(`input[data-retry-object="${status}"]`).forEach(input => {
+        input.checked = control.checked;
+      });
+    });
+  });
   if (window.EventSource) {
     const events = new EventSource("/events");
     events.addEventListener("status", event => {
@@ -2847,6 +2955,60 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
             f'<span class="badge">{html.escape(status)} · {count}</span>'
             for status, count in sorted(values.items())
         )
+
+    def retry_panel(status: str, label: str) -> str:
+        rows = retryable_rows(config, status)
+        total = sum(
+            values.get(status, 0) for values in selected_counts.values()
+        )
+        items = []
+        for row in rows:
+            token = html.escape(
+                json.dumps(
+                    [str(row["kind"]), str(row["id"]), status],
+                    ensure_ascii=False,
+                ),
+                quote=True,
+            )
+            filename = html.escape(str(row["openrag_filename"]))
+            error_detail = html.escape(str(row["last_error"] or "raison inconnue"))
+            kind_label = "Mail" if str(row["kind"]) == "email" else "Pièce jointe"
+            retry_at = int(row["next_retry_at"] or 0)
+            retry_label = (
+                "reprise auto le "
+                + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(retry_at))
+                if retry_at
+                else "reprise automatique épuisée"
+            )
+            items.append(
+                f'<label class="selection-item"><input type="checkbox" '
+                f'name="object" value="{token}" data-retry-object="{status}">'
+                f'<span class="selection-copy"><span class="selection-title">{filename}</span>'
+                f'<span class="selection-meta">{kind_label} · tentative {int(row["attempts"])} · '
+                f'{html.escape(retry_label)}<br>{error_detail}</span></span></label>'
+            )
+        if not items:
+            items.append(f'<p class="empty">Aucun objet {html.escape(label.lower())} dans la sélection active.</p>')
+        truncated = (
+            f'<p class="helper">Affichage limité aux 200 premiers objets sur {total}.</p>'
+            if total > len(rows)
+            else ""
+        )
+        disabled = " disabled" if not rows else ""
+        return (
+            f'<div id="retry-panel-{status}" class="tab-panel"><form method="post" action="/retry">'
+            f'<input type="hidden" name="csrf" value="{csrf}">'
+            f'<div class="selection-list">{"".join(items)}</div>{truncated}'
+            f'<div class="retry-actions"><label class="retry-select-all"><input type="checkbox" '
+            f'data-retry-status="{status}"{disabled}>Tout sélectionner ({len(rows)} affiché(s))</label>'
+            f'<button class="primary" type="submit"{disabled}>Réindexer la sélection</button></div>'
+            f'</form></div>'
+        )
+
+    lost_panel = retry_panel("lost", "Lost")
+    failed_panel = retry_panel("failed", "Failed")
+    lost_total = sum(values.get("lost", 0) for values in selected_counts.values())
+    failed_total = sum(values.get("failed", 0) for values in selected_counts.values())
 
     error = html.escape(str(snapshot["last_error"] or "aucune"))
     ready = "Prêt" if snapshot["ready"] else "Attention requise"
@@ -2971,6 +3133,8 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 <div id="email-status-counts" class="counts" aria-label="États des mails de la sélection"><span class="badge success">Sélection actuelle</span>{count_badges(selected_counts["emails"], "aucun mail")}</div>
 <p id="history-summary" class="helper">Historique local conservé : {historical_email_total} mail(s) ; {historical_attachment_total} pièce(s) jointe(s) déjà détaillée(s). Les éléments hors sélection ne sont pas envoyés à OpenRAG.</p></div>
 <div class="card-footer"><form method="post" action="/scan"><input type="hidden" name="csrf" value="{csrf}">{scan_button}</form></div></section>
+<section class="card"><div class="card-header"><div><h2 class="card-title">Réindexation</h2><p class="card-description">Sélectionnez les tâches perdues ou en échec à soumettre de nouveau à OpenRAG.</p></div><span class="badge warning">Lost {lost_total} · Failed {failed_total}</span></div>
+<div class="card-body"><div class="retry-tabs"><input class="tab-toggle" type="radio" name="retry-tab" id="retry-tab-lost" checked><label class="tab-label" for="retry-tab-lost">Lost · {lost_total}</label><input class="tab-toggle" type="radio" name="retry-tab" id="retry-tab-failed"><label class="tab-label" for="retry-tab-failed">Failed · {failed_total}</label><div class="tab-panels">{lost_panel}{failed_panel}</div></div><p class="helper">La réindexation réinitialise les tentatives des objets choisis. Si le connecteur est en pause, utilisez ensuite « Reprendre l’indexation ».</p></div></section>
 <form method="post" action="/secrets" class="card" autocomplete="off"><div class="card-header"><div><h2 class="card-title">Clés API</h2><p class="card-description">Renouvelez séparément les accès OpenArchiver et OpenRAG.</p></div><span class="badge">OpenArchiver : {openarchiver_key_state} · OpenRAG : {openrag_key_state}</span></div>
 <div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="secret-grid"><label class="secret-field">Nouvelle clé OpenArchiver<input type="password" name="openarchiver_key" autocomplete="new-password"></label><label class="secret-field">Nouvelle clé OpenRAG<input type="password" name="openrag_key" autocomplete="new-password"></label></div><p class="helper">Laissez un champ vide pour conserver sa valeur actuelle. Les clés ne sont jamais réaffichées ni enregistrées dans SQLite.</p></div>
 <div class="card-footer"><button class="primary" type="submit">Enregistrer les clés renseignées</button></div></form>
@@ -3196,6 +3360,22 @@ def make_http_handler(
                             raise ConnectorError("sélection de dossier invalide")
                         selections.append((decoded[0], decoded[1]))
                     replace_mailbox_selection(config, selections)
+                    self._redirect()
+                elif path == "/retry":
+                    objects = []
+                    for value in form.get("object", []):
+                        decoded = json.loads(value)
+                        if (
+                            not isinstance(decoded, list)
+                            or len(decoded) != 3
+                            or not all(isinstance(item, str) for item in decoded)
+                        ):
+                            raise ConnectorError("sélection de réindexation invalide")
+                        objects.append((decoded[0], decoded[1], decoded[2]))
+                    if requeue_objects(config, objects) == 0:
+                        raise ConnectorError("aucun objet éligible à réindexer")
+                    state.cycle_requested()
+                    wake.set()
                     self._redirect()
                 elif path == "/pause":
                     action = form.get("action", [""])[0]

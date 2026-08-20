@@ -1036,6 +1036,17 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                 task.call_args_list[1].kwargs["path"], "/v1/tasks/task%2Fid"
             )
 
+    def test_openrag_task_missing_from_both_endpoints_is_lost(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            client = connector.OpenRAGClient(config, sleeper=lambda _s: None)
+            missing = connector.HTTPStatusError(404, "lecture tâche OpenRAG")
+            with mock.patch.object(client, "task", side_effect=[missing, missing]):
+                with self.assertRaisesRegex(
+                    connector.LostTaskError, "tâche OpenRAG inconnue"
+                ):
+                    client.wait("lost-task")
+
     def test_openrag_ingest_path_uses_json_replace_duplicates(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2182,6 +2193,99 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             row = self.rows(config, "emails")[0]
             self.assertEqual(row["attempts"], 2)
             self.assertEqual(row["next_retry_at"], 0)
+
+    def test_unknown_openrag_task_is_marked_lost_and_reindexable(self):
+        class LostOpenRAG(FakeOpenRAG):
+            def wait(self, task_id):
+                raise connector.LostTaskError(f"tâche OpenRAG inconnue: {task_id}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory), retry_base_seconds=10)
+            self._insert_email(config)
+            item = connector.claim_next(config, now=1)
+            connector.process_work_item(
+                config,
+                item,
+                FakeArchive(downloads={"mail/mail-1.eml": b"Subject: test\r\n\r\nbody"}),
+                LostOpenRAG(),
+            )
+            row = self.rows(config, "emails")[0]
+            self.assertEqual(row["status"], "lost")
+            self.assertEqual(row["task_id"], "task-1")
+            self.assertGreater(row["next_retry_at"], 0)
+            self.assertIsNone(connector.claim_next(config, now=row["next_retry_at"] - 1))
+            retry = connector.claim_next(config, now=row["next_retry_at"])
+            self.assertEqual((retry.kind, retry.object_id, retry.attempts), ("email", "mail-1", 2))
+            claimed = self.rows(config, "emails")[0]
+            self.assertEqual(claimed["status"], "downloading")
+            self.assertEqual(claimed["task_id"], "")
+
+    def test_retry_ui_separates_lost_and_failed_and_requeues_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            lost_id = self._insert_email(config, self.mail("lost-mail"), "lost")
+            failed_id = self._insert_email(config, self.mail("failed-mail"), "failed")
+            with connector.database(config) as db:
+                db.execute(
+                    "UPDATE emails SET attempts=3, task_id='old-task', "
+                    "last_error='tâche inconnue' WHERE id=?",
+                    (lost_id,),
+                )
+                db.execute(
+                    "UPDATE emails SET attempts=2, last_error='échec Langflow' WHERE id=?",
+                    (failed_id,),
+                )
+
+            page = connector.render_status_page(config, connector.RuntimeState())
+            self.assertIn('id="retry-tab-lost"', page)
+            self.assertIn('id="retry-tab-failed"', page)
+            self.assertIn("Lost · 1", page)
+            self.assertIn("Failed · 1", page)
+            self.assertIn("openarchiver-mail-lost-mail.eml", page)
+            self.assertIn("openarchiver-mail-failed-mail.eml", page)
+
+            updated = connector.requeue_objects(
+                config, [("email", lost_id, "lost")]
+            )
+            self.assertEqual(updated, 1)
+            rows = {row["id"]: row for row in self.rows(config, "emails")}
+            self.assertEqual(rows[lost_id]["status"], "queued")
+            self.assertEqual(rows[lost_id]["attempts"], 0)
+            self.assertEqual(rows[lost_id]["task_id"], "")
+            self.assertEqual(rows[failed_id]["status"], "failed")
+
+    def test_retry_http_action_requests_immediate_cycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            object_id = self._insert_email(config, self.mail("failed-mail"), "failed")
+            state = connector.RuntimeState()
+            wake = threading.Event()
+            server = connector.ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                connector.make_http_handler(config, state, wake=wake),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{server.server_port}/retry",
+                    data=urllib.parse.urlencode(
+                        {
+                            "csrf": state.snapshot()["csrf_token"],
+                            "object": json.dumps(["email", object_id, "failed"]),
+                        }
+                    ).encode("utf-8"),
+                )
+                with urllib.request.urlopen(request) as response:
+                    self.assertEqual(response.status, 200)
+                row = self.rows(config, "emails")[0]
+                self.assertEqual(row["status"], "queued")
+                self.assertTrue(wake.is_set())
+                self.assertGreater(state.snapshot()["cycle_requested_at"], 0)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
     def test_recovery_only_marks_interrupted_operations_failed(self):
         with tempfile.TemporaryDirectory() as directory:
