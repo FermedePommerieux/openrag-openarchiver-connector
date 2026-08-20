@@ -1539,6 +1539,9 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                 with urllib.request.urlopen(base + "/ui.js") as response:
                     ui_script = response.read().decode("utf-8")
                 self.assertIn('fetch("/status.json"', ui_script)
+                self.assertIn('new EventSource("/events")', ui_script)
+                self.assertIn("window.setInterval(update, 30000)", ui_script)
+                self.assertNotIn("window.setInterval(update, 2000)", ui_script)
                 self.assertNotIn("window.location.reload()", ui_script)
                 self.assertIn("champs et sélections ont été conservés", ui_script)
                 self.assertIn("Inventaire interrompu", ui_script)
@@ -1615,6 +1618,46 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                     urllib.request.urlopen(base + "/readyz")
                 self.assertEqual(stopped.exception.code, 503)
             finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_status_event_stream_emits_each_runtime_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            state = connector.RuntimeState()
+            state.set_running(True)
+            server = connector.ThreadingHTTPServer(
+                ("127.0.0.1", 0), connector.make_http_handler(config, state)
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            response = urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/events", timeout=2
+            )
+
+            def read_event():
+                fields = {}
+                while True:
+                    line = response.readline().decode("utf-8").rstrip("\r\n")
+                    if not line:
+                        return fields
+                    key, value = line.split(":", 1)
+                    fields[key] = value.lstrip()
+
+            try:
+                initial = read_event()
+                self.assertEqual(initial["event"], "status")
+                self.assertFalse(json.loads(initial["data"])["cycle_requested"])
+
+                state.cycle_requested(force_inventory=True)
+                changed = read_event()
+                self.assertEqual(changed["event"], "status")
+                self.assertGreater(int(changed["id"]), int(initial["id"]))
+                self.assertTrue(json.loads(changed["data"])["cycle_requested"])
+            finally:
+                response.close()
+                state.set_running(False)
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=2)

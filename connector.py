@@ -2095,6 +2095,8 @@ class RuntimeState:
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
+        self.changed = threading.Condition(self.lock)
+        self._revision = 0
         self.csrf_token = uuid.uuid4().hex
         self.started_at = int(time.time())
         self.last_cycle_started_at = 0
@@ -2118,17 +2120,33 @@ class RuntimeState:
         self.running = False
 
     def set_running(self, value: bool) -> None:
-        with self.lock:
+        with self.changed:
             self.running = value
+            self._notify_changed()
+
+    def _notify_changed(self) -> None:
+        """Signale une mutation aux clients de suivi, verrou déjà acquis."""
+        self._revision += 1
+        self.changed.notify_all()
+
+    def revision(self) -> int:
+        with self.lock:
+            return self._revision
+
+    def wait_for_change(self, revision: int, timeout: float = 15) -> int:
+        with self.changed:
+            self.changed.wait_for(lambda: self._revision != revision, timeout)
+            return self._revision
 
     def worker_detection_updated(
         self, *, detected: int, effective: int, success: bool
     ) -> None:
-        with self.lock:
+        with self.changed:
             self.docling_workers_detected = detected
             self.ingestion_concurrency_effective = effective
             self.worker_detection_success = success
             self.worker_detection_at = int(time.time())
+            self._notify_changed()
 
     def restore_cycle(
         self,
@@ -2137,15 +2155,16 @@ class RuntimeState:
         processed: int,
         error: str,
     ) -> None:
-        with self.lock:
+        with self.changed:
             self.last_cycle_completed_at = completed_at
             self.last_scan = scan
             self.last_processed = processed
             self.last_error = error
             self.ready = bool(completed_at and not error)
+            self._notify_changed()
 
     def cycle_started(self) -> bool:
-        with self.lock:
+        with self.changed:
             force_inventory = self.force_inventory_requested
             self.last_cycle_started_at = int(time.time())
             self.cycle_requested_at = 0
@@ -2154,40 +2173,44 @@ class RuntimeState:
             self.cycle_phase = "Démarrage de l’inventaire"
             self.progress_current = 0
             self.progress_total = 0
+            self._notify_changed()
             return force_inventory
 
     def cycle_progress(
         self, phase: str, current: int | None = None, total: int | None = None
     ) -> None:
-        with self.lock:
+        with self.changed:
             if self.cycle_in_progress:
                 self.cycle_phase = phase
                 if current is not None:
                     self.progress_current = max(0, current)
                 if total is not None:
                     self.progress_total = max(0, total)
+                self._notify_changed()
 
     def cycle_requested(self, *, force_inventory: bool = False) -> None:
-        with self.lock:
+        with self.changed:
             self.cycle_requested_at = int(time.time())
             self.force_inventory_requested = (
                 self.force_inventory_requested or force_inventory
             )
+            self._notify_changed()
 
     def cycle_pending(self) -> bool:
         with self.lock:
             return bool(self.cycle_requested_at)
 
     def reset_requested(self) -> None:
-        with self.lock:
+        with self.changed:
             self.reset_requested_at = int(time.time())
+            self._notify_changed()
 
     def reset_pending(self) -> bool:
         with self.lock:
             return bool(self.reset_requested_at)
 
     def reset_succeeded(self) -> None:
-        with self.lock:
+        with self.changed:
             self.reset_requested_at = 0
             self.last_reset_at = int(time.time())
             self.last_cycle_started_at = 0
@@ -2201,13 +2224,15 @@ class RuntimeState:
             self.progress_current = 0
             self.progress_total = 0
             self.ready = True
+            self._notify_changed()
 
     def reset_failed(self, error: Exception) -> None:
-        with self.lock:
+        with self.changed:
             self.last_error = _safe_error(error)
+            self._notify_changed()
 
     def cycle_succeeded(self, scan: ScanResult, processed: int) -> None:
-        with self.lock:
+        with self.changed:
             self.last_cycle_completed_at = int(time.time())
             self.last_error = ""
             self.last_scan = scan
@@ -2215,14 +2240,16 @@ class RuntimeState:
             self.ready = True
             self.cycle_in_progress = False
             self.cycle_phase = ""
+            self._notify_changed()
 
     def cycle_failed(self, error: Exception) -> None:
-        with self.lock:
+        with self.changed:
             self.last_cycle_completed_at = int(time.time())
             self.last_error = _safe_error(error)
             self.ready = False
             self.cycle_in_progress = False
             self.cycle_phase = ""
+            self._notify_changed()
 
     def snapshot(self) -> dict[str, object]:
         with self.lock:
@@ -2643,11 +2670,7 @@ UI_SCRIPT = r"""(() => {
       if (current && replacement) current.innerHTML = replacement.innerHTML;
     });
   };
-  const update = async () => {
-    try {
-      const response = await fetch("/status.json", {cache: "no-store"});
-      if (!response.ok) return;
-      const status = await response.json();
+  const applyStatus = async status => {
       const active = Boolean(status.cycle_in_progress);
       const requested = Boolean(status.cycle_requested);
       const failed = Boolean(status.last_error);
@@ -2697,12 +2720,29 @@ UI_SCRIPT = r"""(() => {
           "Inventaire terminé. Les dossiers et compteurs ont été actualisés ; vos champs et sélections ont été conservés.";
         observedActive = false;
       }
+  };
+  const update = async () => {
+    try {
+      const response = await fetch("/status.json", {cache: "no-store"});
+      if (!response.ok) return;
+      await applyStatus(await response.json());
     } catch (_error) {
-      // La prochaine interrogation reprendra automatiquement.
+      // Le flux SSE ou la prochaine vérification reprendra automatiquement.
     }
   };
-  window.setInterval(update, 2000);
-  update();
+  if (window.EventSource) {
+    const events = new EventSource("/events");
+    events.addEventListener("status", event => {
+      try {
+        void applyStatus(JSON.parse(event.data)).catch(() => {});
+      } catch (_error) {
+        // Un événement suivant remplacera un message incomplet.
+      }
+    });
+  } else {
+    update();
+  }
+  window.setInterval(update, 30000);
 })();
 """
 
@@ -2955,6 +2995,37 @@ def make_http_handler(
             self.send_header("Content-Length", "0")
             self.end_headers()
 
+        def _send_status_events(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            try:
+                last_event_id = self.headers.get("Last-Event-ID", "")
+                revision = int(last_event_id) if last_event_id.isdigit() else -1
+                while True:
+                    current_revision = state.revision()
+                    if current_revision != revision:
+                        payload = render_live_status(state).rstrip("\n")
+                        event = (
+                            f"id: {current_revision}\n"
+                            f"event: status\n"
+                            f"data: {payload}\n\n"
+                        )
+                        self.wfile.write(event.encode("utf-8"))
+                        self.wfile.flush()
+                        revision = current_revision
+                    next_revision = state.wait_for_change(revision, timeout=15)
+                    if next_revision == revision:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                return
+            except OSError as error:
+                LOG.debug("flux SSE fermé: %s", _safe_error(error))
+
         def do_GET(self) -> None:
             path = urllib.parse.urlsplit(self.path).path
             try:
@@ -2994,6 +3065,8 @@ def make_http_handler(
                         render_live_status(state),
                         "application/json; charset=utf-8",
                     )
+                elif path == "/events":
+                    self._send_status_events()
                 elif path == "/ui.js":
                     self._send(
                         200,
