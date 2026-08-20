@@ -428,10 +428,74 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             row = db.execute("SELECT * FROM emails WHERE id='mail-1'").fetchone()
             db.commit()
             db.close()
-            self.assertEqual(row["openrag_filename"], "openarchiver-mail-mail-1.eml")
+            self.assertEqual(
+                row["openrag_filename"],
+                connector.mail_openrag_filename("mail-1", "Sujet de test"),
+            )
             self.assertEqual(row["status"], "queued")
             self.assertEqual(row["sha256"], "")
             self.assertEqual(row["task_id"], "")
+
+    def test_name_migration_requeues_existing_mail_and_attachment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            self._insert_email(
+                config,
+                self.mail("01760ab2-cfcb-445d-b8a4-d1678d781435", subject="Titre été"),
+            )
+            connector.inventory_attachments(
+                config,
+                "01760ab2-cfcb-445d-b8a4-d1678d781435",
+                {
+                    "attachments": [
+                        {
+                            "id": "attachment-1",
+                            "filename": "Facture août.pdf",
+                            "sizeBytes": 4,
+                            "storagePath": "att/facture",
+                        }
+                    ]
+                },
+            )
+            with connector.database(config) as db:
+                db.execute(
+                    """UPDATE emails SET openrag_filename='openarchiver-mail-old.eml',
+                       status='validated', sha256='old', attempts=2,
+                       task_id='old-task'"""
+                )
+                db.execute(
+                    """UPDATE attachments
+                       SET openrag_filename='openarchiver-attachment-old.pdf',
+                           status='validated', sha256='old', attempts=2,
+                           task_id='old-task'"""
+                )
+                db.execute("PRAGMA user_version=2")
+
+            migrated = connector.connect_db(config)
+            try:
+                email = migrated.execute("SELECT * FROM emails").fetchone()
+                attachment = migrated.execute("SELECT * FROM attachments").fetchone()
+            finally:
+                migrated.close()
+
+            self.assertEqual(
+                email["openrag_filename"],
+                "Titre-ete--01760ab2cfcb.eml",
+            )
+            self.assertEqual(email["status"], "queued")
+            self.assertEqual(email["sha256"], "")
+            self.assertEqual(email["attempts"], 0)
+            self.assertEqual(email["task_id"], "")
+            self.assertTrue(
+                attachment["openrag_filename"].startswith(
+                    "Titre-ete--01760ab2cfcb--Facture-aout--"
+                )
+            )
+            self.assertTrue(attachment["openrag_filename"].endswith(".pdf"))
+            self.assertEqual(attachment["status"], "queued")
+            self.assertEqual(attachment["sha256"], "")
+            self.assertEqual(attachment["attempts"], 0)
+            self.assertEqual(attachment["task_id"], "")
 
     def test_refresh_and_select_sources(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -879,7 +943,10 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["status"], "queued")
             self.assertEqual(
-                rows[0]["openrag_filename"], "openarchiver-attachment-att-1.xlsx"
+                rows[0]["openrag_filename"],
+                connector.attachment_openrag_filename(
+                    "att-1", "Classeur été.XLSX", "Sujet de test", "mail-1"
+                ),
             )
             db = connector.connect_db(config)
             links = db.execute("SELECT COUNT(*) FROM email_attachments").fetchone()[0]
@@ -911,10 +978,12 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             self.assertEqual(
                 [row["status"] for row in rows], ["non_indexable", "non_indexable"]
             )
-            self.assertEqual(
-                connector.attachment_openrag_filename("x", "../../evil.EXE"),
-                "openarchiver-attachment-x.exe",
+            safe_name = connector.attachment_openrag_filename(
+                "x", "../../evil.EXE", "Objet du mail"
             )
+            self.assertTrue(safe_name.startswith("Objet-du-mail--evil--"))
+            self.assertTrue(safe_name.endswith(".exe"))
+            self.assertNotIn("/", safe_name)
 
     def test_changed_attachment_resets_transient_ingestion_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -947,12 +1016,38 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             self.assertEqual(row["next_retry_at"], 0)
 
     def test_remote_names_are_stable_and_escape_unsafe_identifiers(self):
-        first = connector.mail_openrag_filename('id"\r\nheader')
-        second = connector.mail_openrag_filename('id"\r\nother')
-        self.assertEqual(first, connector.mail_openrag_filename('id"\r\nheader'))
+        first = connector.mail_openrag_filename(
+            'id"\r\nheader', "Suppression de vos annonces sur leboncoin.fr"
+        )
+        second = connector.mail_openrag_filename(
+            'id"\r\nother', "Suppression de vos annonces sur leboncoin.fr"
+        )
+        self.assertEqual(
+            first,
+            connector.mail_openrag_filename(
+                'id"\r\nheader', "Suppression de vos annonces sur leboncoin.fr"
+            ),
+        )
         self.assertNotEqual(first, second)
+        self.assertTrue(
+            first.startswith("Suppression-de-vos-annonces-sur-leboncoin.fr--")
+        )
         self.assertNotIn("\r", first)
         self.assertNotIn('"', first)
+
+        attachment = connector.attachment_openrag_filename(
+            "attachment-id",
+            "Facture août 2026.pdf",
+            "Suppression de vos annonces sur leboncoin.fr",
+            "01760ab2-cfcb-445d-b8a4-d1678d781435",
+        )
+        self.assertTrue(
+            attachment.startswith(
+                "Suppression-de-vos-annonces-sur-leboncoin.fr--01760ab2cfcb--Facture-aout-2026--"
+            )
+        )
+        self.assertTrue(attachment.endswith(".pdf"))
+        self.assertLessEqual(len(attachment), 255)
 
     def test_download_streams_and_computes_sha256(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2365,7 +2460,10 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                 row["sha256"],
                 connector.hashlib.sha256(message.as_bytes()).hexdigest(),
             )
-            self.assertEqual(rag.uploads[0][0], "openarchiver-mail-mail-1.eml")
+            self.assertEqual(
+                rag.uploads[0][0],
+                connector.mail_openrag_filename("mail-1", "Sujet de test"),
+            )
             self.assertEqual(rag.uploads[0][1], message.as_bytes())
 
     def test_attachment_process_stream_hash_and_validate(self):
@@ -2546,8 +2644,12 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             self.assertIn('id="retry-tab-failed"', page)
             self.assertIn("Lost · 1", page)
             self.assertIn("Failed · 1", page)
-            self.assertIn("openarchiver-mail-lost-mail.eml", page)
-            self.assertIn("openarchiver-mail-failed-mail.eml", page)
+            self.assertIn(
+                connector.mail_openrag_filename("lost-mail", "Sujet de test"), page
+            )
+            self.assertIn(
+                connector.mail_openrag_filename("failed-mail", "Sujet de test"), page
+            )
 
             updated = connector.requeue_objects(
                 config, [("email", lost_id, "lost")]

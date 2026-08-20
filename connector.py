@@ -27,6 +27,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -69,7 +70,7 @@ PROMETHEUS_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
 STOP = threading.Event()
 WAKE = threading.Event()
 RECONCILE_WAKE = threading.Event()
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SCHEMA_LOCK = threading.Lock()
 RECONCILE_BATCH_SIZE = 100
 OPENRAG_QUEUE_POLL_SECONDS = 5
@@ -499,6 +500,63 @@ def connect_db(config: Config) -> sqlite3.Connection:
             db.execute(
                 "ALTER TABLE emails ADD COLUMN mailbox_path TEXT NOT NULL DEFAULT ''"
             )
+        if version < 3:
+            for row in db.execute(
+                "SELECT id, subject, openrag_filename FROM emails"
+            ).fetchall():
+                filename = mail_openrag_filename(str(row["id"]), str(row["subject"]))
+                if filename == str(row["openrag_filename"]):
+                    continue
+                db.execute(
+                    """
+                    UPDATE emails
+                    SET openrag_filename=?, status='queued', sha256='', attempts=0,
+                        next_retry_at=0, last_error='', task_id=''
+                    WHERE id=?
+                    """,
+                    (filename, row["id"]),
+                )
+            for row in db.execute(
+                """
+                SELECT a.id, a.filename, a.openrag_filename, a.status,
+                       COALESCE((
+                           SELECT ea.email_id
+                           FROM email_attachments ea
+                           WHERE ea.attachment_id=a.id
+                           ORDER BY ea.email_id LIMIT 1
+                       ), '') AS email_id,
+                       COALESCE((
+                           SELECT e.subject
+                           FROM email_attachments ea
+                           JOIN emails e ON e.id=ea.email_id
+                           WHERE ea.attachment_id=a.id
+                           ORDER BY e.id LIMIT 1
+                       ), '') AS mail_subject
+                FROM attachments a
+                """
+            ).fetchall():
+                filename = attachment_openrag_filename(
+                    str(row["id"]),
+                    str(row["filename"]),
+                    str(row["mail_subject"]),
+                    str(row["email_id"]),
+                )
+                if filename == str(row["openrag_filename"]):
+                    continue
+                db.execute(
+                    """
+                    UPDATE attachments
+                    SET openrag_filename=?,
+                        status=CASE WHEN status='non_indexable'
+                                    THEN status ELSE 'queued' END,
+                        sha256='', attempts=0, next_retry_at=0,
+                        last_error=CASE WHEN status='non_indexable'
+                                        THEN last_error ELSE '' END,
+                        task_id=''
+                    WHERE id=?
+                    """,
+                    (filename, row["id"]),
+                )
         db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES ('paused','0')")
         db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         db.commit()
@@ -1309,15 +1367,34 @@ def _upsert_email(db: sqlite3.Connection, email: dict[str, object], now: int) ->
             email["size_bytes"],
             int(bool(email["has_attachments"])),
             fingerprint,
-            mail_openrag_filename(str(email["id"])),
+            mail_openrag_filename(str(email["id"]), str(email["subject"])),
             now,
             now,
         ),
     )
 
 
-def mail_openrag_filename(email_id: str) -> str:
-    return f"openarchiver-mail-{_safe_identifier(email_id)}.eml"
+def _short_identifier(value: str) -> str:
+    try:
+        return uuid.UUID(value).hex[:12]
+    except ValueError:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _readable_filename_stem(value: str, fallback: str, max_length: int) -> str:
+    ascii_value = unicodedata.normalize("NFKD", value).encode(
+        "ascii", "ignore"
+    ).decode("ascii")
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", ascii_value)
+    stem = re.sub(r"-{2,}", "-", stem).strip("._-")
+    stem = (stem or fallback)[:max_length].rstrip("._-")
+    return stem or fallback
+
+
+def mail_openrag_filename(email_id: str, subject: str = "") -> str:
+    suffix = f"--{_short_identifier(email_id)}.eml"
+    stem = _readable_filename_stem(subject, "mail", 255 - len(suffix))
+    return f"{stem}{suffix}"
 
 
 def safe_attachment_extension(filename: str) -> str:
@@ -1325,17 +1402,23 @@ def safe_attachment_extension(filename: str) -> str:
     return suffix if SAFE_EXTENSION.fullmatch(suffix) else ""
 
 
-def attachment_openrag_filename(attachment_id: str, filename: str) -> str:
-    return (
-        f"openarchiver-attachment-{_safe_identifier(attachment_id)}"
-        f"{safe_attachment_extension(filename)}"
+def attachment_openrag_filename(
+    attachment_id: str,
+    filename: str,
+    mail_subject: str = "",
+    email_id: str = "",
+) -> str:
+    extension = safe_attachment_extension(filename)
+    source_stem = Path(filename).stem if extension else filename
+    suffix = f"--{_short_identifier(attachment_id)}{extension}"
+    mail_identifier = f"--{_short_identifier(email_id)}" if email_id else ""
+    mail_stem = _readable_filename_stem(mail_subject, "mail", 128)
+    attachment_stem = _readable_filename_stem(
+        source_stem,
+        "piece-jointe",
+        255 - len(mail_stem) - len(mail_identifier) - len(suffix) - len("--"),
     )
-
-
-def _safe_identifier(value: str) -> str:
-    if re.fullmatch(r"[A-Za-z0-9-]{1,128}", value):
-        return value
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"{mail_stem}{mail_identifier}--{attachment_stem}{suffix}"
 
 
 def inventory_attachments(
@@ -1351,6 +1434,10 @@ def inventory_attachments(
     now = int(time.time()) if observed_at is None else observed_at
     identifiers: list[str] = []
     with database(config) as db:
+        parent = db.execute(
+            "SELECT subject FROM emails WHERE id=?", (email_id,)
+        ).fetchone()
+        mail_subject = str(parent[0]) if parent else ""
         for raw in raw_attachments:
             attachment = _require_object(raw, "pièce jointe")
             attachment_id = attachment.get("id")
@@ -1382,6 +1469,24 @@ def inventory_attachments(
                 "classification": status,
             }
             fingerprint = _fingerprint(metadata, tuple(metadata))
+            existing_parent = db.execute(
+                """
+                SELECT e.id, e.subject
+                FROM email_attachments ea
+                JOIN emails e ON e.id=ea.email_id
+                WHERE ea.attachment_id=?
+                ORDER BY e.id LIMIT 1
+                """,
+                (attachment_id,),
+            ).fetchone()
+            origin_email_id = (
+                str(existing_parent["id"]) if existing_parent else email_id
+            )
+            origin_subject = (
+                str(existing_parent["subject"])
+                if existing_parent
+                else mail_subject
+            )
             db.execute(
                 """
                 INSERT INTO attachments(
@@ -1395,22 +1500,28 @@ def inventory_attachments(
                     openrag_filename=excluded.openrag_filename,
                     status=CASE
                         WHEN attachments.metadata_fingerprint <> excluded.metadata_fingerprint
+                          OR attachments.openrag_filename <> excluded.openrag_filename
                             THEN excluded.status
                         ELSE attachments.status END,
                     sha256=CASE
                         WHEN attachments.metadata_fingerprint <> excluded.metadata_fingerprint
+                          OR attachments.openrag_filename <> excluded.openrag_filename
                             THEN '' ELSE attachments.sha256 END,
                     attempts=CASE
                         WHEN attachments.metadata_fingerprint <> excluded.metadata_fingerprint
+                          OR attachments.openrag_filename <> excluded.openrag_filename
                             THEN 0 ELSE attachments.attempts END,
                     last_error=CASE
                         WHEN attachments.metadata_fingerprint <> excluded.metadata_fingerprint
+                          OR attachments.openrag_filename <> excluded.openrag_filename
                             THEN excluded.last_error ELSE attachments.last_error END,
                     next_retry_at=CASE
                         WHEN attachments.metadata_fingerprint <> excluded.metadata_fingerprint
+                          OR attachments.openrag_filename <> excluded.openrag_filename
                             THEN 0 ELSE attachments.next_retry_at END,
                     task_id=CASE
                         WHEN attachments.metadata_fingerprint <> excluded.metadata_fingerprint
+                          OR attachments.openrag_filename <> excluded.openrag_filename
                             THEN '' ELSE attachments.task_id END,
                     metadata_fingerprint=excluded.metadata_fingerprint,
                     last_seen_at=excluded.last_seen_at
@@ -1422,7 +1533,12 @@ def inventory_attachments(
                     storage_path,
                     size,
                     fingerprint,
-                    attachment_openrag_filename(attachment_id, filename),
+                    attachment_openrag_filename(
+                        attachment_id,
+                        filename,
+                        origin_subject,
+                        origin_email_id,
+                    ),
                     status,
                     error,
                     now,
