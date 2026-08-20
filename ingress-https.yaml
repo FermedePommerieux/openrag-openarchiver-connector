@@ -7,7 +7,8 @@ metadata:
     app.kubernetes.io/part-of: openrag
   annotations:
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
-    traefik.ingress.kubernetes.io/router.middlewares: openrag-openrag-openarchiver-connector-auth@kubernetescrd,openrag-openrag-openarchiver-connector-headers@kubernetescrd
+    # BasicAuth temporairement désactivé pour le diagnostic de latence.
+    traefik.ingress.kubernetes.io/router.middlewares: openrag-openrag-openarchiver-connector-headers@kubernetescrd
     traefik.ingress.kubernetes.io/router.tls: "true"
 spec:
   ingressClassName: traefik
