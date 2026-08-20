@@ -1433,44 +1433,17 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                     )
                 )
 
-    def test_openrag_queue_snapshot_separates_connector_from_visible_queue(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config = self.config(Path(directory))
-            client = connector.OpenRAGClient(config)
-            tasks = {
-                "connector-pending": {"status": "pending", "pending_files": 1, "running_files": 0},
-                "connector-running": {"status": "running", "pending_files": 0, "running_files": 1},
-            }
-            with mock.patch.object(client, "task", side_effect=lambda task_id, **_: tasks.get(task_id, {"status": "completed"})):
-                snapshot = client.queue_snapshot(
-                    {"connector-pending", "connector-running", "unknown-local"}
-                )
-            self.assertEqual(
-                snapshot,
-                connector.OpenRAGQueueSnapshot(0, 3, 2, 1, 1, 2, 1, 1, 0),
-            )
-
-    def test_openrag_queue_state_is_rendered_in_page_and_live_status(self):
+    def test_mail_rate_is_rendered_without_remote_pending_state(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
             state = connector.RuntimeState()
-            state.openrag_queue_updated(
-                connector.OpenRAGQueueSnapshot(13752, 6, 6, 2, 4, 6, 2, 4, 4),
-                mails_per_minute=73,
-            )
+            state.mail_rate_updated(73)
             page = connector.render_status_page(config, state)
-            self.assertIn("13752 restant(s) côté connecteur", page)
-            self.assertIn("2 pending du connecteur dans OpenRAG", page)
-            self.assertNotIn('id="openrag-queue-progress"', page)
-            self.assertIn('id="openrag-queue-detail"', page)
-            self.assertIn("73 mail(s) validé(s)/min", page)
+            self.assertIn('id="mail-rate" class="stat-value">73</strong>', page)
+            self.assertNotIn("pending du connecteur", page)
             status = json.loads(connector.render_live_status(state))
-            self.assertTrue(status["openrag_queue_known"])
-            self.assertEqual(status["openrag_connector_backlog"], 13752)
-            self.assertEqual(status["openrag_connector_pending"], 2)
-            self.assertEqual(status["openrag_visible_pending"], 2)
-            self.assertEqual(status["openrag_visible_running"], 4)
-            self.assertEqual(status["openrag_mails_per_minute"], 73)
+            self.assertEqual(status["mails_per_minute"], 73)
+            self.assertFalse(any("queue" in key for key in status))
 
     def test_mail_rate_counts_recent_validated_selected_emails_only(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2442,7 +2415,7 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
         self.assertEqual(selected_counts["emails"]["queued"], 1)
         self.assertEqual(attachment_mail_count, 1)
         self.assertIn("Mails dans la sélection", page)
-        self.assertIn("Mails avec pièces jointes", page)
+        self.assertIn("Débit récent", page)
         self.assertIn("pas encore détaillées", page)
         self.assertIn("Historique local conservé : 2 mail(s)", page)
         self.assertIn("Les éléments hors sélection ne sont pas envoyés", page)
@@ -2530,13 +2503,17 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
         self.assertNotIn("https://", page)
         self.assertNotIn("http://", page)
 
-        state.cycle_progress("Traitement de la file vers OpenRAG", 6, 10)
+        state.cycle_progress("Traitement de l’ingestion OpenRAG", 6, 10)
         ingestion_page = connector.render_status_page(config, state)
         ingestion_live = json.loads(connector.render_live_status(state))
         self.assertEqual(ingestion_live["cycle_stage"], "ingestion")
-        self.assertIn("Ingestion en cours — Traitement de la file", ingestion_live["inventory_status"])
+        self.assertIn(
+            "Ingestion en cours — Traitement de l’ingestion",
+            ingestion_live["inventory_status"],
+        )
         self.assertIn(">Ingestion OpenRAG<", ingestion_page)
-        self.assertIn("Ingestion en cours…", ingestion_page)
+        self.assertIn("Inventaire terminé", ingestion_page)
+        self.assertIn("Cycle en cours…", ingestion_page)
         self.assertNotIn("Inventaire en cours…", ingestion_page)
 
     def test_runtime_manifests_expose_the_interface_securely_on_the_lan(self):

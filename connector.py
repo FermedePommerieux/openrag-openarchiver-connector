@@ -82,7 +82,7 @@ RECONCILE_WAKE = threading.Event()
 SCHEMA_VERSION = 4
 SCHEMA_LOCK = threading.Lock()
 RECONCILE_BATCH_SIZE = 100
-OPENRAG_QUEUE_POLL_SECONDS = 5
+MAIL_RATE_POLL_SECONDS = 5
 OPENRAG_TASK_POLL_SECONDS = 0.25
 
 
@@ -118,19 +118,6 @@ class ReconciliationResult:
     checked: int
     restored: int
     lost: int
-
-
-@dataclass(frozen=True)
-class OpenRAGQueueSnapshot:
-    connector_backlog: int
-    connector_submitted: int
-    connector_active: int
-    connector_pending: int
-    connector_running: int
-    visible_active: int
-    visible_pending: int
-    visible_running: int
-    processing_capacity: int
 
 
 @dataclass(frozen=True)
@@ -1013,23 +1000,6 @@ def is_paused(config: Config) -> bool:
     with database(config) as db:
         row = db.execute("SELECT value FROM settings WHERE key='paused'").fetchone()
         return bool(row and str(row[0]) == "1")
-
-
-def connector_ingesting_task_ids(config: Config) -> set[str]:
-    """Identifiants OpenRAG encore attendus par le connecteur."""
-    with database(config) as db:
-        return {
-            str(row[0])
-            for row in db.execute(
-                """
-                SELECT task_id FROM emails
-                WHERE status='ingesting' AND task_id<>''
-                UNION
-                SELECT task_id FROM attachments
-                WHERE status='ingesting' AND task_id<>''
-                """
-            )
-        }
 
 
 def set_paused(config: Config, paused: bool) -> None:
@@ -2336,48 +2306,6 @@ class OpenRAGClient:
             raise ConnectorError("réponse de tâche OpenRAG invalide") from None
         return _require_object(payload, "tâche OpenRAG")
 
-    def queue_snapshot(
-        self, connector_task_ids: set[str], connector_backlog: int = 0
-    ) -> OpenRAGQueueSnapshot:
-        """Mesure exactement les tâches actives du connecteur via l'API existante."""
-        connector_active = connector_pending = connector_running = 0
-        for task_id in sorted(connector_task_ids):
-            encoded = urllib.parse.quote(task_id, safe="")
-            enhanced_path = self.config.openrag_task_path.format(task_id=encoded)
-            try:
-                task = self.task(task_id, path=enhanced_path)
-            except HTTPStatusError as error:
-                if error.status != 404:
-                    raise
-                try:
-                    task = self.task(task_id, path=f"/v1/tasks/{encoded}")
-                except HTTPStatusError as fallback_error:
-                    if fallback_error.status == 404:
-                        continue
-                    raise
-            if str(task.get("status") or "").lower() not in {"pending", "running"}:
-                continue
-            try:
-                pending = max(0, int(task.get("pending_files", 0)))
-                running = max(0, int(task.get("running_files", 0)))
-            except (TypeError, ValueError):
-                raise ConnectorError("compteur de file OpenRAG invalide") from None
-            connector_active += 1
-            connector_pending += pending
-            connector_running += running
-
-        return OpenRAGQueueSnapshot(
-            connector_backlog=max(0, connector_backlog),
-            connector_submitted=len(connector_task_ids),
-            connector_active=connector_active,
-            connector_pending=connector_pending,
-            connector_running=connector_running,
-            visible_active=connector_active,
-            visible_pending=connector_pending,
-            visible_running=connector_running,
-            processing_capacity=0,
-        )
-
     def indexed_document(self, filename: str) -> dict[str, object] | None:
         """Retourne le document durable correspondant exactement au nom fourni."""
         return self.indexed_documents([filename]).get(filename)
@@ -3096,19 +3024,7 @@ class RuntimeState:
         self.reconciliation_restored = 0
         self.reconciliation_lost = 0
         self.reconciliation_error = ""
-        self.openrag_queue_updated_at = 0
-        self.openrag_queue_known = False
-        self.openrag_queue_error = ""
-        self.openrag_connector_backlog = 0
-        self.openrag_connector_submitted = 0
-        self.openrag_connector_active = 0
-        self.openrag_connector_pending = 0
-        self.openrag_connector_running = 0
-        self.openrag_visible_active = 0
-        self.openrag_visible_pending = 0
-        self.openrag_visible_running = 0
-        self.openrag_processing_capacity = 0
-        self.openrag_mails_per_minute = 0
+        self.mails_per_minute = 0
         self.docling_workers_detected = -1
         self.ingestion_concurrency_effective = 0
         self.worker_detection_success = False
@@ -3247,61 +3163,12 @@ class RuntimeState:
             self.reconciliation_error = _safe_error(error)
             self._notify_changed()
 
-    def openrag_queue_updated(
-        self, snapshot: OpenRAGQueueSnapshot, *, mails_per_minute: int = 0
-    ) -> None:
+    def mail_rate_updated(self, mails_per_minute: int) -> None:
+        """Publie le débit récent calculé dans la base locale."""
         with self.changed:
-            values = (
-                snapshot.connector_backlog,
-                snapshot.connector_submitted,
-                snapshot.connector_active,
-                snapshot.connector_pending,
-                snapshot.connector_running,
-                snapshot.visible_active,
-                snapshot.visible_pending,
-                snapshot.visible_running,
-                snapshot.processing_capacity,
-                max(0, mails_per_minute),
-            )
-            previous = (
-                self.openrag_connector_backlog,
-                self.openrag_connector_submitted,
-                self.openrag_connector_active,
-                self.openrag_connector_pending,
-                self.openrag_connector_running,
-                self.openrag_visible_active,
-                self.openrag_visible_pending,
-                self.openrag_visible_running,
-                self.openrag_processing_capacity,
-                self.openrag_mails_per_minute,
-            )
-            was_known = self.openrag_queue_known
-            self.openrag_queue_updated_at = int(time.time())
-            self.openrag_queue_known = True
-            self.openrag_queue_error = ""
-            (
-                self.openrag_connector_backlog,
-                self.openrag_connector_submitted,
-                self.openrag_connector_active,
-                self.openrag_connector_pending,
-                self.openrag_connector_running,
-                self.openrag_visible_active,
-                self.openrag_visible_pending,
-                self.openrag_visible_running,
-                self.openrag_processing_capacity,
-                self.openrag_mails_per_minute,
-            ) = values
-            if not was_known or values != previous:
-                self._notify_changed()
-
-    def openrag_queue_failed(self, error: Exception) -> None:
-        with self.changed:
-            message = _safe_error(error)
-            changed = self.openrag_queue_known or self.openrag_queue_error != message
-            self.openrag_queue_updated_at = int(time.time())
-            self.openrag_queue_known = False
-            self.openrag_queue_error = message
-            if changed:
+            value = max(0, mails_per_minute)
+            if value != self.mails_per_minute:
+                self.mails_per_minute = value
                 self._notify_changed()
 
     def cycle_succeeded(self, scan: ScanResult, processed: int) -> None:
@@ -3349,19 +3216,7 @@ class RuntimeState:
                 "reconciliation_restored": self.reconciliation_restored,
                 "reconciliation_lost": self.reconciliation_lost,
                 "reconciliation_error": self.reconciliation_error,
-                "openrag_queue_updated_at": self.openrag_queue_updated_at,
-                "openrag_queue_known": self.openrag_queue_known,
-                "openrag_queue_error": self.openrag_queue_error,
-                "openrag_connector_backlog": self.openrag_connector_backlog,
-                "openrag_connector_submitted": self.openrag_connector_submitted,
-                "openrag_connector_active": self.openrag_connector_active,
-                "openrag_connector_pending": self.openrag_connector_pending,
-                "openrag_connector_running": self.openrag_connector_running,
-                "openrag_visible_active": self.openrag_visible_active,
-                "openrag_visible_pending": self.openrag_visible_pending,
-                "openrag_visible_running": self.openrag_visible_running,
-                "openrag_processing_capacity": self.openrag_processing_capacity,
-                "openrag_mails_per_minute": self.openrag_mails_per_minute,
+                "mails_per_minute": self.mails_per_minute,
                 "docling_workers_detected": self.docling_workers_detected,
                 "ingestion_concurrency_effective": self.ingestion_concurrency_effective,
                 "worker_detection_success": self.worker_detection_success,
@@ -3419,7 +3274,7 @@ def run_cycle(
             time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(cached_at)),
         )
     queue_total = selected_queue_pending_count(config)
-    report("Traitement de la file vers OpenRAG", 0, queue_total)
+    report("Traitement de l’ingestion OpenRAG", 0, queue_total)
     LOG.info(
         "inventaire terminé: sources=%d mails=%d; traitement de la file",
         scan.sources,
@@ -3430,7 +3285,7 @@ def run_cycle(
         openarchiver,
         openrag,
         progress=lambda current, total: report(
-            "Traitement de la file vers OpenRAG", current, total
+            "Traitement de l’ingestion OpenRAG", current, total
         ),
         state=state,
     )
@@ -3617,28 +3472,19 @@ def reconciliation_loop(
             LOG.error("réconciliation OpenRAG en échec: %s", _safe_error(error))
 
 
-def openrag_queue_monitor_loop(
+def mail_rate_monitor_loop(
     config: Config,
     state: RuntimeState,
     *,
-    openrag: OpenRAGClient | None = None,
     stop: threading.Event = STOP,
-    poll_seconds: float = OPENRAG_QUEUE_POLL_SECONDS,
+    poll_seconds: float = MAIL_RATE_POLL_SECONDS,
 ) -> None:
-    """Maintient une vue légère de la file OpenRAG pour l'interface."""
-    rag_client = openrag or OpenRAGClient(config)
+    """Actualise le débit récent depuis SQLite, sans interroger OpenRAG."""
     while not stop.is_set():
         try:
-            task_ids = connector_ingesting_task_ids(config)
-            state.openrag_queue_updated(
-                rag_client.queue_snapshot(
-                    task_ids, connector_backlog=selected_queue_pending_count(config)
-                ),
-                mails_per_minute=selected_mails_validated_last_minute(config),
-            )
+            state.mail_rate_updated(selected_mails_validated_last_minute(config))
         except Exception as error:
-            state.openrag_queue_failed(error)
-            LOG.warning("lecture de la file OpenRAG impossible: %s", _safe_error(error))
+            LOG.warning("calcul du débit d'ingestion impossible: %s", _safe_error(error))
         stop.wait(max(1.0, poll_seconds))
 
 
@@ -3701,7 +3547,7 @@ def cycle_stage(snapshot: Mapping[str, object]) -> str:
     if not bool(snapshot["cycle_in_progress"]):
         return "idle"
     phase = str(snapshot.get("cycle_phase") or "")
-    if phase.startswith("Traitement de la file vers OpenRAG"):
+    if phase.startswith("Traitement de l’ingestion OpenRAG"):
         return "ingestion"
     return "inventory"
 
@@ -3758,7 +3604,7 @@ STATUS_PAGE_STYLE = """
 .app{min-height:100vh}.topbar{display:flex;align-items:center;justify-content:space-between;height:64px;border-bottom:1px solid var(--border);background:color-mix(in srgb,var(--background) 94%,transparent);padding:0 24px;position:sticky;top:0;z-index:2;backdrop-filter:blur(10px)}.brand{display:flex;align-items:center;gap:10px;font:600 18px/1 ui-monospace,SFMono-Regular,Menlo,monospace}.brand-logo{width:24px;height:22px;fill:currentColor}.connector-chip{border:1px solid var(--border);border-radius:999px;padding:5px 10px;color:var(--muted-foreground);font-size:12px}.user-menu{display:flex;align-items:center;gap:9px}.user-menu form{margin:0}.user-menu button{min-height:32px;padding:5px 10px;font-size:12px}.main{min-width:0;padding:38px 24px}.content{max-width:1120px;margin:0 auto}.page-heading{margin-bottom:24px}.eyebrow{margin:0 0 4px;color:var(--muted-foreground);font-size:12px;font-weight:600}.page-heading h1{margin:0;font-size:26px;line-height:1.25;letter-spacing:-.025em}.page-heading p{margin:7px 0 0;color:var(--muted-foreground)}.section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:18px}.section-heading h2{margin:0;font-size:18px;letter-spacing:-.015em}.section-heading p{margin:4px 0 0;color:var(--muted-foreground)}.toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.toolbar form{margin:0}
 .workspace-tabs{display:flex;gap:4px;width:max-content;max-width:100%;margin-bottom:28px;border:1px solid var(--border);border-radius:10px;background:var(--muted);padding:4px;overflow-x:auto}.workspace-tab{min-height:38px;border:0;background:transparent;padding:8px 15px;color:var(--muted-foreground);white-space:nowrap;box-shadow:none}.workspace-tab:hover{background:color-mix(in srgb,var(--card) 55%,transparent);color:var(--foreground)}.workspace-tab[aria-selected="true"]{background:var(--card);color:var(--foreground);box-shadow:var(--shadow)}.workspace-panel[hidden]{display:none}.workspace-panel{animation:panel-in .14s ease-out}@keyframes panel-in{from{opacity:.55;transform:translateY(2px)}to{opacity:1;transform:none}}
 .status-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:20px}.stat-card,.card{border:1px solid var(--border);border-radius:var(--radius);background:var(--card);box-shadow:var(--shadow)}.stat-card{padding:16px}.stat-label{display:flex;align-items:center;gap:7px;color:var(--muted-foreground);font-size:12px;font-weight:600}.dot{width:8px;height:8px;border-radius:50%;background:var(--muted-foreground)}.dot.success{background:var(--success)}.dot.warning{background:#f59e0b}.dot.danger{background:var(--danger)}.stat-value{display:block;margin-top:8px;font-size:22px;font-weight:650;letter-spacing:-.03em}.stat-detail{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px}.card{margin-bottom:16px;overflow:hidden}.card-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:18px 20px;border-bottom:1px solid var(--border)}.card-title{margin:0;font-size:15px}.card-description{margin:3px 0 0;color:var(--muted-foreground);font-size:13px}.card-body{padding:20px}.card-footer{display:flex;justify-content:flex-end;padding:14px 20px;border-top:1px solid var(--border);background:var(--sidebar)}.badge{display:inline-flex;align-items:center;border-radius:999px;background:var(--muted);padding:3px 8px;color:var(--muted-foreground);font-size:11px;font-weight:600}.badge.success{background:var(--success-soft);color:var(--success)}.badge.warning{background:var(--warning-soft);color:var(--warning)}.badge.danger{background:var(--danger-soft);color:var(--danger)}
-.inventory-row{display:flex;align-items:center;gap:12px}.inventory-status{display:block;width:100%;min-height:24px;font-weight:600}.inventory-status.running{color:var(--success)}.queue-monitor{margin-top:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--sidebar);padding:14px}.queue-monitor .progress-wrap{margin-top:9px}.progress-wrap{margin-top:12px}.progress-track{height:10px;overflow:hidden;border-radius:999px;background:var(--muted)}.progress-bar{height:100%;width:0;border-radius:inherit;background:var(--success);transition:width .25s ease}.progress-bar.indeterminate{width:35%;animation:progress-slide 1.2s ease-in-out infinite}.progress-label{display:block;margin-top:5px;color:var(--muted-foreground);font-size:12px;text-align:right}@keyframes progress-slide{0%{transform:translateX(-110%)}100%{transform:translateX(300%)}}.helper{margin:10px 0 0;color:var(--muted-foreground);font-size:12px}.error-alert{display:flex;gap:10px;margin-bottom:16px;border:1px solid #fecaca;border-radius:var(--radius);background:var(--danger-soft);padding:13px 15px;color:#991b1b}.error-alert strong{display:block}.selection-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:390px;overflow:auto}.selection-item{display:flex;align-items:flex-start;gap:11px;margin:0;border:1px solid var(--border);border-radius:var(--radius);padding:12px;cursor:pointer;transition:background .15s,border-color .15s}.selection-item:hover{background:var(--muted)}.selection-item:has(input:checked){border-color:#a1a1aa;background:var(--muted)}.selection-item input{width:16px;height:16px;margin:2px 0 0;accent-color:var(--primary);flex:0 0 auto}.selection-copy{min-width:0}.selection-title{display:block;font-weight:600;overflow-wrap:anywhere}.selection-meta{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px;overflow-wrap:anywhere}.empty{grid-column:1/-1;margin:0;border:1px dashed var(--border);border-radius:var(--radius);padding:22px;text-align:center;color:var(--muted-foreground)}.counts{display:flex;flex-wrap:wrap;gap:6px}.secret-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.secret-field{display:grid;gap:6px;color:var(--muted-foreground);font-size:12px;font-weight:600}.secret-field input{width:100%;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}.footer-note{padding:8px 0 24px;text-align:center;color:var(--muted-foreground);font-size:12px}
+.inventory-row{display:flex;align-items:center;gap:12px}.inventory-status{display:block;width:100%;min-height:24px;font-weight:600}.inventory-status.running{color:var(--success)}.progress-wrap{margin-top:12px}.progress-track{height:10px;overflow:hidden;border-radius:999px;background:var(--muted)}.progress-bar{height:100%;width:0;border-radius:inherit;background:var(--success);transition:width .25s ease}.progress-bar.indeterminate{width:35%;animation:progress-slide 1.2s ease-in-out infinite}.progress-label{display:block;margin-top:5px;color:var(--muted-foreground);font-size:12px;text-align:right}@keyframes progress-slide{0%{transform:translateX(-110%)}100%{transform:translateX(300%)}}.helper{margin:10px 0 0;color:var(--muted-foreground);font-size:12px}.error-alert{display:flex;gap:10px;margin-bottom:16px;border:1px solid #fecaca;border-radius:var(--radius);background:var(--danger-soft);padding:13px 15px;color:#991b1b}.error-alert strong{display:block}.selection-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:390px;overflow:auto}.selection-item{display:flex;align-items:flex-start;gap:11px;margin:0;border:1px solid var(--border);border-radius:var(--radius);padding:12px;cursor:pointer;transition:background .15s,border-color .15s}.selection-item:hover{background:var(--muted)}.selection-item:has(input:checked){border-color:#a1a1aa;background:var(--muted)}.selection-item input{width:16px;height:16px;margin:2px 0 0;accent-color:var(--primary);flex:0 0 auto}.selection-copy{min-width:0}.selection-title{display:block;font-weight:600;overflow-wrap:anywhere}.selection-meta{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px;overflow-wrap:anywhere}.empty{grid-column:1/-1;margin:0;border:1px dashed var(--border);border-radius:var(--radius);padding:22px;text-align:center;color:var(--muted-foreground)}.counts{display:flex;flex-wrap:wrap;gap:6px}.secret-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.secret-field{display:grid;gap:6px;color:var(--muted-foreground);font-size:12px;font-weight:600}.secret-field input{width:100%;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}.footer-note{padding:8px 0 24px;text-align:center;color:var(--muted-foreground);font-size:12px}
 .reconciliation-row{display:flex;align-items:center;justify-content:space-between;gap:16px}.reconciliation-row form{flex:0 0 auto}.section-rule{margin:18px 0;border:0;border-top:1px solid var(--border)}.retry-tabs{position:relative}.tab-toggle{position:absolute;opacity:0;pointer-events:none}.tab-label{display:inline-flex;margin:0 6px 14px 0;border:1px solid var(--border);border-radius:999px;padding:7px 12px;color:var(--muted-foreground);cursor:pointer;font-weight:600}.tab-panel{display:none}.retry-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px}.retry-select-all{display:flex;align-items:center;gap:8px;color:var(--muted-foreground);font-size:12px}.retry-select-all input{width:16px;height:16px;accent-color:var(--primary)}#retry-tab-lost:checked~label[for="retry-tab-lost"],#retry-tab-failed:checked~label[for="retry-tab-failed"]{border-color:var(--primary);background:var(--primary);color:var(--primary-foreground)}#retry-tab-lost:checked~.tab-panels>#retry-panel-lost,#retry-tab-failed:checked~.tab-panels>#retry-panel-failed{display:block}
 .login-page{min-height:100vh;display:grid;place-items:center;padding:24px;background:var(--muted)}.login-card{width:min(440px,100%);border:1px solid var(--border);border-radius:14px;background:var(--card);padding:42px;box-shadow:var(--shadow);text-align:center}.login-card .brand-logo{width:50px;height:42px}.login-card h1{margin:24px 0 8px;font-size:24px}.login-card p{margin:0 0 28px;color:var(--muted-foreground)}.login-card form{margin:0}.login-card button{width:100%;min-height:46px}.identity-notice{margin-bottom:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--sidebar);padding:11px 14px;color:var(--muted-foreground);font-size:12px}
 @media(prefers-color-scheme:dark){:root{--background:#18181b;--foreground:#fafafa;--muted:#27272a;--muted-foreground:#a1a1aa;--border:#3f3f46;--card:#18181b;--sidebar:#111113;--primary:#fafafa;--primary-foreground:#09090b;--danger:#f87171;--danger-soft:#2b1719;--success:#34d399;--success-soft:#10251e;--warning:#fbbf24;--warning-soft:#2b2414;--shadow:none}.primary:hover{background:#e4e4e7}.error-alert{border-color:#7f1d1d;color:#fecaca}.selection-item:has(input:checked){border-color:#71717a}}
@@ -3804,23 +3650,7 @@ def render_live_status(state: RuntimeState) -> str:
             "reconciliation_restored": int(snapshot["reconciliation_restored"]),
             "reconciliation_lost": int(snapshot["reconciliation_lost"]),
             "reconciliation_error": str(snapshot["reconciliation_error"] or ""),
-            "openrag_queue_updated_at": int(snapshot["openrag_queue_updated_at"]),
-            "openrag_queue_known": bool(snapshot["openrag_queue_known"]),
-            "openrag_queue_error": str(snapshot["openrag_queue_error"] or ""),
-            "openrag_connector_backlog": int(snapshot["openrag_connector_backlog"]),
-            "openrag_connector_submitted": int(
-                snapshot["openrag_connector_submitted"]
-            ),
-            "openrag_connector_active": int(snapshot["openrag_connector_active"]),
-            "openrag_connector_pending": int(snapshot["openrag_connector_pending"]),
-            "openrag_connector_running": int(snapshot["openrag_connector_running"]),
-            "openrag_visible_active": int(snapshot["openrag_visible_active"]),
-            "openrag_visible_pending": int(snapshot["openrag_visible_pending"]),
-            "openrag_visible_running": int(snapshot["openrag_visible_running"]),
-            "openrag_processing_capacity": int(
-                snapshot["openrag_processing_capacity"]
-            ),
-            "openrag_mails_per_minute": int(snapshot["openrag_mails_per_minute"]),
+            "mails_per_minute": int(snapshot["mails_per_minute"]),
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -3888,11 +3718,10 @@ UI_SCRIPT = r"""(() => {
   const progressWrap = document.getElementById("cycle-progress");
   const progressBar = document.getElementById("cycle-progress-bar");
   const progressLabel = document.getElementById("cycle-progress-label");
-  const cycleTitle = document.getElementById("cycle-card-title");
-  const cycleDescription = document.getElementById("cycle-card-description");
-  const openragQueueDot = document.getElementById("openrag-queue-dot");
-  const openragQueueSummary = document.getElementById("openrag-queue-summary");
-  const openragQueueDetail = document.getElementById("openrag-queue-detail");
+  const inventoryProgressWrap = document.getElementById("inventory-cycle-progress");
+  const inventoryProgressBar = document.getElementById("inventory-cycle-progress-bar");
+  const inventoryProgressLabel = document.getElementById("inventory-cycle-progress-label");
+  const mailRate = document.getElementById("mail-rate");
   const reconciliationButton = document.getElementById("reconciliation-button");
   const reconciliationStatus = document.getElementById("reconciliation-status");
   const reconciliationDetail = document.getElementById("reconciliation-detail");
@@ -3930,8 +3759,6 @@ UI_SCRIPT = r"""(() => {
       "mailbox-selection-badge",
       "mail-count",
       "mailbox-selected-count",
-      "selected-attachment-mail-count",
-      "detailed-attachment-count",
       "inventory-cache-label",
       "email-status-counts",
       "history-summary",
@@ -3978,27 +3805,21 @@ UI_SCRIPT = r"""(() => {
       observedActive = observedActive || active || requested;
       if (active) observedStage = status.cycle_stage;
       if (active || requested) completion.hidden = true;
-      summary.textContent = status.inventory_status;
-      summary.setAttribute("aria-busy", active ? "true" : "false");
-      summary.classList.toggle("running", active);
-      const stateClass = active ? "success" : (failed ? "danger" : "warning");
+      summary.textContent = active && ingestion ?
+        "Inventaire terminé ; ingestion OpenRAG en cours." : status.inventory_status;
+      summary.setAttribute("aria-busy", active && !ingestion ? "true" : "false");
+      summary.classList.toggle("running", active && !ingestion);
+      const stateClass = active && ingestion ? "success" :
+        (active ? "success" : (failed ? "danger" : "warning"));
       badge.className = "badge " + stateClass;
       dot.className = "dot " + stateClass;
-      badge.textContent = active ? (ingestion ? "Ingestion en cours…" : "Inventaire en cours…") :
+      badge.textContent = active ? (ingestion ? "Inventaire terminé" : "Inventaire en cours…") :
         (requested ? "Inventaire demandé" :
           (failed ? "Inventaire interrompu" : "En attente"));
       button.disabled = active || requested;
       button.type = active || requested ? "button" : "submit";
-      button.textContent = active ? (ingestion ? "Ingestion en cours…" : "Inventaire en cours…") :
+      button.textContent = active ? (ingestion ? "Cycle en cours…" : "Inventaire en cours…") :
         (requested ? "Inventaire demandé…" : "Relancer l’inventaire");
-      if (cycleTitle) {
-        cycleTitle.textContent = ingestion ? "Ingestion OpenRAG" : "Inventaire IMAP";
-      }
-      if (cycleDescription) {
-        cycleDescription.textContent = ingestion ?
-          "Progression de l’envoi des mails et pièces jointes sélectionnés." :
-          "État du cycle de découverte des sources et dossiers.";
-      }
       if (service) service.textContent = status.ready ? "Prêt" : "Attention requise";
       if (lastSync) {
         lastSync.textContent = status.cycle_completed_at ?
@@ -4006,34 +3827,26 @@ UI_SCRIPT = r"""(() => {
           "Dernière synchro : Jamais exécutée";
       }
       if (processed) processed.textContent = status.last_processed + " objet(s) au dernier cycle";
-      if (progressWrap && progressBar && progressLabel) {
+      if (mailRate) mailRate.textContent = String(Number(status.mails_per_minute || 0));
+      const updateProgress = (wrap, bar, label, visible) => {
+        if (!wrap || !bar || !label) return;
         const current = Number(status.progress_current || 0);
         const total = Number(status.progress_total || 0);
-        progressWrap.hidden = !active;
-        progressBar.classList.toggle("indeterminate", active && total <= 0);
-        progressBar.style.width = total > 0 ? Math.min(100, current * 100 / total) + "%" : "";
-        progressLabel.textContent = total > 0 ? current + " / " + total + " · " + Math.round(current * 100 / total) + " %" : "Préparation…";
-        progressWrap.setAttribute("aria-valuemin", "0");
+        wrap.hidden = !visible;
+        bar.classList.toggle("indeterminate", visible && total <= 0);
+        bar.style.width = total > 0 ? Math.min(100, current * 100 / total) + "%" : "";
+        label.textContent = total > 0 ? current + " / " + total + " · " + Math.round(current * 100 / total) + " %" : "Préparation…";
+        wrap.setAttribute("aria-valuemin", "0");
         if (total > 0) {
-          progressWrap.setAttribute("aria-valuemax", String(total));
-          progressWrap.setAttribute("aria-valuenow", String(Math.min(current, total)));
+          wrap.setAttribute("aria-valuemax", String(total));
+          wrap.setAttribute("aria-valuenow", String(Math.min(current, total)));
         } else {
-          progressWrap.removeAttribute("aria-valuemax");
-          progressWrap.removeAttribute("aria-valuenow");
+          wrap.removeAttribute("aria-valuemax");
+          wrap.removeAttribute("aria-valuenow");
         }
-      }
-      if (openragQueueSummary && openragQueueDetail) {
-        const known = Boolean(status.openrag_queue_known);
-        const pending = Number(status.openrag_visible_pending || 0);
-        const running = Number(status.openrag_visible_running || 0);
-        openragQueueSummary.textContent = known ?
-          `${status.openrag_connector_backlog} restant(s) côté connecteur · ${pending} pending du connecteur dans OpenRAG` :
-          "File OpenRAG indisponible";
-        openragQueueDetail.textContent = known ?
-          `${status.openrag_connector_submitted} soumise(s) localement · ${status.openrag_connector_active} active(s) · ${running} fichier(s) en exécution · ${status.openrag_mails_per_minute} mail(s) validé(s)/min · file OpenRAG globale non exposée` :
-          (status.openrag_queue_error || "Mesure en attente");
-        if (openragQueueDot) openragQueueDot.className = "dot " + (known ? "success" : "warning");
-      }
+      };
+      updateProgress(progressWrap, progressBar, progressLabel, active && ingestion);
+      updateProgress(inventoryProgressWrap, inventoryProgressBar, inventoryProgressLabel, active && !ingestion);
       const reconciling = Boolean(status.reconciliation_in_progress);
       const reconciliationRequested = Boolean(status.reconciliation_requested);
       const reconciliationActive = reconciling || reconciliationRequested;
@@ -4138,7 +3951,6 @@ def render_status_page(
     mailboxes = mailbox_rows(config)
     counts = _status_counts(config)
     selected_counts = _status_counts(config, selected_only=True)
-    selected_attachment_mails = selected_mail_with_attachments(config)
     inventory_cache = cached_inventory(config, allow_expired=True)
     paused = is_paused(config)
     csrf = html.escape(str(snapshot["csrf_token"]), quote=True)
@@ -4285,11 +4097,11 @@ def render_status_page(
     if inventory_running:
         ingestion_running = current_stage == "ingestion"
         inventory_activity = (
-            "Ingestion en cours…" if ingestion_running else "Inventaire en cours…"
+            "Inventaire terminé" if ingestion_running else "Inventaire en cours…"
         )
         inventory_class = "success running"
         button_label = (
-            "Ingestion en cours…" if ingestion_running else "Inventaire en cours…"
+            "Cycle en cours…" if ingestion_running else "Inventaire en cours…"
         )
         scan_button = f'<button id="inventory-button" class="primary" type="button" disabled>{button_label}</button>'
     elif inventory_requested:
@@ -4303,7 +4115,6 @@ def render_status_page(
     selected_sources = sum(int(row["selected"]) for row in sources)
     selected_mailboxes = sum(int(row["selected"]) for row in mailboxes)
     email_total = sum(selected_counts["emails"].values())
-    attachment_total = sum(selected_counts["attachments"].values())
     historical_email_total = sum(counts["emails"].values())
     historical_attachment_total = sum(counts["attachments"].values())
     if inventory_cache:
@@ -4339,30 +4150,11 @@ def render_status_page(
             '<div class="error-alert" role="alert"><span aria-hidden="true">⚠</span>'
             f'<div><strong>Dernière erreur</strong>{error}</div></div>'
         )
-    cycle_title = "Ingestion OpenRAG" if current_stage == "ingestion" else "Inventaire IMAP"
-    cycle_description = (
-        "Progression de l’envoi des mails et pièces jointes sélectionnés."
-        if current_stage == "ingestion"
-        else "État du cycle de découverte des sources et dossiers."
+    inventory_summary = (
+        "Inventaire terminé ; ingestion OpenRAG en cours."
+        if inventory_running and current_stage == "ingestion"
+        else inventory_status(snapshot)
     )
-    queue_known = bool(snapshot["openrag_queue_known"])
-    queue_pending = int(snapshot["openrag_visible_pending"])
-    queue_running = int(snapshot["openrag_visible_running"])
-    if queue_known:
-        queue_summary = (
-            f'{int(snapshot["openrag_connector_backlog"])} restant(s) côté connecteur · '
-            f"{queue_pending} pending du connecteur dans OpenRAG"
-        )
-        queue_detail = (
-            f'{int(snapshot["openrag_connector_submitted"])} soumise(s) localement · '
-            f'{int(snapshot["openrag_connector_active"])} active(s) · '
-            f"{queue_running} fichier(s) en exécution · "
-            f'{int(snapshot["openrag_mails_per_minute"])} mail(s) validé(s)/min · '
-            "file OpenRAG globale non exposée"
-        )
-    else:
-        queue_summary = "File OpenRAG indisponible"
-        queue_detail = str(snapshot["openrag_queue_error"] or "Mesure en attente")
     reconciliation_active = bool(
         snapshot["reconciliation_requested_at"]
         or snapshot["reconciliation_in_progress"]
@@ -4414,31 +4206,33 @@ def render_status_page(
 <button id="workspace-tab-configuration" class="workspace-tab" type="button" role="tab" aria-selected="false" aria-controls="workspace-panel-configuration" data-workspace-tab="configuration" tabindex="-1">Configuration</button>
 </div>
 <section id="workspace-panel-ingestion" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-ingestion" data-workspace-panel="ingestion">
-<div class="section-heading"><div><h2>État de l’ingestion</h2><p>Suivi en direct de la file locale et des traitements OpenRAG.</p></div>
+<div class="section-heading"><div><h2>État de l’ingestion</h2><p>Suivi en direct des traitements envoyés à OpenRAG.</p></div>
 <div class="toolbar"><form method="post" action="/pause"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="action" value="{pause_action}"><button type="submit">{pause_label}</button></form></div></div>
 {error_alert}
 <section class="status-grid" aria-label="État du connecteur">
 <div class="stat-card"><span class="stat-label"><span class="dot {status_class}"></span>Service</span><strong id="service-status" class="stat-value">{ready}</strong><span id="last-sync" class="stat-detail">Dernière synchro : {last_sync}</span></div>
 <div class="stat-card"><span class="stat-label"><span class="dot {activity_class}"></span>Indexation</span><strong class="stat-value">{activity}</strong><span id="last-processed" class="stat-detail">{int(snapshot["last_processed"])} objet(s) au dernier cycle · concurrence {concurrency_mode} : {effective_concurrency} · workers Docling : {worker_label}</span></div>
 <div class="stat-card"><span class="stat-label">Mails dans la sélection</span><strong id="mail-count" class="stat-value">{email_total}</strong><span id="mailbox-selected-count" class="stat-detail">{selected_mailboxes} dossier(s) sélectionné(s)</span></div>
-<div class="stat-card"><span class="stat-label">Mails avec pièces jointes</span><strong id="selected-attachment-mail-count" class="stat-value">{selected_attachment_mails}</strong><span id="detailed-attachment-count" class="stat-detail">{attachment_total} pièce(s) déjà détaillée(s)</span></div>
+<div class="stat-card"><span class="stat-label">Débit récent</span><strong id="mail-rate" class="stat-value">{int(snapshot["mails_per_minute"])}</strong><span class="stat-detail">mail(s) validé(s)/min</span></div>
 </section>
-<section class="card"><div class="card-header"><div><h2 id="cycle-card-title" class="card-title">{cycle_title}</h2><p id="cycle-card-description" class="card-description">{cycle_description}</p></div><span id="inventory-badge" class="badge {inventory_class}">{inventory_activity}</span></div>
-<div class="card-body"><div class="inventory-row"><span id="inventory-dot" class="dot {inventory_class}"></span><span id="inventory-summary" class="inventory-status" role="status" aria-live="polite" aria-busy="{str(inventory_running).lower()}">{html.escape(inventory_status(snapshot))}</span></div>
-<div id="cycle-progress" class="progress-wrap" role="progressbar" aria-label="Progression du cycle" hidden><div class="progress-track"><div id="cycle-progress-bar" class="progress-bar"></div></div><span id="cycle-progress-label" class="progress-label">Préparation…</span></div>
-<div id="openrag-queue" class="queue-monitor"><div class="inventory-row"><span id="openrag-queue-dot" class="dot {'success' if queue_known else 'warning'}"></span><strong id="openrag-queue-summary">{html.escape(queue_summary)}</strong></div><p id="openrag-queue-detail" class="helper">{html.escape(queue_detail)}</p></div>
+<section class="card"><div class="card-header"><div><h2 class="card-title">Ingestion OpenRAG</h2><p class="card-description">Progression de l’envoi des mails et pièces jointes sélectionnés.</p></div></div>
+<div class="card-body"><div id="cycle-progress" class="progress-wrap" role="progressbar" aria-label="Progression de l’ingestion OpenRAG" hidden><div class="progress-track"><div id="cycle-progress-bar" class="progress-bar"></div></div><span id="cycle-progress-label" class="progress-label">Préparation…</span></div>
 <p id="inventory-completion" class="helper" role="status" hidden></p>
-<p id="inventory-cache-label" class="helper">{html.escape(inventory_cache_label)}</p>
-<p class="helper">Les archives sont traitées comme un instantané stable. Utilisez « Relancer l’inventaire » pour rechercher explicitement de nouveaux éléments.</p>
-<p class="helper">La pause bloque les envois vers OpenRAG, mais autorise l’inventaire des sources et dossiers IMAP.</p>
 <div id="email-status-counts" class="counts" aria-label="États des mails de la sélection"><span class="badge success">Sélection actuelle</span>{count_badges(selected_counts["emails"], "aucun mail")}</div>
 <p id="history-summary" class="helper">Historique local conservé : {historical_email_total} mail(s) ; {historical_attachment_total} pièce(s) jointe(s) déjà détaillée(s). Les éléments hors sélection ne sont pas envoyés à OpenRAG.</p></div>
-<div class="card-footer"><form method="post" action="/scan"><input type="hidden" name="csrf" value="{csrf}">{scan_button}</form></div></section>
+</section>
 <section id="retry-card" class="card"><div class="card-header"><div><h2 class="card-title">Réindexation</h2><p class="card-description">Contrôlez OpenRAG puis resoumettez les tâches réellement perdues ou en échec.</p></div><span id="retry-count-badge" class="badge warning">Lost {lost_total} · Failed {failed_total}</span></div>
 <div class="card-body"><div class="reconciliation-row"><div><strong id="reconciliation-status">{html.escape(reconciliation_label)}</strong><p id="reconciliation-detail" class="helper">{html.escape(reconciliation_detail)}</p></div><form method="post" action="/reconcile"><input type="hidden" name="csrf" value="{csrf}">{reconciliation_button}</form></div><div id="reconciliation-progress" class="progress-wrap" role="progressbar" aria-label="Progression de la réconciliation" {'hidden' if not reconciliation_active else ''}><div class="progress-track"><div id="reconciliation-progress-bar" class="progress-bar"></div></div><span id="reconciliation-progress-label" class="progress-label">Préparation…</span></div><hr class="section-rule"><div id="retry-tabs" class="retry-tabs"><input class="tab-toggle" type="radio" name="retry-tab" id="retry-tab-lost" checked><label class="tab-label" for="retry-tab-lost">Lost · {lost_total}</label><input class="tab-toggle" type="radio" name="retry-tab" id="retry-tab-failed"><label class="tab-label" for="retry-tab-failed">Failed · {failed_total}</label><div class="tab-panels">{lost_panel}{failed_panel}</div></div><p class="helper">La réindexation réinitialise les tentatives des objets choisis. Si le connecteur est en pause, utilisez ensuite « Reprendre l’indexation ».</p></div></section>
 </section>
 <section id="workspace-panel-sources" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-sources" data-workspace-panel="sources" hidden>
 <div class="section-heading"><div><h2>Sources</h2><p>Sélectionnez les comptes et dossiers OpenArchiver à indexer.</p></div></div>
+<section class="card"><div class="card-header"><div><h2 class="card-title">Inventaire IMAP</h2><p class="card-description">État de la découverte des sources, dossiers et messages OpenArchiver.</p></div><span id="inventory-badge" class="badge {inventory_class}">{inventory_activity}</span></div>
+<div class="card-body"><div class="inventory-row"><span id="inventory-dot" class="dot {inventory_class}"></span><span id="inventory-summary" class="inventory-status" role="status" aria-live="polite" aria-busy="{str(inventory_running and current_stage == 'inventory').lower()}">{html.escape(inventory_summary)}</span></div>
+<div id="inventory-cycle-progress" class="progress-wrap" role="progressbar" aria-label="Progression de l’inventaire IMAP" hidden><div class="progress-track"><div id="inventory-cycle-progress-bar" class="progress-bar"></div></div><span id="inventory-cycle-progress-label" class="progress-label">Préparation…</span></div>
+<p id="inventory-cache-label" class="helper">{html.escape(inventory_cache_label)}</p>
+<p class="helper">L’inventaire est conservé comme un instantané stable et n’est renouvelé que sur demande.</p>
+<p class="helper">La pause bloque les envois vers OpenRAG, mais n’empêche pas l’inventaire IMAP.</p></div>
+<div class="card-footer"><form method="post" action="/scan"><input type="hidden" name="csrf" value="{csrf}">{scan_button}</form></div></section>
 <form method="post" action="/sources" class="card"><div class="card-header"><div><h2 class="card-title">Sources indexées</h2><p class="card-description">Choisissez les comptes OpenArchiver à rendre disponibles dans OpenRAG.</p></div><span class="badge">{selected_sources}/{len(sources)} sélectionnée(s)</span></div>
 <div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="selection-list">{"".join(source_lines)}</div></div>
 <div class="card-footer"><button class="primary" type="submit">Enregistrer et lancer l’inventaire</button></div></form>
@@ -4947,13 +4741,13 @@ def main() -> None:
         daemon=True,
     )
     reconciliation_worker.start()
-    queue_monitor_worker = threading.Thread(
-        target=openrag_queue_monitor_loop,
+    mail_rate_worker = threading.Thread(
+        target=mail_rate_monitor_loop,
         args=(config, state),
-        name="openrag-queue-monitor",
+        name="mail-rate-monitor",
         daemon=True,
     )
-    queue_monitor_worker.start()
+    mail_rate_worker.start()
     server = ThreadingHTTPServer(
         (config.http_host, config.http_port), make_http_handler(config, state)
     )
@@ -4969,7 +4763,7 @@ def main() -> None:
         server.server_close()
         worker.join(timeout=5)
         reconciliation_worker.join(timeout=5)
-        queue_monitor_worker.join(timeout=5)
+        mail_rate_worker.join(timeout=5)
 
 
 if __name__ == "__main__":

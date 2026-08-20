@@ -16,8 +16,7 @@ flowchart LR
     OA[OpenArchiver] -->|inventaire et téléchargement| C[Connecteur]
     C <--> DB[(SQLite sur PVC)]
     C -->|upload multipart + source_url| API[API OpenRAG]
-    API --> Q[File OpenRAG]
-    Q --> LF[Langflow]
+    API --> LF[Langflow]
     LF --> D[Docling]
     API --> OS[(Chunks OpenRAG)]
     C -->|vérification par nom + SHA-256| OS
@@ -203,8 +202,7 @@ détection réussit mais trouve zéro worker, aucune nouvelle ingestion n'est
 soumise pendant ce cycle.
 
 Cette concurrence limite les objets suivis simultanément par le connecteur.
-Elle ne garantit pas que Langflow ou Docling les exécutent immédiatement :
-OpenRAG conserve sa propre file en aval.
+Elle ne garantit pas que Langflow ou Docling les exécutent immédiatement.
 
 ## Reprises et réconciliation
 
@@ -245,7 +243,7 @@ La pause ne supprime aucun mail OpenArchiver ni aucune connaissance OpenRAG.
 | --- | --- |
 | `openarchiver-cycle` | inventaire, file locale et ingestion |
 | `openarchiver-reconciliation` | audit demandé depuis l'interface |
-| `openrag-queue-monitor` | état des tâches du connecteur et mails validés/minute |
+| `mail-rate-monitor` | calcul local des mails validés par minute |
 | serveur HTTP | interface, événements SSE, probes et métriques |
 
 Routes de lecture :
@@ -261,8 +259,9 @@ Routes de lecture :
 
 L'interface est répartie en trois onglets persistants : **État de
 l'ingestion**, **Sources** et **Configuration**. Le premier regroupe le suivi,
-la pause, la réconciliation et les reprises ; le second contient le périmètre
-OpenArchiver ; le dernier contient l'identité OpenRAG et les clés techniques.
+la pause, la réconciliation et les reprises ; le second contient l'inventaire
+IMAP et le périmètre OpenArchiver ; le dernier contient l'identité OpenRAG et
+les clés techniques.
 
 Actions POST : `/sources`, `/mailboxes`, `/scan`, `/pause`, `/retry`,
 `/reconcile` et `/secrets`. Elles exigent toutes le jeton CSRF de la
