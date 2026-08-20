@@ -72,6 +72,7 @@ RECONCILE_WAKE = threading.Event()
 SCHEMA_VERSION = 2
 SCHEMA_LOCK = threading.Lock()
 RECONCILE_BATCH_SIZE = 100
+OPENRAG_QUEUE_POLL_SECONDS = 5
 
 
 class ConnectorError(RuntimeError):
@@ -101,6 +102,19 @@ class ReconciliationResult:
     checked: int
     restored: int
     lost: int
+
+
+@dataclass(frozen=True)
+class OpenRAGQueueSnapshot:
+    connector_backlog: int
+    connector_submitted: int
+    connector_active: int
+    connector_pending: int
+    connector_running: int
+    visible_active: int
+    visible_pending: int
+    visible_running: int
+    processing_capacity: int
 
 
 @dataclass(frozen=True)
@@ -536,6 +550,23 @@ def is_paused(config: Config) -> bool:
     with database(config) as db:
         row = db.execute("SELECT value FROM settings WHERE key='paused'").fetchone()
         return bool(row and str(row[0]) == "1")
+
+
+def connector_ingesting_task_ids(config: Config) -> set[str]:
+    """Identifiants OpenRAG encore attendus par le connecteur."""
+    with database(config) as db:
+        return {
+            str(row[0])
+            for row in db.execute(
+                """
+                SELECT task_id FROM emails
+                WHERE status='ingesting' AND task_id<>''
+                UNION
+                SELECT task_id FROM attachments
+                WHERE status='ingesting' AND task_id<>''
+                """
+            )
+        }
 
 
 def set_paused(config: Config, paused: bool) -> None:
@@ -1769,6 +1800,48 @@ class OpenRAGClient:
             raise ConnectorError("réponse de tâche OpenRAG invalide") from None
         return _require_object(payload, "tâche OpenRAG")
 
+    def queue_snapshot(
+        self, connector_task_ids: set[str], connector_backlog: int = 0
+    ) -> OpenRAGQueueSnapshot:
+        """Mesure exactement les tâches actives du connecteur via l'API existante."""
+        connector_active = connector_pending = connector_running = 0
+        for task_id in sorted(connector_task_ids):
+            encoded = urllib.parse.quote(task_id, safe="")
+            enhanced_path = self.config.openrag_task_path.format(task_id=encoded)
+            try:
+                task = self.task(task_id, path=enhanced_path)
+            except HTTPStatusError as error:
+                if error.status != 404:
+                    raise
+                try:
+                    task = self.task(task_id, path=f"/v1/tasks/{encoded}")
+                except HTTPStatusError as fallback_error:
+                    if fallback_error.status == 404:
+                        continue
+                    raise
+            if str(task.get("status") or "").lower() not in {"pending", "running"}:
+                continue
+            try:
+                pending = max(0, int(task.get("pending_files", 0)))
+                running = max(0, int(task.get("running_files", 0)))
+            except (TypeError, ValueError):
+                raise ConnectorError("compteur de file OpenRAG invalide") from None
+            connector_active += 1
+            connector_pending += pending
+            connector_running += running
+
+        return OpenRAGQueueSnapshot(
+            connector_backlog=max(0, connector_backlog),
+            connector_submitted=len(connector_task_ids),
+            connector_active=connector_active,
+            connector_pending=connector_pending,
+            connector_running=connector_running,
+            visible_active=connector_active,
+            visible_pending=connector_pending,
+            visible_running=connector_running,
+            processing_capacity=0,
+        )
+
     def indexed_document(self, filename: str) -> dict[str, object] | None:
         """Retourne le document durable correspondant exactement au nom fourni."""
         return self.indexed_documents([filename]).get(filename)
@@ -2435,6 +2508,18 @@ class RuntimeState:
         self.reconciliation_restored = 0
         self.reconciliation_lost = 0
         self.reconciliation_error = ""
+        self.openrag_queue_updated_at = 0
+        self.openrag_queue_known = False
+        self.openrag_queue_error = ""
+        self.openrag_connector_backlog = 0
+        self.openrag_connector_submitted = 0
+        self.openrag_connector_active = 0
+        self.openrag_connector_pending = 0
+        self.openrag_connector_running = 0
+        self.openrag_visible_active = 0
+        self.openrag_visible_pending = 0
+        self.openrag_visible_running = 0
+        self.openrag_processing_capacity = 0
         self.docling_workers_detected = -1
         self.ingestion_concurrency_effective = 0
         self.worker_detection_success = False
@@ -2604,6 +2689,58 @@ class RuntimeState:
             self.reconciliation_error = _safe_error(error)
             self._notify_changed()
 
+    def openrag_queue_updated(self, snapshot: OpenRAGQueueSnapshot) -> None:
+        with self.changed:
+            values = (
+                snapshot.connector_backlog,
+                snapshot.connector_submitted,
+                snapshot.connector_active,
+                snapshot.connector_pending,
+                snapshot.connector_running,
+                snapshot.visible_active,
+                snapshot.visible_pending,
+                snapshot.visible_running,
+                snapshot.processing_capacity,
+            )
+            previous = (
+                self.openrag_connector_backlog,
+                self.openrag_connector_submitted,
+                self.openrag_connector_active,
+                self.openrag_connector_pending,
+                self.openrag_connector_running,
+                self.openrag_visible_active,
+                self.openrag_visible_pending,
+                self.openrag_visible_running,
+                self.openrag_processing_capacity,
+            )
+            was_known = self.openrag_queue_known
+            self.openrag_queue_updated_at = int(time.time())
+            self.openrag_queue_known = True
+            self.openrag_queue_error = ""
+            (
+                self.openrag_connector_backlog,
+                self.openrag_connector_submitted,
+                self.openrag_connector_active,
+                self.openrag_connector_pending,
+                self.openrag_connector_running,
+                self.openrag_visible_active,
+                self.openrag_visible_pending,
+                self.openrag_visible_running,
+                self.openrag_processing_capacity,
+            ) = values
+            if not was_known or values != previous:
+                self._notify_changed()
+
+    def openrag_queue_failed(self, error: Exception) -> None:
+        with self.changed:
+            message = _safe_error(error)
+            changed = self.openrag_queue_known or self.openrag_queue_error != message
+            self.openrag_queue_updated_at = int(time.time())
+            self.openrag_queue_known = False
+            self.openrag_queue_error = message
+            if changed:
+                self._notify_changed()
+
     def cycle_succeeded(self, scan: ScanResult, processed: int) -> None:
         with self.changed:
             self.last_cycle_completed_at = int(time.time())
@@ -2651,6 +2788,18 @@ class RuntimeState:
                 "reconciliation_restored": self.reconciliation_restored,
                 "reconciliation_lost": self.reconciliation_lost,
                 "reconciliation_error": self.reconciliation_error,
+                "openrag_queue_updated_at": self.openrag_queue_updated_at,
+                "openrag_queue_known": self.openrag_queue_known,
+                "openrag_queue_error": self.openrag_queue_error,
+                "openrag_connector_backlog": self.openrag_connector_backlog,
+                "openrag_connector_submitted": self.openrag_connector_submitted,
+                "openrag_connector_active": self.openrag_connector_active,
+                "openrag_connector_pending": self.openrag_connector_pending,
+                "openrag_connector_running": self.openrag_connector_running,
+                "openrag_visible_active": self.openrag_visible_active,
+                "openrag_visible_pending": self.openrag_visible_pending,
+                "openrag_visible_running": self.openrag_visible_running,
+                "openrag_processing_capacity": self.openrag_processing_capacity,
                 "docling_workers_detected": self.docling_workers_detected,
                 "ingestion_concurrency_effective": self.ingestion_concurrency_effective,
                 "worker_detection_success": self.worker_detection_success,
@@ -2910,6 +3059,30 @@ def reconciliation_loop(
             LOG.error("réconciliation OpenRAG en échec: %s", _safe_error(error))
 
 
+def openrag_queue_monitor_loop(
+    config: Config,
+    state: RuntimeState,
+    *,
+    openrag: OpenRAGClient | None = None,
+    stop: threading.Event = STOP,
+    poll_seconds: float = OPENRAG_QUEUE_POLL_SECONDS,
+) -> None:
+    """Maintient une vue légère de la file OpenRAG pour l'interface."""
+    rag_client = openrag or OpenRAGClient(config)
+    while not stop.is_set():
+        try:
+            task_ids = connector_ingesting_task_ids(config)
+            state.openrag_queue_updated(
+                rag_client.queue_snapshot(
+                    task_ids, connector_backlog=selected_queue_pending_count(config)
+                )
+            )
+        except Exception as error:
+            state.openrag_queue_failed(error)
+            LOG.warning("lecture de la file OpenRAG impossible: %s", _safe_error(error))
+        stop.wait(max(1.0, poll_seconds))
+
+
 def _status_counts(
     config: Config, *, selected_only: bool = False
 ) -> dict[str, dict[str, int]]:
@@ -3020,7 +3193,7 @@ STATUS_PAGE_STYLE = """
 *{box-sizing:border-box}html{background:var(--background)}body{margin:0;background:var(--background);color:var(--foreground);font:14px/1.5 Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input{font:inherit}button,input[type=text],input[type=password]{min-height:40px}button{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:1px solid var(--border);border-radius:var(--radius);background:var(--card);color:var(--foreground);padding:9px 14px;font-weight:600;cursor:pointer;transition:background .15s,border-color .15s,transform .05s}button:hover{background:var(--muted)}button:active{transform:translateY(1px)}button:focus-visible,input:focus-visible{outline:2px solid var(--foreground);outline-offset:2px}.primary{border-color:var(--primary);background:var(--primary);color:var(--primary-foreground)}.primary:hover{background:#27272a}.danger-button{border-color:var(--danger);color:var(--danger)}.danger-button:hover{background:var(--danger-soft)}
 .app{min-height:100vh;display:grid;grid-template-rows:64px 1fr;grid-template-columns:224px minmax(0,1fr)}.topbar{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);background:var(--background);padding:0 20px;position:sticky;top:0;z-index:2}.brand{display:flex;align-items:center;gap:10px;font:600 18px/1 ui-monospace,SFMono-Regular,Menlo,monospace}.brand-logo{width:24px;height:22px;fill:currentColor}.connector-chip{border:1px solid var(--border);border-radius:999px;padding:5px 10px;color:var(--muted-foreground);font-size:12px}.sidebar{border-right:1px solid var(--border);background:var(--sidebar);padding:16px}.nav-label{display:block;margin:8px 12px 10px;color:var(--muted-foreground);font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}.nav-item{display:flex;align-items:center;gap:10px;border-radius:var(--radius);padding:11px 12px;background:var(--muted);font-size:13px;font-weight:600}.nav-icon{width:18px;height:18px}.main{min-width:0;padding:32px}.content{max-width:1120px;margin:0 auto}.page-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.eyebrow{margin:0 0 4px;color:var(--muted-foreground);font-size:12px;font-weight:600}.page-heading h1{margin:0;font-size:24px;line-height:1.25;letter-spacing:-.02em}.page-heading p{margin:7px 0 0;color:var(--muted-foreground)}.toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.toolbar form{margin:0}
 .status-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:20px}.stat-card,.card{border:1px solid var(--border);border-radius:var(--radius);background:var(--card);box-shadow:var(--shadow)}.stat-card{padding:16px}.stat-label{display:flex;align-items:center;gap:7px;color:var(--muted-foreground);font-size:12px;font-weight:600}.dot{width:8px;height:8px;border-radius:50%;background:var(--muted-foreground)}.dot.success{background:var(--success)}.dot.warning{background:#f59e0b}.dot.danger{background:var(--danger)}.stat-value{display:block;margin-top:8px;font-size:22px;font-weight:650;letter-spacing:-.03em}.stat-detail{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px}.card{margin-bottom:16px;overflow:hidden}.card-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:18px 20px;border-bottom:1px solid var(--border)}.card-title{margin:0;font-size:15px}.card-description{margin:3px 0 0;color:var(--muted-foreground);font-size:13px}.card-body{padding:20px}.card-footer{display:flex;justify-content:flex-end;padding:14px 20px;border-top:1px solid var(--border);background:var(--sidebar)}.badge{display:inline-flex;align-items:center;border-radius:999px;background:var(--muted);padding:3px 8px;color:var(--muted-foreground);font-size:11px;font-weight:600}.badge.success{background:var(--success-soft);color:var(--success)}.badge.warning{background:var(--warning-soft);color:var(--warning)}.badge.danger{background:var(--danger-soft);color:var(--danger)}
-.inventory-row{display:flex;align-items:center;gap:12px}.inventory-status{display:block;width:100%;min-height:24px;font-weight:600}.inventory-status.running{color:var(--success)}.progress-wrap{margin-top:12px}.progress-track{height:10px;overflow:hidden;border-radius:999px;background:var(--muted)}.progress-bar{height:100%;width:0;border-radius:inherit;background:var(--success);transition:width .25s ease}.progress-bar.indeterminate{width:35%;animation:progress-slide 1.2s ease-in-out infinite}.progress-label{display:block;margin-top:5px;color:var(--muted-foreground);font-size:12px;text-align:right}@keyframes progress-slide{0%{transform:translateX(-110%)}100%{transform:translateX(300%)}}.helper{margin:10px 0 0;color:var(--muted-foreground);font-size:12px}.error-alert{display:flex;gap:10px;margin-bottom:16px;border:1px solid #fecaca;border-radius:var(--radius);background:var(--danger-soft);padding:13px 15px;color:#991b1b}.error-alert strong{display:block}.selection-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:320px;overflow:auto}.selection-item{display:flex;align-items:flex-start;gap:11px;margin:0;border:1px solid var(--border);border-radius:var(--radius);padding:12px;cursor:pointer;transition:background .15s,border-color .15s}.selection-item:hover{background:var(--muted)}.selection-item:has(input:checked){border-color:#a1a1aa;background:var(--muted)}.selection-item input{width:16px;height:16px;margin:2px 0 0;accent-color:var(--primary);flex:0 0 auto}.selection-copy{min-width:0}.selection-title{display:block;font-weight:600;overflow-wrap:anywhere}.selection-meta{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px;overflow-wrap:anywhere}.empty{grid-column:1/-1;margin:0;border:1px dashed var(--border);border-radius:var(--radius);padding:22px;text-align:center;color:var(--muted-foreground)}.counts{display:flex;flex-wrap:wrap;gap:6px}.operation-grid,.secret-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.secret-field{display:grid;gap:6px;color:var(--muted-foreground);font-size:12px;font-weight:600}.secret-field input{width:100%;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}.danger-card{border-color:#fecaca}.danger-card .card-header{background:var(--danger-soft)}.confirm-row{display:flex;align-items:end;gap:10px}.confirm-row label{flex:1;margin:0;color:var(--muted-foreground);font-size:12px;font-weight:600}.confirm-row input{display:block;width:100%;margin-top:6px;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}code{border-radius:4px;background:var(--muted);padding:2px 5px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.footer-note{padding:8px 0 24px;text-align:center;color:var(--muted-foreground);font-size:12px}
+.inventory-row{display:flex;align-items:center;gap:12px}.inventory-status{display:block;width:100%;min-height:24px;font-weight:600}.inventory-status.running{color:var(--success)}.queue-monitor{margin-top:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--sidebar);padding:14px}.queue-monitor .progress-wrap{margin-top:9px}.progress-wrap{margin-top:12px}.progress-track{height:10px;overflow:hidden;border-radius:999px;background:var(--muted)}.progress-bar{height:100%;width:0;border-radius:inherit;background:var(--success);transition:width .25s ease}.progress-bar.indeterminate{width:35%;animation:progress-slide 1.2s ease-in-out infinite}.progress-label{display:block;margin-top:5px;color:var(--muted-foreground);font-size:12px;text-align:right}@keyframes progress-slide{0%{transform:translateX(-110%)}100%{transform:translateX(300%)}}.helper{margin:10px 0 0;color:var(--muted-foreground);font-size:12px}.error-alert{display:flex;gap:10px;margin-bottom:16px;border:1px solid #fecaca;border-radius:var(--radius);background:var(--danger-soft);padding:13px 15px;color:#991b1b}.error-alert strong{display:block}.selection-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:320px;overflow:auto}.selection-item{display:flex;align-items:flex-start;gap:11px;margin:0;border:1px solid var(--border);border-radius:var(--radius);padding:12px;cursor:pointer;transition:background .15s,border-color .15s}.selection-item:hover{background:var(--muted)}.selection-item:has(input:checked){border-color:#a1a1aa;background:var(--muted)}.selection-item input{width:16px;height:16px;margin:2px 0 0;accent-color:var(--primary);flex:0 0 auto}.selection-copy{min-width:0}.selection-title{display:block;font-weight:600;overflow-wrap:anywhere}.selection-meta{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px;overflow-wrap:anywhere}.empty{grid-column:1/-1;margin:0;border:1px dashed var(--border);border-radius:var(--radius);padding:22px;text-align:center;color:var(--muted-foreground)}.counts{display:flex;flex-wrap:wrap;gap:6px}.operation-grid,.secret-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.secret-field{display:grid;gap:6px;color:var(--muted-foreground);font-size:12px;font-weight:600}.secret-field input{width:100%;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}.danger-card{border-color:#fecaca}.danger-card .card-header{background:var(--danger-soft)}.confirm-row{display:flex;align-items:end;gap:10px}.confirm-row label{flex:1;margin:0;color:var(--muted-foreground);font-size:12px;font-weight:600}.confirm-row input{display:block;width:100%;margin-top:6px;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}code{border-radius:4px;background:var(--muted);padding:2px 5px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.footer-note{padding:8px 0 24px;text-align:center;color:var(--muted-foreground);font-size:12px}
 .reconciliation-row{display:flex;align-items:center;justify-content:space-between;gap:16px}.reconciliation-row form{flex:0 0 auto}.section-rule{margin:18px 0;border:0;border-top:1px solid var(--border)}.retry-tabs{position:relative}.tab-toggle{position:absolute;opacity:0;pointer-events:none}.tab-label{display:inline-flex;margin:0 6px 14px 0;border:1px solid var(--border);border-radius:999px;padding:7px 12px;color:var(--muted-foreground);cursor:pointer;font-weight:600}.tab-panel{display:none}.retry-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px}.retry-select-all{display:flex;align-items:center;gap:8px;color:var(--muted-foreground);font-size:12px}.retry-select-all input{width:16px;height:16px;accent-color:var(--primary)}#retry-tab-lost:checked~label[for="retry-tab-lost"],#retry-tab-failed:checked~label[for="retry-tab-failed"]{border-color:var(--primary);background:var(--primary);color:var(--primary-foreground)}#retry-tab-lost:checked~.tab-panels>#retry-panel-lost,#retry-tab-failed:checked~.tab-panels>#retry-panel-failed{display:block}
 @media(prefers-color-scheme:dark){:root{--background:#18181b;--foreground:#fafafa;--muted:#27272a;--muted-foreground:#a1a1aa;--border:#3f3f46;--card:#18181b;--sidebar:#111113;--primary:#fafafa;--primary-foreground:#09090b;--danger:#f87171;--danger-soft:#2b1719;--success:#34d399;--success-soft:#10251e;--warning:#fbbf24;--warning-soft:#2b2414;--shadow:none}.primary:hover{background:#e4e4e7}.danger-card,.error-alert{border-color:#7f1d1d}.danger-card .card-header{background:var(--danger-soft)}.error-alert{color:#fecaca}.selection-item:has(input:checked){border-color:#71717a}}
 @media(max-width:900px){.app{grid-template-columns:1fr;grid-template-rows:64px auto 1fr}.sidebar{border-right:0;border-bottom:1px solid var(--border);padding:8px 16px}.nav-label{display:none}.nav-item{width:max-content;padding:8px 12px}.main{padding:24px 18px}.status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.operation-grid,.secret-grid{grid-template-columns:1fr}}
@@ -3064,6 +3237,22 @@ def render_live_status(state: RuntimeState) -> str:
             "reconciliation_restored": int(snapshot["reconciliation_restored"]),
             "reconciliation_lost": int(snapshot["reconciliation_lost"]),
             "reconciliation_error": str(snapshot["reconciliation_error"] or ""),
+            "openrag_queue_updated_at": int(snapshot["openrag_queue_updated_at"]),
+            "openrag_queue_known": bool(snapshot["openrag_queue_known"]),
+            "openrag_queue_error": str(snapshot["openrag_queue_error"] or ""),
+            "openrag_connector_backlog": int(snapshot["openrag_connector_backlog"]),
+            "openrag_connector_submitted": int(
+                snapshot["openrag_connector_submitted"]
+            ),
+            "openrag_connector_active": int(snapshot["openrag_connector_active"]),
+            "openrag_connector_pending": int(snapshot["openrag_connector_pending"]),
+            "openrag_connector_running": int(snapshot["openrag_connector_running"]),
+            "openrag_visible_active": int(snapshot["openrag_visible_active"]),
+            "openrag_visible_pending": int(snapshot["openrag_visible_pending"]),
+            "openrag_visible_running": int(snapshot["openrag_visible_running"]),
+            "openrag_processing_capacity": int(
+                snapshot["openrag_processing_capacity"]
+            ),
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -3084,6 +3273,11 @@ UI_SCRIPT = r"""(() => {
   const progressLabel = document.getElementById("cycle-progress-label");
   const cycleTitle = document.getElementById("cycle-card-title");
   const cycleDescription = document.getElementById("cycle-card-description");
+  const openragQueueDot = document.getElementById("openrag-queue-dot");
+  const openragQueueSummary = document.getElementById("openrag-queue-summary");
+  const openragQueueProgress = document.getElementById("openrag-queue-progress");
+  const openragQueueBar = document.getElementById("openrag-queue-progress-bar");
+  const openragQueueDetail = document.getElementById("openrag-queue-detail");
   const reconciliationButton = document.getElementById("reconciliation-button");
   const reconciliationStatus = document.getElementById("reconciliation-status");
   const reconciliationDetail = document.getElementById("reconciliation-detail");
@@ -3199,6 +3393,23 @@ UI_SCRIPT = r"""(() => {
           progressWrap.removeAttribute("aria-valuemax");
           progressWrap.removeAttribute("aria-valuenow");
         }
+      }
+      if (openragQueueSummary && openragQueueProgress && openragQueueBar && openragQueueDetail) {
+        const known = Boolean(status.openrag_queue_known);
+        const pending = Number(status.openrag_visible_pending || 0);
+        const running = Number(status.openrag_visible_running || 0);
+        const total = pending + running;
+        openragQueueSummary.textContent = known ?
+          `${status.openrag_connector_backlog} restant(s) côté connecteur · ${pending} pending du connecteur dans OpenRAG` :
+          "File OpenRAG indisponible";
+        openragQueueDetail.textContent = known ?
+          `${status.openrag_connector_submitted} soumise(s) localement · ${status.openrag_connector_active} active(s) · ${running} fichier(s) en exécution · file OpenRAG globale non exposée` :
+          (status.openrag_queue_error || "Mesure en attente");
+        if (openragQueueDot) openragQueueDot.className = "dot " + (known ? "success" : "warning");
+        openragQueueBar.classList.toggle("indeterminate", !known);
+        openragQueueBar.style.width = known && total > 0 ? Math.min(100, running * 100 / total) + "%" : "";
+        openragQueueProgress.setAttribute("aria-valuemax", String(total));
+        openragQueueProgress.setAttribute("aria-valuenow", String(running));
       }
       const reconciling = Boolean(status.reconciliation_in_progress);
       const reconciliationRequested = Boolean(status.reconciliation_requested);
@@ -3478,6 +3689,24 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
         if current_stage == "ingestion"
         else "État du cycle de découverte des sources et dossiers."
     )
+    queue_known = bool(snapshot["openrag_queue_known"])
+    queue_pending = int(snapshot["openrag_visible_pending"])
+    queue_running = int(snapshot["openrag_visible_running"])
+    queue_total = queue_pending + queue_running
+    queue_width = round(queue_running * 100 / queue_total) if queue_total else 0
+    if queue_known:
+        queue_summary = (
+            f'{int(snapshot["openrag_connector_backlog"])} restant(s) côté connecteur · '
+            f"{queue_pending} pending du connecteur dans OpenRAG"
+        )
+        queue_detail = (
+            f'{int(snapshot["openrag_connector_submitted"])} soumise(s) localement · '
+            f'{int(snapshot["openrag_connector_active"])} active(s) · '
+            f"{queue_running} fichier(s) en exécution · file OpenRAG globale non exposée"
+        )
+    else:
+        queue_summary = "File OpenRAG indisponible"
+        queue_detail = str(snapshot["openrag_queue_error"] or "Mesure en attente")
     reconciliation_active = bool(
         snapshot["reconciliation_requested_at"]
         or snapshot["reconciliation_in_progress"]
@@ -3537,6 +3766,7 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 <section class="card"><div class="card-header"><div><h2 id="cycle-card-title" class="card-title">{cycle_title}</h2><p id="cycle-card-description" class="card-description">{cycle_description}</p></div><span id="inventory-badge" class="badge {inventory_class}">{inventory_activity}</span></div>
 <div class="card-body"><div class="inventory-row"><span id="inventory-dot" class="dot {inventory_class}"></span><span id="inventory-summary" class="inventory-status" role="status" aria-live="polite" aria-busy="{str(inventory_running).lower()}">{html.escape(inventory_status(snapshot))}</span></div>
 <div id="cycle-progress" class="progress-wrap" role="progressbar" aria-label="Progression du cycle" hidden><div class="progress-track"><div id="cycle-progress-bar" class="progress-bar"></div></div><span id="cycle-progress-label" class="progress-label">Préparation…</span></div>
+<div id="openrag-queue" class="queue-monitor"><div class="inventory-row"><span id="openrag-queue-dot" class="dot {'success' if queue_known else 'warning'}"></span><strong id="openrag-queue-summary">{html.escape(queue_summary)}</strong></div><div id="openrag-queue-progress" class="progress-wrap" role="progressbar" aria-label="État de la file OpenRAG" aria-valuemin="0" aria-valuemax="{queue_total}" aria-valuenow="{queue_running}"><div class="progress-track"><div id="openrag-queue-progress-bar" class="progress-bar {'indeterminate' if not queue_known else ''}" style="width:{queue_width}%"></div></div><span id="openrag-queue-detail" class="progress-label">{html.escape(queue_detail)}</span></div></div>
 <p id="inventory-completion" class="helper" role="status" hidden></p>
 <p id="inventory-cache-label" class="helper">{html.escape(inventory_cache_label)}</p>
 <p class="helper">Les archives sont traitées comme un instantané stable. Utilisez « Relancer l’inventaire » pour rechercher explicitement de nouveaux éléments.</p>
@@ -3867,6 +4097,13 @@ def main() -> None:
         daemon=True,
     )
     reconciliation_worker.start()
+    queue_monitor_worker = threading.Thread(
+        target=openrag_queue_monitor_loop,
+        args=(config, state),
+        name="openrag-queue-monitor",
+        daemon=True,
+    )
+    queue_monitor_worker.start()
     server = ThreadingHTTPServer(
         (config.http_host, config.http_port), make_http_handler(config, state)
     )
@@ -3882,6 +4119,7 @@ def main() -> None:
         server.server_close()
         worker.join(timeout=5)
         reconciliation_worker.join(timeout=5)
+        queue_monitor_worker.join(timeout=5)
 
 
 if __name__ == "__main__":

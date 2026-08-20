@@ -1107,6 +1107,41 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                     )
                 )
 
+    def test_openrag_queue_snapshot_separates_connector_from_visible_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            client = connector.OpenRAGClient(config)
+            tasks = {
+                "connector-pending": {"status": "pending", "pending_files": 1, "running_files": 0},
+                "connector-running": {"status": "running", "pending_files": 0, "running_files": 1},
+            }
+            with mock.patch.object(client, "task", side_effect=lambda task_id, **_: tasks.get(task_id, {"status": "completed"})):
+                snapshot = client.queue_snapshot(
+                    {"connector-pending", "connector-running", "unknown-local"}
+                )
+            self.assertEqual(
+                snapshot,
+                connector.OpenRAGQueueSnapshot(0, 3, 2, 1, 1, 2, 1, 1, 0),
+            )
+
+    def test_openrag_queue_state_is_rendered_in_page_and_live_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            state = connector.RuntimeState()
+            state.openrag_queue_updated(
+                connector.OpenRAGQueueSnapshot(13752, 6, 6, 2, 4, 6, 2, 4, 4)
+            )
+            page = connector.render_status_page(config, state)
+            self.assertIn("13752 restant(s) côté connecteur", page)
+            self.assertIn("2 pending du connecteur dans OpenRAG", page)
+            self.assertIn('id="openrag-queue-progress"', page)
+            status = json.loads(connector.render_live_status(state))
+            self.assertTrue(status["openrag_queue_known"])
+            self.assertEqual(status["openrag_connector_backlog"], 13752)
+            self.assertEqual(status["openrag_connector_pending"], 2)
+            self.assertEqual(status["openrag_visible_pending"], 2)
+            self.assertEqual(status["openrag_visible_running"], 4)
+
     def test_reconciliation_restores_found_and_marks_missing_validated_lost(self):
         class ReconciliationOpenRAG:
             def __init__(self, documents):
