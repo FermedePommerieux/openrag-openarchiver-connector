@@ -516,30 +516,30 @@ def connect_db(config: Config) -> sqlite3.Connection:
                     """,
                     (filename, row["id"]),
                 )
+            attachment_parents: dict[str, tuple[str, str]] = {}
+            for parent in db.execute(
+                """
+                SELECT ea.attachment_id, e.id AS email_id, e.subject
+                FROM email_attachments ea
+                JOIN emails e ON e.id=ea.email_id
+                ORDER BY e.first_seen_at, e.id
+                """
+            ):
+                attachment_parents.setdefault(
+                    str(parent["attachment_id"]),
+                    (str(parent["email_id"]), str(parent["subject"])),
+                )
             for row in db.execute(
-                """
-                SELECT a.id, a.filename, a.openrag_filename, a.status,
-                       COALESCE((
-                           SELECT ea.email_id
-                           FROM email_attachments ea
-                           WHERE ea.attachment_id=a.id
-                           ORDER BY ea.email_id LIMIT 1
-                       ), '') AS email_id,
-                       COALESCE((
-                           SELECT e.subject
-                           FROM email_attachments ea
-                           JOIN emails e ON e.id=ea.email_id
-                           WHERE ea.attachment_id=a.id
-                           ORDER BY e.id LIMIT 1
-                       ), '') AS mail_subject
-                FROM attachments a
-                """
+                "SELECT id, filename, openrag_filename, status FROM attachments"
             ).fetchall():
+                email_id, mail_subject = attachment_parents.get(
+                    str(row["id"]), ("", "")
+                )
                 filename = attachment_openrag_filename(
                     str(row["id"]),
                     str(row["filename"]),
-                    str(row["mail_subject"]),
-                    str(row["email_id"]),
+                    mail_subject,
+                    email_id,
                 )
                 if filename == str(row["openrag_filename"]):
                     continue
