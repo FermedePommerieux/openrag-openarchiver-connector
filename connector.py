@@ -3203,6 +3203,7 @@ UI_SCRIPT = r"""(() => {
       const reconciling = Boolean(status.reconciliation_in_progress);
       const reconciliationRequested = Boolean(status.reconciliation_requested);
       const reconciliationActive = reconciling || reconciliationRequested;
+      const reconciliationCompleted = Boolean(status.reconciliation_completed_at);
       observedReconciliation = observedReconciliation || reconciliationActive;
       if (reconciliationButton) {
         reconciliationButton.disabled = reconciliationActive;
@@ -3213,12 +3214,15 @@ UI_SCRIPT = r"""(() => {
       if (reconciliationStatus) {
         reconciliationStatus.textContent = reconciling ? "Réconciliation en cours…" :
           (reconciliationRequested ? "Réconciliation demandée…" :
-            (status.reconciliation_error ? "Réconciliation interrompue" : "Réconciliation terminée"));
+            (status.reconciliation_error ? "Réconciliation interrompue" :
+              (reconciliationCompleted ? "Réconciliation terminée" : "Aucune réconciliation lancée")));
       }
       if (reconciliationDetail) {
         reconciliationDetail.textContent = status.reconciliation_error ||
           (reconciliationActive ? "Comparaison des connaissances locales avec OpenRAG." :
-            `${status.reconciliation_current} vérifié(s) · ${status.reconciliation_restored} restauré(s) · ${status.reconciliation_lost} perdu(s) détecté(s)`);
+            (reconciliationCompleted ?
+              `${status.reconciliation_current} vérifié(s) · ${status.reconciliation_restored} restauré(s) · ${status.reconciliation_lost} perdu(s) détecté(s)` :
+              "Le scan compare les documents validés, lost et failed avec les chunks OpenRAG."));
       }
       if (reconciliationProgress && reconciliationBar && reconciliationLabel) {
         const current = Number(status.reconciliation_current || 0);
