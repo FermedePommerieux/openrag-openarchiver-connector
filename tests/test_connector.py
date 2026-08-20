@@ -433,25 +433,36 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             ):
                 self.assertEqual(connector.effective_ingestion_concurrency(config), 2)
 
-    def test_secret_rotation_is_atomic_private_and_never_rendered(self):
+    def test_secret_rotation_is_atomic_and_only_renders_safe_prefixes(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
+            openarchiver_key = "oa_live_1234567890_secret_suffix"
+            openrag_key = "orag_abcdefghijk_secret_suffix"
             connector.write_secret(
-                config.openarchiver_api_key_file, "nouvelle-cle-oa", "OpenArchiver"
+                config.openarchiver_api_key_file, openarchiver_key, "OpenArchiver"
             )
             connector.write_secret(
-                config.openrag_api_key_file, "nouvelle-cle-rag", "OpenRAG"
+                config.openrag_api_key_file, openrag_key, "OpenRAG"
             )
             self.assertEqual(
                 connector.read_secret(config.openarchiver_api_key_file, "OpenArchiver"),
-                "nouvelle-cle-oa",
+                openarchiver_key,
             )
             self.assertEqual(config.openarchiver_api_key_file.stat().st_mode & 0o777, 0o600)
             page = connector.render_status_page(config, connector.RuntimeState())
             self.assertIn("OpenArchiver : Configurée", page)
             self.assertIn("OpenRAG : Configurée", page)
-            self.assertNotIn("nouvelle-cle-oa", page)
-            self.assertNotIn("nouvelle-cle-rag", page)
+            self.assertIn("oa_live_1234...", page)
+            self.assertIn("orag_abcdefg...", page)
+            self.assertNotIn(openarchiver_key, page)
+            self.assertNotIn(openrag_key, page)
+            self.assertNotIn("secret_suffix", page)
+
+    def test_short_secret_prefix_always_masks_the_last_four_characters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "api-key"
+            path.write_text("short-key", encoding="utf-8")
+            self.assertEqual(connector.secret_display_prefix(path), "short")
 
     def test_rejects_non_internal_or_non_http_urls(self):
         invalid = (

@@ -266,7 +266,9 @@ clés techniques.
 Actions POST : `/sources`, `/mailboxes`, `/scan`, `/pause`, `/retry`,
 `/reconcile` et `/secrets`. Elles exigent toutes le jeton CSRF de la
 page. Les clés saisies sont écrites atomiquement dans `/state/secrets`, jamais
-enregistrées dans SQLite ni écrites dans les logs.
+enregistrées dans SQLite ni écrites dans les logs. Comme dans OpenRAG,
+l'interface n'affiche que leurs 12 premiers caractères suivis de `...` et
+masque toujours au moins les quatre derniers caractères.
 
 ## Configuration de production
 
