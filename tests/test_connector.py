@@ -177,6 +177,7 @@ class ConnectorTests(unittest.TestCase):
                 "SUPPORTED_EXTENSIONS": "pdf,XLSX",
                 "INGESTION_CONCURRENCY": "9",
                 "INGESTION_CONCURRENCY_MAX": "3",
+                "INGESTION_LARGE_OBJECT_BYTES": "12345",
             }
             loaded = connector.Config.from_env(env)
             self.assertEqual(
@@ -188,6 +189,7 @@ class ConnectorTests(unittest.TestCase):
             )
             self.assertEqual(loaded.supported_extensions, frozenset({".pdf", ".xlsx"}))
             self.assertEqual(loaded.ingestion_concurrency, 3)
+            self.assertEqual(loaded.large_object_bytes, 12345)
             self.assertEqual(
                 loaded.openarchiver_base_url,
                 "http://openarchiver-api.openarchiver.svc.cluster.local:4000/v1",
@@ -208,6 +210,7 @@ class ConnectorTests(unittest.TestCase):
             self.assertIsNone(defaults.ingestion_concurrency)
             self.assertEqual(defaults.ingestion_concurrency_fallback, 2)
             self.assertEqual(defaults.ingestion_concurrency_max, 8)
+            self.assertEqual(defaults.large_object_bytes, 10_485_760)
             self.assertEqual(defaults.ingestion_prefetch_per_worker, 2)
             self.assertEqual(
                 defaults.docling_metrics_url,
@@ -2129,6 +2132,10 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
         self.assertIn("name: INGESTION_CONCURRENCY\n              value: auto", deployment)
         self.assertIn("name: INGESTION_CONCURRENCY_FALLBACK", deployment)
         self.assertIn(
+            'name: INGESTION_LARGE_OBJECT_BYTES\n              value: "10485760"',
+            deployment,
+        )
+        self.assertIn(
             'name: INGESTION_PREFETCH_PER_WORKER\n              value: "2"', deployment
         )
         self.assertIn("name: DOCLING_METRICS_URL", deployment)
@@ -2635,6 +2642,76 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             for thread in threads:
                 thread.join()
             self.assertEqual(sum(result is not None for result in results), 1)
+
+    def test_large_object_waits_for_active_small_object(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory), large_object_bytes=100)
+            self._insert_email(config, self.mail("small", sizeBytes=99))
+            small = connector.claim_next(config, now=1)
+            self.assertEqual(small.object_id, "small")
+            self._insert_email(config, self.mail("large", sizeBytes=100))
+
+            self.assertIsNone(connector.claim_next(config, now=1))
+            connector._set_object_state(
+                config, "email", "small", "status='validated'", ()
+            )
+            large = connector.claim_next(config, now=1)
+            self.assertEqual(large.object_id, "large")
+
+    def test_active_large_object_blocks_small_claims(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory), large_object_bytes=100)
+            self._insert_email(config, self.mail("large", sizeBytes=100))
+            large = connector.claim_next(config, now=1)
+            self.assertEqual(large.object_id, "large")
+            self._insert_email(config, self.mail("small", sizeBytes=99))
+
+            self.assertIsNone(connector.claim_next(config, now=1))
+            connector._set_object_state(
+                config, "email", "large", "status='validated'", ()
+            )
+            small = connector.claim_next(config, now=1)
+            self.assertEqual(small.object_id, "small")
+
+    def test_process_queue_serializes_large_then_parallelizes_small_objects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(
+                Path(directory),
+                large_object_bytes=100,
+                ingestion_concurrency=2,
+                ingestion_concurrency_max=2,
+            )
+            self._insert_email(config, self.mail("small-1", sizeBytes=10))
+            self._insert_email(config, self.mail("large", sizeBytes=100))
+            self._insert_email(config, self.mail("small-2", sizeBytes=10))
+            active = set()
+            lock = threading.Lock()
+            large_overlap = []
+            max_small_active = 0
+
+            def process(_config, item, _openarchiver, _openrag):
+                nonlocal max_small_active
+                with lock:
+                    active.add(item.object_id)
+                    if item.object_id == "large":
+                        large_overlap.append(len(active))
+                    else:
+                        max_small_active = max(max_small_active, len(active))
+                time.sleep(0.05)
+                connector._set_object_state(
+                    config, "email", item.object_id, "status='validated'", ()
+                )
+                with lock:
+                    active.remove(item.object_id)
+
+            with mock.patch.object(
+                connector, "OPENRAG_TASK_POLL_SECONDS", 0.01
+            ), mock.patch.object(connector, "process_work_item", side_effect=process):
+                processed = connector.process_queue(config, mock.Mock(), mock.Mock())
+
+            self.assertEqual(processed, 3)
+            self.assertEqual(large_overlap, [1])
+            self.assertEqual(max_small_active, 2)
 
     def test_no_automatic_delete_and_logs_exclude_keys_and_bodies(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
