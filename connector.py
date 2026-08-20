@@ -1,14 +1,21 @@
-"""Cœur du connecteur OpenArchiver vers le dossier d'ingestion OpenRAG.
+"""Connecteur d'inventaire et d'ingestion OpenArchiver vers OpenRAG.
 
-Le connecteur conserve son inventaire, ses sélections, ses reprises et son
-rate limiting dans SQLite. Pour l'ingestion, il dépose désormais les messages
-originaux ``.eml`` et les pièces jointes compatibles dans le volume partagé,
-par renommage atomique, puis déclenche l'API ``ingest-path`` d'OpenRAG.
+Le connecteur orchestre quatre responsabilités, sans modifier OpenRAG :
 
-OpenRAG reste ainsi seul responsable du traitement et, lorsque l'archivage est
-activé dans Settings > Archiving, du déplacement de la source vers son archive
-authentifiée. En mode multi-utilisateur, le refus du chemin local déclenche un
-repli vers l'upload multipart, avec une ``source_url`` distante facultative.
+1. inventorier les sources, dossiers, mails et pièces jointes d'OpenArchiver ;
+2. conserver les sélections et l'état de reprise dans une base SQLite locale ;
+3. soumettre les fichiers originaux à l'API d'ingestion OpenRAG ;
+4. valider et réconcilier le résultat avec les chunks durables d'OpenRAG.
+
+Le chemin normal en production est l'upload multipart (``OPENRAG_INGEST_MODE=api``).
+Chaque worker télécharge un fichier dans le volume partagé, calcule son SHA-256,
+le soumet, attend la fin de la tâche OpenRAG, puis vérifie que ``/v2/files`` expose
+au moins un chunk portant l'identifiant dérivé de ce SHA-256. Le statut local ne
+passe à ``validated`` qu'après cette dernière preuve.
+
+Ce module reste volontairement autonome pour être monté depuis une ConfigMap.
+Le guide d'architecture, les états et les procédures d'exploitation sont dans
+le fichier ``README.md`` situé à côté de ce module.
 """
 
 from __future__ import annotations
@@ -77,6 +84,11 @@ OPENRAG_QUEUE_POLL_SECONDS = 5
 OPENRAG_TASK_POLL_SECONDS = 0.25
 
 
+# ---------------------------------------------------------------------------
+# Configuration et types du domaine
+# ---------------------------------------------------------------------------
+
+
 class ConnectorError(RuntimeError):
     """Erreur contrôlée dont le message ne contient ni secret ni contenu."""
 
@@ -121,6 +133,8 @@ class OpenRAGQueueSnapshot:
 
 @dataclass(frozen=True)
 class Config:
+    """Configuration immuable chargée depuis les variables du Deployment."""
+
     openarchiver_base_url: str
     openarchiver_api_key_file: Path
     openrag_base_url: str
@@ -386,8 +400,22 @@ def write_secret(path: Path, value: str, label: str) -> None:
         raise
 
 
+# ---------------------------------------------------------------------------
+# Persistance SQLite, sélection et reprise
+# ---------------------------------------------------------------------------
+
+
 def connect_db(config: Config) -> sqlite3.Connection:
-    """Crée et migre idempotemment l'état local."""
+    """Ouvre SQLite et applique les migrations manquantes une seule fois.
+
+    ``PRAGMA user_version`` est la version du schéma. Une migration doit être
+    idempotente car plusieurs threads peuvent ouvrir la base au démarrage ;
+    ``SCHEMA_LOCK`` sérialise cette phase dans le processus.
+
+    La migration v3 change l'identité visible des connaissances. Elle efface
+    donc le SHA et le ``task_id`` précédents, puis remet chaque objet indexable
+    en file afin qu'OpenRAG reçoive le même contenu sous son nouveau nom.
+    """
     config.state_db.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(config.state_db, timeout=30)
     db.row_factory = sqlite3.Row
@@ -839,7 +867,14 @@ class RateLimiter:
             self.sleeper(delay)
 
 
+# ---------------------------------------------------------------------------
+# Client OpenArchiver et inventaire
+# ---------------------------------------------------------------------------
+
+
 class OpenArchiverClient:
+    """Accès HTTP authentifié à OpenArchiver avec débit et reprises bornés."""
+
     def __init__(
         self,
         config: Config,
@@ -1285,6 +1320,13 @@ def _fingerprint(values: Mapping[str, object], keys: Sequence[str]) -> str:
 
 
 def _upsert_email(db: sqlite3.Connection, email: dict[str, object], now: int) -> None:
+    """Insère un mail ou le remet en file uniquement si son identité a changé.
+
+    Le fingerprint regroupe les métadonnées qui influencent la connaissance.
+    Un inventaire identique conserve donc ``validated`` ; une modification du
+    mail ou de son nom OpenRAG invalide la preuve SHA et relance l'ingestion.
+    """
+
     fingerprint = _fingerprint(
         email,
         (
@@ -1392,6 +1434,8 @@ def _readable_filename_stem(value: str, fallback: str, max_length: int) -> str:
 
 
 def mail_openrag_filename(email_id: str, subject: str = "") -> str:
+    """Construit ``<objet-lisible>--<id-court>.eml`` sans collision d'UUID."""
+
     suffix = f"--{_short_identifier(email_id)}.eml"
     stem = _readable_filename_stem(subject, "mail", 255 - len(suffix))
     return f"{stem}{suffix}"
@@ -1408,6 +1452,8 @@ def attachment_openrag_filename(
     mail_subject: str = "",
     email_id: str = "",
 ) -> str:
+    """Préfixe une pièce jointe par le titre et l'identifiant du mail d'origine."""
+
     extension = safe_attachment_extension(filename)
     source_stem = Path(filename).stem if extension else filename
     suffix = f"--{_short_identifier(attachment_id)}{extension}"
@@ -1428,6 +1474,13 @@ def inventory_attachments(
     *,
     observed_at: int | None = None,
 ) -> list[str]:
+    """Enregistre les pièces jointes découvertes dans le détail d'un mail.
+
+    Une même pièce jointe peut être référencée par plusieurs mails. Le premier
+    parent déjà enregistré reste alors l'origine stable utilisée dans son nom,
+    ce qui évite de renommer la connaissance à chaque nouvel inventaire.
+    """
+
     raw_attachments = detail.get("attachments", [])
     if not isinstance(raw_attachments, list):
         raise ConnectorError("inventaire des pièces jointes invalide")
@@ -1551,6 +1604,11 @@ def inventory_attachments(
             )
             identifiers.append(attachment_id)
     return sorted(identifiers)
+
+
+# ---------------------------------------------------------------------------
+# Transformation facultative du contenu mail
+# ---------------------------------------------------------------------------
 
 
 class _ReadableHTML(HTMLParser):
@@ -1746,7 +1804,14 @@ def deposit_source(
         temporary.unlink(missing_ok=True)
 
 
+# ---------------------------------------------------------------------------
+# Soumission OpenRAG et preuve durable d'indexation
+# ---------------------------------------------------------------------------
+
+
 class OpenRAGClient:
+    """Client minimal des API de tâche, d'ingestion et de connaissances OpenRAG."""
+
     def __init__(
         self, config: Config, *, sleeper: Callable[[float], None] = time.sleep
     ) -> None:
@@ -2191,7 +2256,19 @@ def reconcile_openrag(
     return ReconciliationResult(checked, restored, lost)
 
 
+# ---------------------------------------------------------------------------
+# File locale, transitions d'état et concurrence d'ingestion
+# ---------------------------------------------------------------------------
+
+
 def claim_next(config: Config, *, now: int | None = None) -> WorkItem | None:
+    """Réserve atomiquement le prochain objet éligible de la sélection active.
+
+    ``BEGIN IMMEDIATE`` empêche deux threads de réserver la même ligne. Les
+    objets ``lost`` arrivés à échéance passent avant les nouveaux objets, puis
+    viennent les échecs dont le délai exponentiel est écoulé.
+    """
+
     timestamp = int(time.time()) if now is None else now
     db = connect_db(config)
     try:
@@ -2299,6 +2376,13 @@ def process_work_item(
     openarchiver: OpenArchiverClient,
     openrag: OpenRAGClient,
 ) -> None:
+    """Exécute le cycle complet d'un mail ou d'une pièce jointe réservé.
+
+    La transition nominale est ``downloading -> ingesting -> validated``.
+    Toute exception est convertie en ``failed`` ou ``lost`` et reçoit, tant que
+    la limite n'est pas atteinte, une date de nouvelle tentative.
+    """
+
     try:
         if item.kind == "email":
             with database(config) as db:
@@ -2556,6 +2640,14 @@ def process_queue(
     progress: Callable[[int, int], None] | None = None,
     state: RuntimeState | None = None,
 ) -> int:
+    """Vide la file locale avec la concurrence calculée pour ce cycle.
+
+    Chaque thread ne garde qu'un objet à la fois. En mode automatique, le
+    nombre de threads vaut ``workers Docling x prefetch``, borné par
+    ``INGESTION_CONCURRENCY_MAX``. Aucune heuristique liée à la taille ou à
+    l'OCR n'est appliquée ici.
+    """
+
     workers = effective_ingestion_concurrency(config, state)
     if workers == 0:
         return 0
@@ -2617,6 +2709,11 @@ def selected_mails_validated_last_minute(
             (cutoff,),
         ).fetchone()
     return int(row[0]) if row else 0
+
+
+# ---------------------------------------------------------------------------
+# État mémoire, boucles de fond et cycle métier
+# ---------------------------------------------------------------------------
 
 
 class RuntimeState:
@@ -2966,6 +3063,13 @@ def run_cycle(
     force_inventory: bool = True,
     state: RuntimeState | None = None,
 ) -> tuple[ScanResult, int]:
+    """Construit/réutilise un inventaire valide puis traite la file locale.
+
+    Un scan manuel force l'appel à OpenArchiver. Les cycles suivants peuvent
+    réutiliser le dernier instantané complet : une pagination instable ne doit
+    jamais faire disparaître des objets ni bloquer une file déjà connue.
+    """
+
     report = progress or (lambda _phase, _current=None, _total=None: None)
     cached = cached_inventory(config)
     if force_inventory or cached is None:
@@ -3081,6 +3185,8 @@ def runtime_loop(
     stop: threading.Event = STOP,
     wake: threading.Event = WAKE,
 ) -> None:
+    """Boucle principale : récupération, inventaire, ingestion puis attente."""
+
     archive_client = openarchiver or OpenArchiverClient(config)
     rag_client = openrag or OpenRAGClient(config)
     state.set_running(True)
@@ -3231,6 +3337,11 @@ def openrag_queue_monitor_loop(
             state.openrag_queue_failed(error)
             LOG.warning("lecture de la file OpenRAG impossible: %s", _safe_error(error))
         stop.wait(max(1.0, poll_seconds))
+
+
+# ---------------------------------------------------------------------------
+# Interface d'exploitation, événements SSE et métriques Prometheus
+# ---------------------------------------------------------------------------
 
 
 def _status_counts(
@@ -3988,6 +4099,13 @@ def make_http_handler(
     wake: threading.Event = WAKE,
     reconciliation_wake: threading.Event = RECONCILE_WAKE,
 ) -> type[BaseHTTPRequestHandler]:
+    """Construit le handler HTTP lié à la configuration et à l'état courant.
+
+    Les lectures sont publiques dans le cluster. Chaque mutation POST exige le
+    jeton CSRF rendu dans la page ; les réponses SSE publient uniquement lors
+    d'un changement d'état, avec un keepalive toutes les 15 secondes.
+    """
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "OpenArchiverConnector/1"
 
@@ -4221,6 +4339,8 @@ def make_http_handler(
 
 
 def main() -> None:
+    """Migre la base, démarre les trois workers de fond et sert l'interface."""
+
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(message)s",
