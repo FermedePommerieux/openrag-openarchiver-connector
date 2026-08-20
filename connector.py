@@ -2481,6 +2481,28 @@ def selected_queue_pending_count(config: Config) -> int:
     )
 
 
+def selected_mails_validated_last_minute(
+    config: Config, *, now: int | None = None
+) -> int:
+    """Débit glissant des mails sélectionnés réellement validés."""
+    cutoff = (int(time.time()) if now is None else now) - 60
+    with database(config) as db:
+        row = db.execute(
+            """
+            SELECT COUNT(*) FROM emails e
+            WHERE e.status='validated' AND e.last_success_at>=?
+              AND EXISTS (
+                SELECT 1 FROM sources s
+                JOIN mailboxes m
+                  ON m.source_id=e.source_id AND m.path=e.mailbox_path
+                WHERE s.id=e.source_id AND s.selected=1 AND m.selected=1
+              )
+            """,
+            (cutoff,),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
 class RuntimeState:
     """Petit état mémoire pour les probes et l'interface d'exploitation."""
 
@@ -2524,6 +2546,7 @@ class RuntimeState:
         self.openrag_visible_pending = 0
         self.openrag_visible_running = 0
         self.openrag_processing_capacity = 0
+        self.openrag_mails_per_minute = 0
         self.docling_workers_detected = -1
         self.ingestion_concurrency_effective = 0
         self.worker_detection_success = False
@@ -2693,7 +2716,9 @@ class RuntimeState:
             self.reconciliation_error = _safe_error(error)
             self._notify_changed()
 
-    def openrag_queue_updated(self, snapshot: OpenRAGQueueSnapshot) -> None:
+    def openrag_queue_updated(
+        self, snapshot: OpenRAGQueueSnapshot, *, mails_per_minute: int = 0
+    ) -> None:
         with self.changed:
             values = (
                 snapshot.connector_backlog,
@@ -2705,6 +2730,7 @@ class RuntimeState:
                 snapshot.visible_pending,
                 snapshot.visible_running,
                 snapshot.processing_capacity,
+                max(0, mails_per_minute),
             )
             previous = (
                 self.openrag_connector_backlog,
@@ -2716,6 +2742,7 @@ class RuntimeState:
                 self.openrag_visible_pending,
                 self.openrag_visible_running,
                 self.openrag_processing_capacity,
+                self.openrag_mails_per_minute,
             )
             was_known = self.openrag_queue_known
             self.openrag_queue_updated_at = int(time.time())
@@ -2731,6 +2758,7 @@ class RuntimeState:
                 self.openrag_visible_pending,
                 self.openrag_visible_running,
                 self.openrag_processing_capacity,
+                self.openrag_mails_per_minute,
             ) = values
             if not was_known or values != previous:
                 self._notify_changed()
@@ -2804,6 +2832,7 @@ class RuntimeState:
                 "openrag_visible_pending": self.openrag_visible_pending,
                 "openrag_visible_running": self.openrag_visible_running,
                 "openrag_processing_capacity": self.openrag_processing_capacity,
+                "openrag_mails_per_minute": self.openrag_mails_per_minute,
                 "docling_workers_detected": self.docling_workers_detected,
                 "ingestion_concurrency_effective": self.ingestion_concurrency_effective,
                 "worker_detection_success": self.worker_detection_success,
@@ -3079,7 +3108,8 @@ def openrag_queue_monitor_loop(
             state.openrag_queue_updated(
                 rag_client.queue_snapshot(
                     task_ids, connector_backlog=selected_queue_pending_count(config)
-                )
+                ),
+                mails_per_minute=selected_mails_validated_last_minute(config),
             )
         except Exception as error:
             state.openrag_queue_failed(error)
@@ -3258,6 +3288,7 @@ def render_live_status(state: RuntimeState) -> str:
             "openrag_processing_capacity": int(
                 snapshot["openrag_processing_capacity"]
             ),
+            "openrag_mails_per_minute": int(snapshot["openrag_mails_per_minute"]),
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -3280,8 +3311,6 @@ UI_SCRIPT = r"""(() => {
   const cycleDescription = document.getElementById("cycle-card-description");
   const openragQueueDot = document.getElementById("openrag-queue-dot");
   const openragQueueSummary = document.getElementById("openrag-queue-summary");
-  const openragQueueProgress = document.getElementById("openrag-queue-progress");
-  const openragQueueBar = document.getElementById("openrag-queue-progress-bar");
   const openragQueueDetail = document.getElementById("openrag-queue-detail");
   const reconciliationButton = document.getElementById("reconciliation-button");
   const reconciliationStatus = document.getElementById("reconciliation-status");
@@ -3412,22 +3441,17 @@ UI_SCRIPT = r"""(() => {
           progressWrap.removeAttribute("aria-valuenow");
         }
       }
-      if (openragQueueSummary && openragQueueProgress && openragQueueBar && openragQueueDetail) {
+      if (openragQueueSummary && openragQueueDetail) {
         const known = Boolean(status.openrag_queue_known);
         const pending = Number(status.openrag_visible_pending || 0);
         const running = Number(status.openrag_visible_running || 0);
-        const total = pending + running;
         openragQueueSummary.textContent = known ?
           `${status.openrag_connector_backlog} restant(s) côté connecteur · ${pending} pending du connecteur dans OpenRAG` :
           "File OpenRAG indisponible";
         openragQueueDetail.textContent = known ?
-          `${status.openrag_connector_submitted} soumise(s) localement · ${status.openrag_connector_active} active(s) · ${running} fichier(s) en exécution · file OpenRAG globale non exposée` :
+          `${status.openrag_connector_submitted} soumise(s) localement · ${status.openrag_connector_active} active(s) · ${running} fichier(s) en exécution · ${status.openrag_mails_per_minute} mail(s) validé(s)/min · file OpenRAG globale non exposée` :
           (status.openrag_queue_error || "Mesure en attente");
         if (openragQueueDot) openragQueueDot.className = "dot " + (known ? "success" : "warning");
-        openragQueueBar.classList.toggle("indeterminate", !known);
-        openragQueueBar.style.width = known && total > 0 ? Math.min(100, running * 100 / total) + "%" : "";
-        openragQueueProgress.setAttribute("aria-valuemax", String(total));
-        openragQueueProgress.setAttribute("aria-valuenow", String(running));
       }
       const reconciling = Boolean(status.reconciliation_in_progress);
       const reconciliationRequested = Boolean(status.reconciliation_requested);
@@ -3710,8 +3734,6 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
     queue_known = bool(snapshot["openrag_queue_known"])
     queue_pending = int(snapshot["openrag_visible_pending"])
     queue_running = int(snapshot["openrag_visible_running"])
-    queue_total = queue_pending + queue_running
-    queue_width = round(queue_running * 100 / queue_total) if queue_total else 0
     if queue_known:
         queue_summary = (
             f'{int(snapshot["openrag_connector_backlog"])} restant(s) côté connecteur · '
@@ -3720,7 +3742,9 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
         queue_detail = (
             f'{int(snapshot["openrag_connector_submitted"])} soumise(s) localement · '
             f'{int(snapshot["openrag_connector_active"])} active(s) · '
-            f"{queue_running} fichier(s) en exécution · file OpenRAG globale non exposée"
+            f"{queue_running} fichier(s) en exécution · "
+            f'{int(snapshot["openrag_mails_per_minute"])} mail(s) validé(s)/min · '
+            "file OpenRAG globale non exposée"
         )
     else:
         queue_summary = "File OpenRAG indisponible"
@@ -3784,7 +3808,7 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 <section class="card"><div class="card-header"><div><h2 id="cycle-card-title" class="card-title">{cycle_title}</h2><p id="cycle-card-description" class="card-description">{cycle_description}</p></div><span id="inventory-badge" class="badge {inventory_class}">{inventory_activity}</span></div>
 <div class="card-body"><div class="inventory-row"><span id="inventory-dot" class="dot {inventory_class}"></span><span id="inventory-summary" class="inventory-status" role="status" aria-live="polite" aria-busy="{str(inventory_running).lower()}">{html.escape(inventory_status(snapshot))}</span></div>
 <div id="cycle-progress" class="progress-wrap" role="progressbar" aria-label="Progression du cycle" hidden><div class="progress-track"><div id="cycle-progress-bar" class="progress-bar"></div></div><span id="cycle-progress-label" class="progress-label">Préparation…</span></div>
-<div id="openrag-queue" class="queue-monitor"><div class="inventory-row"><span id="openrag-queue-dot" class="dot {'success' if queue_known else 'warning'}"></span><strong id="openrag-queue-summary">{html.escape(queue_summary)}</strong></div><div id="openrag-queue-progress" class="progress-wrap" role="progressbar" aria-label="État de la file OpenRAG" aria-valuemin="0" aria-valuemax="{queue_total}" aria-valuenow="{queue_running}"><div class="progress-track"><div id="openrag-queue-progress-bar" class="progress-bar {'indeterminate' if not queue_known else ''}" style="width:{queue_width}%"></div></div><span id="openrag-queue-detail" class="progress-label">{html.escape(queue_detail)}</span></div></div>
+<div id="openrag-queue" class="queue-monitor"><div class="inventory-row"><span id="openrag-queue-dot" class="dot {'success' if queue_known else 'warning'}"></span><strong id="openrag-queue-summary">{html.escape(queue_summary)}</strong></div><p id="openrag-queue-detail" class="helper">{html.escape(queue_detail)}</p></div>
 <p id="inventory-completion" class="helper" role="status" hidden></p>
 <p id="inventory-cache-label" class="helper">{html.escape(inventory_cache_label)}</p>
 <p class="helper">Les archives sont traitées comme un instantané stable. Utilisez « Relancer l’inventaire » pour rechercher explicitement de nouveaux éléments.</p>

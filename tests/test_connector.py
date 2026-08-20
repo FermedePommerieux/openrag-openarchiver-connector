@@ -1149,18 +1149,60 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             config = self.config(Path(directory))
             state = connector.RuntimeState()
             state.openrag_queue_updated(
-                connector.OpenRAGQueueSnapshot(13752, 6, 6, 2, 4, 6, 2, 4, 4)
+                connector.OpenRAGQueueSnapshot(13752, 6, 6, 2, 4, 6, 2, 4, 4),
+                mails_per_minute=73,
             )
             page = connector.render_status_page(config, state)
             self.assertIn("13752 restant(s) côté connecteur", page)
             self.assertIn("2 pending du connecteur dans OpenRAG", page)
-            self.assertIn('id="openrag-queue-progress"', page)
+            self.assertNotIn('id="openrag-queue-progress"', page)
+            self.assertIn('id="openrag-queue-detail"', page)
+            self.assertIn("73 mail(s) validé(s)/min", page)
             status = json.loads(connector.render_live_status(state))
             self.assertTrue(status["openrag_queue_known"])
             self.assertEqual(status["openrag_connector_backlog"], 13752)
             self.assertEqual(status["openrag_connector_pending"], 2)
             self.assertEqual(status["openrag_visible_pending"], 2)
             self.assertEqual(status["openrag_visible_running"], 4)
+            self.assertEqual(status["openrag_mails_per_minute"], 73)
+
+    def test_mail_rate_counts_recent_validated_selected_emails_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory), page_limit=10)
+            self.select(config, "source-1")
+            connector.scan_selected_sources(
+                config,
+                FakeArchive(
+                    pages={
+                        ("source-1", 1): {
+                            "items": [
+                                self.mail("recent"),
+                                self.mail("old"),
+                                self.mail("failed"),
+                            ],
+                            "total": 3,
+                        }
+                    }
+                ),
+            )
+            connector.replace_mailbox_selection(config, [("source-1", "INBOX")])
+            with connector.database(config) as db:
+                db.execute(
+                    "UPDATE emails SET status='validated', last_success_at=980 "
+                    "WHERE id='recent'"
+                )
+                db.execute(
+                    "UPDATE emails SET status='validated', last_success_at=939 "
+                    "WHERE id='old'"
+                )
+                db.execute(
+                    "UPDATE emails SET status='failed', last_success_at=990 "
+                    "WHERE id='failed'"
+                )
+
+            self.assertEqual(
+                connector.selected_mails_validated_last_minute(config, now=1000), 1
+            )
 
     def test_reconciliation_restores_found_and_marks_missing_validated_lost(self):
         class ReconciliationOpenRAG:
