@@ -318,6 +318,12 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                 email_columns = {
                     row["name"] for row in db.execute("PRAGMA table_info(emails)")
                 }
+                indexes = {
+                    row[0]
+                    for row in db.execute(
+                        "SELECT name FROM sqlite_master WHERE type='index'"
+                    )
+                }
                 db.close()
             self.assertTrue(
                 {
@@ -332,6 +338,14 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             )
             self.assertIn("sha256", email_columns)
             self.assertIn("mailbox_path", email_columns)
+            self.assertTrue(
+                {
+                    "emails_mailbox_status",
+                    "emails_mailbox_attachments",
+                    "email_attachments_by_attachment",
+                }
+                <= indexes
+            )
             version_db = connector.connect_db(config)
             try:
                 self.assertEqual(
@@ -1667,6 +1681,29 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
         self.assertIn("pas encore détaillées", page)
         self.assertIn("Historique local conservé : 2 mail(s)", page)
         self.assertIn("Les éléments hors sélection ne sont pas envoyés", page)
+
+    def test_selected_attachment_counts_shared_attachment_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            self._insert_email(config, self.mail("mail-1"))
+            self._insert_email(config, self.mail("mail-2"))
+            detail = {
+                "attachments": [
+                    {
+                        "id": "shared",
+                        "filename": "shared.pdf",
+                        "mimeType": "application/pdf",
+                        "sizeBytes": 10,
+                        "storagePath": "att/shared",
+                    }
+                ]
+            }
+            connector.inventory_attachments(config, "mail-1", detail)
+            connector.inventory_attachments(config, "mail-2", detail)
+
+            counts = connector._status_counts(config, selected_only=True)
+
+        self.assertEqual(counts["attachments"]["queued"], 1)
 
     def test_last_cycle_is_restored_after_restart(self):
         with tempfile.TemporaryDirectory() as directory:

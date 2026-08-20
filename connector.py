@@ -66,7 +66,7 @@ RQ_WORKER_METRIC = re.compile(
 PROMETHEUS_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
 STOP = threading.Event()
 WAKE = threading.Event()
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SCHEMA_LOCK = threading.Lock()
 
 
@@ -462,6 +462,18 @@ def connect_db(config: Config) -> sqlite3.Connection:
             db.execute(
                 "ALTER TABLE emails ADD COLUMN mailbox_path TEXT NOT NULL DEFAULT ''"
             )
+        db.execute(
+            """CREATE INDEX IF NOT EXISTS emails_mailbox_status
+               ON emails(source_id, mailbox_path, status)"""
+        )
+        db.execute(
+            """CREATE INDEX IF NOT EXISTS emails_mailbox_attachments
+               ON emails(source_id, mailbox_path, has_attachments)"""
+        )
+        db.execute(
+            """CREATE INDEX IF NOT EXISTS email_attachments_by_attachment
+               ON email_attachments(attachment_id, email_id)"""
+        )
         db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES ('paused','0')")
         db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         db.commit()
@@ -2470,31 +2482,34 @@ def _status_counts(
 ) -> dict[str, dict[str, int]]:
     result: dict[str, dict[str, int]] = {"emails": {}, "attachments": {}}
     with database(config) as db:
-        for table in result:
-            selection_clause = ""
-            if selected_only and table == "emails":
-                selection_clause = """WHERE EXISTS (
-                    SELECT 1 FROM sources s
-                    JOIN mailboxes m
-                      ON m.source_id=emails.source_id
-                     AND m.path=emails.mailbox_path
-                    WHERE s.id=emails.source_id
-                      AND s.selected=1 AND m.selected=1
-                )"""
-            elif selected_only:
-                selection_clause = """WHERE EXISTS (
-                    SELECT 1 FROM email_attachments ea
-                    JOIN emails e ON e.id=ea.email_id
-                    JOIN sources s ON s.id=e.source_id
-                    JOIN mailboxes m
-                      ON m.source_id=e.source_id AND m.path=e.mailbox_path
-                    WHERE ea.attachment_id=attachments.id
-                      AND s.selected=1 AND m.selected=1
-                )"""
-            for row in db.execute(
-                f"""SELECT status, COUNT(*) AS count FROM {table}
-                    {selection_clause} GROUP BY status"""
-            ):
+        if selected_only:
+            queries = {
+                "emails": """SELECT e.status, COUNT(*) AS count
+                    FROM sources s
+                    JOIN mailboxes m ON m.source_id=s.id
+                    JOIN emails e
+                      ON e.source_id=m.source_id AND e.mailbox_path=m.path
+                    WHERE s.selected=1 AND m.selected=1
+                    GROUP BY e.status""",
+                "attachments": """SELECT a.status,
+                           COUNT(DISTINCT a.id) AS count
+                    FROM sources s
+                    JOIN mailboxes m ON m.source_id=s.id
+                    JOIN emails e
+                      ON e.source_id=m.source_id AND e.mailbox_path=m.path
+                    JOIN email_attachments ea ON ea.email_id=e.id
+                    JOIN attachments a ON a.id=ea.attachment_id
+                    WHERE s.selected=1 AND m.selected=1
+                    GROUP BY a.status""",
+            }
+        else:
+            queries = {
+                table: f"""SELECT status, COUNT(*) AS count FROM {table}
+                             GROUP BY status"""
+                for table in result
+            }
+        for table, query in queries.items():
+            for row in db.execute(query):
                 result[table][str(row["status"])] = int(row["count"])
     return result
 
@@ -2502,15 +2517,12 @@ def _status_counts(
 def selected_mail_with_attachments(config: Config) -> int:
     with database(config) as db:
         row = db.execute(
-            """SELECT COUNT(*) FROM emails
-               WHERE has_attachments=1 AND EXISTS (
-                   SELECT 1 FROM sources s
-                   JOIN mailboxes m
-                     ON m.source_id=emails.source_id
-                    AND m.path=emails.mailbox_path
-                   WHERE s.id=emails.source_id
-                     AND s.selected=1 AND m.selected=1
-               )"""
+            """SELECT COUNT(*)
+               FROM sources s
+               JOIN mailboxes m ON m.source_id=s.id
+               JOIN emails e
+                 ON e.source_id=m.source_id AND e.mailbox_path=m.path
+               WHERE s.selected=1 AND m.selected=1 AND e.has_attachments=1"""
         ).fetchone()
     return int(row[0])
 
@@ -3001,9 +3013,15 @@ def make_http_handler(
                         "text/javascript; charset=utf-8",
                     )
                 elif path == "/":
+                    started_at = time.monotonic()
+                    body = render_status_page(config, state)
+                    LOG.info(
+                        "page principale générée en %.3fs",
+                        time.monotonic() - started_at,
+                    )
                     self._send(
                         200,
-                        render_status_page(config, state),
+                        body,
                         "text/html; charset=utf-8",
                     )
                 else:
