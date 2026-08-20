@@ -73,6 +73,7 @@ SCHEMA_VERSION = 2
 SCHEMA_LOCK = threading.Lock()
 RECONCILE_BATCH_SIZE = 100
 OPENRAG_QUEUE_POLL_SECONDS = 5
+OPENRAG_TASK_POLL_SECONDS = 1
 
 
 class ConnectorError(RuntimeError):
@@ -1933,7 +1934,7 @@ class OpenRAGClient:
                 raise ConnectorError("tâche OpenRAG terminée avec fichiers en échec")
             if status in {"failed", "cancelled", "canceled"}:
                 raise ConnectorError(f"tâche OpenRAG {status}")
-            self.sleeper(5)
+            self.sleeper(OPENRAG_TASK_POLL_SECONDS)
         raise TimeoutError("tâche OpenRAG non terminée avant expiration")
 
 
