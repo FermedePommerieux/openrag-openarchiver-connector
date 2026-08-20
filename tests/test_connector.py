@@ -1842,9 +1842,10 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                     base + "/scan",
                     data=urllib.parse.urlencode({"csrf": "bad"}).encode("ascii"),
                 )
-                with self.assertRaises(urllib.error.HTTPError) as caught:
-                    urllib.request.urlopen(bad)
-                self.assertEqual(caught.exception.code, 403)
+                with urllib.request.urlopen(bad) as response:
+                    stale_page = response.read().decode("utf-8")
+                    self.assertTrue(response.geturl().endswith("/?form=expired"))
+                self.assertIn("OpenArchiver vers OpenRAG", stale_page)
                 state.set_running(False)
                 with self.assertRaises(urllib.error.HTTPError) as stopped:
                     urllib.request.urlopen(base + "/healthz")

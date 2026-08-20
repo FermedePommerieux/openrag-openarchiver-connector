@@ -3220,6 +3220,7 @@ def render_live_status(state: RuntimeState) -> str:
     snapshot = state.snapshot()
     return json.dumps(
         {
+            "csrf_token": str(snapshot["csrf_token"]),
             "inventory_status": inventory_status(snapshot),
             "cycle_in_progress": bool(snapshot["cycle_in_progress"]),
             "cycle_stage": cycle_stage(snapshot),
@@ -3288,6 +3289,14 @@ UI_SCRIPT = r"""(() => {
   const reconciliationBar = document.getElementById("reconciliation-progress-bar");
   const reconciliationLabel = document.getElementById("reconciliation-progress-label");
   if (!badge || !summary || !dot || !button || !completion) return;
+  if (new URLSearchParams(window.location.search).get("form") === "expired") {
+    const alert = document.createElement("div");
+    alert.className = "error-alert";
+    alert.setAttribute("role", "alert");
+    alert.textContent = "L’interface a été renouvelée après un redémarrage. Recommencez l’action.";
+    document.querySelector(".content")?.prepend(alert);
+    window.history.replaceState(null, "", "/");
+  }
   let observedActive = document.body.dataset.cycleActive === "true";
   let observedStage = document.body.dataset.cycleStage || "idle";
   let observedReconciliation = document.body.dataset.reconciliationActive === "true";
@@ -3346,6 +3355,11 @@ UI_SCRIPT = r"""(() => {
     bindRetrySelectors();
   };
   const applyStatus = async status => {
+      if (typeof status.csrf_token === "string" && status.csrf_token) {
+        document.querySelectorAll('input[name="csrf"]').forEach(input => {
+          input.value = status.csrf_token;
+        });
+      }
       const active = Boolean(status.cycle_in_progress);
       const requested = Boolean(status.cycle_requested);
       const failed = Boolean(status.last_error);
@@ -3852,9 +3866,10 @@ def make_http_handler(
             self.end_headers()
             self.wfile.write(payload)
 
-        def _redirect(self) -> None:
+        def _redirect(self, location: str = "/") -> None:
             self.send_response(303)
-            self.send_header("Location", "/")
+            self.send_header("Location", location)
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", "0")
             self.end_headers()
 
@@ -3965,7 +3980,7 @@ def make_http_handler(
                 form = urllib.parse.parse_qs(raw, keep_blank_values=True)
                 csrf = form.get("csrf", [""])[0]
                 if not isinstance(csrf, str) or csrf != state.snapshot()["csrf_token"]:
-                    self._send(403, "forbidden\n", "text/plain; charset=utf-8")
+                    self._redirect("/?form=expired")
                     return
                 if path == "/secrets":
                     changed = []
