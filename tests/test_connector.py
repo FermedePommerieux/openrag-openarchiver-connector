@@ -1030,7 +1030,7 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                 with self.assertRaisesRegex(connector.ConnectorError, "failed"):
                     client.wait("bad")
 
-    def test_openrag_running_task_is_polled_every_second(self):
+    def test_openrag_running_task_is_polled_every_250ms(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
             sleeps = []
@@ -1044,7 +1044,7 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                 ],
             ):
                 client.wait("running")
-            self.assertEqual(sleeps, [1])
+            self.assertEqual(sleeps, [0.25])
 
     def test_openrag_task_404_falls_back_to_standard_endpoint(self):
         with tempfile.TemporaryDirectory() as directory:
