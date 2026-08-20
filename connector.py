@@ -2542,14 +2542,29 @@ def selected_mail_with_attachments(config: Config) -> int:
     return int(row[0])
 
 
+def cycle_stage(snapshot: Mapping[str, object]) -> str:
+    if not bool(snapshot["cycle_in_progress"]):
+        return "idle"
+    phase = str(snapshot.get("cycle_phase") or "")
+    if phase.startswith("Traitement de la file vers OpenRAG"):
+        return "ingestion"
+    return "inventory"
+
+
 def inventory_status(snapshot: Mapping[str, object]) -> str:
     started_at = int(snapshot["last_cycle_started_at"])
     completed_at = int(snapshot["last_cycle_completed_at"])
     requested_at = int(snapshot["cycle_requested_at"])
     if bool(snapshot["cycle_in_progress"]):
         phase = str(snapshot.get("cycle_phase") or "Inventaire en cours")
+        activity = (
+            "Ingestion en cours"
+            if cycle_stage(snapshot) == "ingestion"
+            else "Inventaire en cours"
+        )
         return (
-            "Inventaire en cours — "
+            activity
+            + " — "
             + phase
             + " — démarré le "
             + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(started_at))
@@ -2612,6 +2627,7 @@ def render_live_status(state: RuntimeState) -> str:
         {
             "inventory_status": inventory_status(snapshot),
             "cycle_in_progress": bool(snapshot["cycle_in_progress"]),
+            "cycle_stage": cycle_stage(snapshot),
             "cycle_requested": bool(snapshot["cycle_requested_at"]),
             "cycle_completed_at": int(snapshot["last_cycle_completed_at"]),
             "last_error": str(snapshot["last_error"] or ""),
@@ -2637,8 +2653,11 @@ UI_SCRIPT = r"""(() => {
   const progressWrap = document.getElementById("cycle-progress");
   const progressBar = document.getElementById("cycle-progress-bar");
   const progressLabel = document.getElementById("cycle-progress-label");
+  const cycleTitle = document.getElementById("cycle-card-title");
+  const cycleDescription = document.getElementById("cycle-card-description");
   if (!badge || !summary || !dot || !button || !completion) return;
   let observedActive = document.body.dataset.cycleActive === "true";
+  let observedStage = document.body.dataset.cycleStage || "idle";
   const refreshInventoryDisplay = async () => {
     const response = await fetch("/?inventory-fragment=1", {cache: "no-store"});
     if (!response.ok) throw new Error("actualisation de l’inventaire impossible");
@@ -2674,7 +2693,9 @@ UI_SCRIPT = r"""(() => {
       const active = Boolean(status.cycle_in_progress);
       const requested = Boolean(status.cycle_requested);
       const failed = Boolean(status.last_error);
+      const ingestion = status.cycle_stage === "ingestion";
       observedActive = observedActive || active || requested;
+      if (active) observedStage = status.cycle_stage;
       if (active || requested) completion.hidden = true;
       summary.textContent = status.inventory_status;
       summary.setAttribute("aria-busy", active ? "true" : "false");
@@ -2682,13 +2703,21 @@ UI_SCRIPT = r"""(() => {
       const stateClass = active ? "success" : (failed ? "danger" : "warning");
       badge.className = "badge " + stateClass;
       dot.className = "dot " + stateClass;
-      badge.textContent = active ? "Inventaire en cours…" :
+      badge.textContent = active ? (ingestion ? "Ingestion en cours…" : "Inventaire en cours…") :
         (requested ? "Inventaire demandé" :
           (failed ? "Inventaire interrompu" : "En attente"));
       button.disabled = active || requested;
       button.type = active || requested ? "button" : "submit";
-      button.textContent = active ? "Inventaire en cours…" :
+      button.textContent = active ? (ingestion ? "Ingestion en cours…" : "Inventaire en cours…") :
         (requested ? "Inventaire demandé…" : "Relancer l’inventaire");
+      if (cycleTitle) {
+        cycleTitle.textContent = ingestion ? "Ingestion OpenRAG" : "Inventaire IMAP";
+      }
+      if (cycleDescription) {
+        cycleDescription.textContent = ingestion ?
+          "Progression de l’envoi des mails et pièces jointes sélectionnés." :
+          "État du cycle de découverte des sources et dossiers.";
+      }
       if (service) service.textContent = status.ready ? "Prêt" : "Attention requise";
       if (lastSync) {
         lastSync.textContent = status.cycle_completed_at ?
@@ -2716,9 +2745,12 @@ UI_SCRIPT = r"""(() => {
         await refreshInventoryDisplay();
         completion.hidden = false;
         completion.textContent = failed ?
-          "Inventaire interrompu. Le détail est affiché ci-dessus ; vos champs et sélections ont été conservés." :
-          "Inventaire terminé. Les dossiers et compteurs ont été actualisés ; vos champs et sélections ont été conservés.";
+          "Cycle interrompu. Le détail est affiché ci-dessus ; vos champs et sélections ont été conservés." :
+          (observedStage === "ingestion" ?
+            "Ingestion terminée. Les compteurs ont été actualisés ; vos champs et sélections ont été conservés." :
+            "Inventaire terminé. Les dossiers et compteurs ont été actualisés ; vos champs et sélections ont été conservés.");
         observedActive = false;
+        observedStage = "idle";
       }
   };
   const update = async () => {
@@ -2822,10 +2854,17 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
     )
     inventory_running = bool(snapshot["cycle_in_progress"])
     inventory_requested = bool(snapshot["cycle_requested_at"])
+    current_stage = cycle_stage(snapshot)
     if inventory_running:
-        inventory_activity = "Inventaire en cours…"
+        ingestion_running = current_stage == "ingestion"
+        inventory_activity = (
+            "Ingestion en cours…" if ingestion_running else "Inventaire en cours…"
+        )
         inventory_class = "success running"
-        scan_button = '<button id="inventory-button" class="primary" type="button" disabled>Inventaire en cours…</button>'
+        button_label = (
+            "Ingestion en cours…" if ingestion_running else "Inventaire en cours…"
+        )
+        scan_button = f'<button id="inventory-button" class="primary" type="button" disabled>{button_label}</button>'
     elif inventory_requested:
         inventory_activity = "Inventaire demandé"
         inventory_class = "warning"
@@ -2883,13 +2922,19 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
         )
     else:
         reset_status = "Aucune remise à zéro depuis le démarrage."
+    cycle_title = "Ingestion OpenRAG" if current_stage == "ingestion" else "Inventaire IMAP"
+    cycle_description = (
+        "Progression de l’envoi des mails et pièces jointes sélectionnés."
+        if current_stage == "ingestion"
+        else "État du cycle de découverte des sources et dossiers."
+    )
     return f"""<!doctype html>
 <html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>Connecteur OpenArchiver · OpenRAG</title>
 <style>{STATUS_PAGE_STYLE}</style><script src="/ui.js" defer></script></head>
-<body data-cycle-active="{str(inventory_running or inventory_requested).lower()}" data-cycle-completed="{last_completed}">
+<body data-cycle-active="{str(inventory_running or inventory_requested).lower()}" data-cycle-stage="{current_stage}" data-cycle-completed="{last_completed}">
 <div class="app">
 <header class="topbar"><div class="brand">{OPENRAG_LOGO}<span>OpenRAG</span></div>
 <span class="connector-chip">OpenArchiver connector</span></header>
@@ -2907,7 +2952,7 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 <div class="stat-card"><span class="stat-label">Mails dans la sélection</span><strong id="mail-count" class="stat-value">{email_total}</strong><span id="mailbox-selected-count" class="stat-detail">{selected_mailboxes} dossier(s) sélectionné(s)</span></div>
 <div class="stat-card"><span class="stat-label">Mails avec pièces jointes</span><strong id="selected-attachment-mail-count" class="stat-value">{selected_attachment_mails}</strong><span id="detailed-attachment-count" class="stat-detail">{attachment_total} pièce(s) déjà détaillée(s)</span></div>
 </section>
-<section class="card"><div class="card-header"><div><h2 class="card-title">Inventaire IMAP</h2><p class="card-description">État du cycle de découverte des sources et dossiers.</p></div><span id="inventory-badge" class="badge {inventory_class}">{inventory_activity}</span></div>
+<section class="card"><div class="card-header"><div><h2 id="cycle-card-title" class="card-title">{cycle_title}</h2><p id="cycle-card-description" class="card-description">{cycle_description}</p></div><span id="inventory-badge" class="badge {inventory_class}">{inventory_activity}</span></div>
 <div class="card-body"><div class="inventory-row"><span id="inventory-dot" class="dot {inventory_class}"></span><span id="inventory-summary" class="inventory-status" role="status" aria-live="polite" aria-busy="{str(inventory_running).lower()}">{html.escape(inventory_status(snapshot))}</span></div>
 <div id="cycle-progress" class="progress-wrap" role="progressbar" aria-label="Progression du cycle" hidden><div class="progress-track"><div id="cycle-progress-bar" class="progress-bar"></div></div><span id="cycle-progress-label" class="progress-label">Préparation…</span></div>
 <p id="inventory-completion" class="helper" role="status" hidden></p>

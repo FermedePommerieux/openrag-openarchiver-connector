@@ -1779,12 +1779,22 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
         live = json.loads(connector.render_live_status(state))
         self.assertEqual(live["progress_current"], 5)
         self.assertEqual(live["progress_total"], 10)
+        self.assertEqual(live["cycle_stage"], "inventory")
         self.assertIn('id="cycle-progress"', page)
         self.assertIn('id="cycle-progress-bar"', page)
         self.assertIn('id="cycle-progress-label"', page)
         self.assertNotIn('<script src="http', page)
         self.assertNotIn("https://", page)
         self.assertNotIn("http://", page)
+
+        state.cycle_progress("Traitement de la file vers OpenRAG", 6, 10)
+        ingestion_page = connector.render_status_page(config, state)
+        ingestion_live = json.loads(connector.render_live_status(state))
+        self.assertEqual(ingestion_live["cycle_stage"], "ingestion")
+        self.assertIn("Ingestion en cours — Traitement de la file", ingestion_live["inventory_status"])
+        self.assertIn(">Ingestion OpenRAG<", ingestion_page)
+        self.assertIn("Ingestion en cours…", ingestion_page)
+        self.assertNotIn("Inventaire en cours…", ingestion_page)
 
     def test_runtime_manifests_expose_the_interface_securely_on_the_lan(self):
         root = MODULE_PATH.parent
