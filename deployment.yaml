@@ -100,8 +100,6 @@ spec:
               value: "3600"
             - name: MAX_FILE_BYTES
               value: "104857600"
-            - name: INGESTION_LARGE_OBJECT_BYTES
-              value: "10485760"
             - name: MAX_AUTO_RETRIES
               value: "3"
             - name: RETRY_BASE_SECONDS

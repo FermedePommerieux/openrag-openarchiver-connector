@@ -133,7 +133,6 @@ class Config:
     scan_interval_seconds: int = 3600
     task_timeout_seconds: int = 3600
     max_file_bytes: int = 104_857_600
-    large_object_bytes: int = 10_485_760
     max_auto_retries: int = 3
     retry_base_seconds: int = 300
     retry_max_seconds: int = 3600
@@ -216,9 +215,6 @@ class Config:
                 1, int(values.get("TASK_TIMEOUT_SECONDS", "3600"))
             ),
             max_file_bytes=max(1, int(values.get("MAX_FILE_BYTES", "104857600"))),
-            large_object_bytes=max(
-                1, int(values.get("INGESTION_LARGE_OBJECT_BYTES", "10485760"))
-            ),
             max_auto_retries=max(1, int(values.get("MAX_AUTO_RETRIES", "3"))),
             retry_base_seconds=max(1, int(values.get("RETRY_BASE_SECONDS", "300"))),
             retry_max_seconds=max(1, int(values.get("RETRY_MAX_SECONDS", "3600"))),
@@ -2088,76 +2084,31 @@ def claim_next(config: Config, *, now: int | None = None) -> WorkItem | None:
         if paused is not None and str(paused[0]) == "1":
             db.commit()
             return None
-
-        active = db.execute(
-            """
-            SELECT
-              (SELECT COUNT(*) FROM emails
-               WHERE status IN ('downloading','ingesting'))
-              +
-              (SELECT COUNT(*) FROM attachments
-               WHERE status IN ('downloading','ingesting')) AS total,
-              (SELECT COUNT(*) FROM emails
-               WHERE status IN ('downloading','ingesting') AND size_bytes>=?)
-              +
-              (SELECT COUNT(*) FROM attachments
-               WHERE status IN ('downloading','ingesting') AND size_bytes>=?) AS large
-            """,
-            (config.large_object_bytes, config.large_object_bytes),
-        ).fetchone()
-        active_total = int(active["total"])
-        active_large = int(active["large"])
-        if active_large:
-            db.commit()
-            return None
-
-        selections = {
-            "email": """EXISTS (
-                   SELECT 1 FROM sources s
-                   JOIN mailboxes m
-                     ON m.source_id=emails.source_id
-                    AND m.path=emails.mailbox_path
-                   WHERE s.id=emails.source_id
-                     AND s.selected=1 AND m.selected=1
-               )""",
-            "attachment": """EXISTS (
-                   SELECT 1 FROM email_attachments ea
-                   JOIN emails e ON e.id=ea.email_id
-                   JOIN sources s ON s.id=e.source_id
-                   JOIN mailboxes m
-                     ON m.source_id=e.source_id AND m.path=e.mailbox_path
-                   WHERE ea.attachment_id=attachments.id
-                     AND s.selected=1 AND m.selected=1
-               )""",
-        }
-        large_waiting = False
         for kind, table in (("email", "emails"), ("attachment", "attachments")):
-            if db.execute(
-                f"""
-                SELECT 1 FROM {table}
-                WHERE ({selections[kind]}) AND size_bytes>=? AND (
-                    status='queued' OR (
-                        status IN ('failed','lost') AND attempts < ?
-                        AND next_retry_at > 0 AND next_retry_at <= ?
-                    )
-                )
-                LIMIT 1
-                """,
-                (config.large_object_bytes, config.max_auto_retries, timestamp),
-            ).fetchone() is not None:
-                large_waiting = True
-                break
-        if large_waiting and active_total:
-            db.commit()
-            return None
-
-        for kind, table in (("email", "emails"), ("attachment", "attachments")):
-            size_operator = ">=" if large_waiting else "<"
+            selection_clause = (
+                """EXISTS (
+                       SELECT 1 FROM sources s
+                       JOIN mailboxes m
+                         ON m.source_id=emails.source_id
+                        AND m.path=emails.mailbox_path
+                       WHERE s.id=emails.source_id
+                         AND s.selected=1 AND m.selected=1
+                   )"""
+                if kind == "email"
+                else """EXISTS (
+                       SELECT 1 FROM email_attachments ea
+                       JOIN emails e ON e.id=ea.email_id
+                       JOIN sources s ON s.id=e.source_id
+                       JOIN mailboxes m
+                         ON m.source_id=e.source_id AND m.path=e.mailbox_path
+                       WHERE ea.attachment_id=attachments.id
+                         AND s.selected=1 AND m.selected=1
+                   )"""
+            )
             row = db.execute(
                 f"""
                 SELECT id, attempts FROM {table}
-                WHERE ({selections[kind]})
-                  AND size_bytes {size_operator} ? AND (
+                WHERE ({selection_clause}) AND (
                     status='queued' OR (
                         status IN ('failed','lost') AND attempts < ?
                         AND next_retry_at > 0 AND next_retry_at <= ?
@@ -2170,7 +2121,7 @@ def claim_next(config: Config, *, now: int | None = None) -> WorkItem | None:
                          next_retry_at, id
                 LIMIT 1
                 """,
-                (config.large_object_bytes, config.max_auto_retries, timestamp),
+                (config.max_auto_retries, timestamp),
             ).fetchone()
             if row is None:
                 continue
@@ -2191,45 +2142,6 @@ def claim_next(config: Config, *, now: int | None = None) -> WorkItem | None:
         return None
     finally:
         db.close()
-
-
-def selected_ingestion_work_remains(config: Config) -> bool:
-    """Indique aux workers temporairement bloqués s'ils doivent rester disponibles."""
-    with database(config) as db:
-        paused = db.execute(
-            "SELECT value FROM settings WHERE key='paused'"
-        ).fetchone()
-        if paused is not None and str(paused[0]) == "1":
-            return False
-        row = db.execute(
-            """
-            SELECT
-              EXISTS (
-                SELECT 1 FROM emails e
-                WHERE e.status IN ('queued','downloading','ingesting')
-                  AND EXISTS (
-                    SELECT 1 FROM sources s
-                    JOIN mailboxes m
-                      ON m.source_id=e.source_id AND m.path=e.mailbox_path
-                    WHERE s.id=e.source_id AND s.selected=1 AND m.selected=1
-                  )
-              )
-              OR EXISTS (
-                SELECT 1 FROM attachments a
-                WHERE a.status IN ('queued','downloading','ingesting')
-                  AND EXISTS (
-                    SELECT 1 FROM email_attachments ea
-                    JOIN emails e ON e.id=ea.email_id
-                    JOIN sources s ON s.id=e.source_id
-                    JOIN mailboxes m
-                      ON m.source_id=e.source_id AND m.path=e.mailbox_path
-                    WHERE ea.attachment_id=a.id
-                      AND s.selected=1 AND m.selected=1
-                  )
-              )
-            """
-        ).fetchone()
-    return bool(row and row[0])
 
 
 def _set_object_state(
@@ -2543,9 +2455,6 @@ def process_queue(
         while True:
             item = claim_next(config)
             if item is None:
-                if selected_ingestion_work_remains(config):
-                    time.sleep(OPENRAG_TASK_POLL_SECONDS)
-                    continue
                 return processed
             process_work_item(config, item, openarchiver, openrag)
             processed += 1
