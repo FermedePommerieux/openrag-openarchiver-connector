@@ -111,9 +111,17 @@ spec:
             - name: OPENARCHIVER_PAGE_LIMIT
               value: "250"
             - name: INGESTION_CONCURRENCY
+              value: auto
+            - name: INGESTION_CONCURRENCY_FALLBACK
               value: "2"
             - name: INGESTION_CONCURRENCY_MAX
               value: "4"
+            - name: DOCLING_METRICS_URL
+              value: http://docling-serve.docling.svc.cluster.local:5001/metrics
+            - name: DOCLING_METRICS_TIMEOUT_SECONDS
+              value: "5"
+            - name: DOCLING_RQ_QUEUE_NAME
+              value: convert
             - name: REQUEST_TIMEOUT_SECONDS
               value: "30"
             - name: HTTP_HOST

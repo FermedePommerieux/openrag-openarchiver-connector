@@ -60,6 +60,10 @@ ALL_STATUSES = (
 )
 DEFAULT_EXTENSIONS = ".asc,.asciidoc,.adoc,.csv,.docx,.htm,.html,.md,.pdf,.txt,.xlsx"
 SAFE_EXTENSION = re.compile(r"^\.[a-z0-9]{1,10}$")
+RQ_WORKER_METRIC = re.compile(
+    r"^rq_workers\{(?P<labels>.*)\}\s+(?P<value>[0-9.eE+-]+)$"
+)
+PROMETHEUS_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
 STOP = threading.Event()
 WAKE = threading.Event()
 SCHEMA_VERSION = 2
@@ -104,8 +108,14 @@ class Config:
     retry_max_seconds: int = 3600
     supported_extensions: frozenset[str] = frozenset(DEFAULT_EXTENSIONS.split(","))
     openarchiver_requests_per_minute: int = 90
-    ingestion_concurrency: int = 2
+    ingestion_concurrency: int | None = None
+    ingestion_concurrency_fallback: int = 2
     ingestion_concurrency_max: int = 4
+    docling_metrics_url: str = (
+        "http://docling-serve.docling.svc.cluster.local:5001/metrics"
+    )
+    docling_metrics_timeout: int = 5
+    docling_queue_name: str = "convert"
     page_limit: int = 250
     openarchiver_link_template: str = ""
     openarchiver_source_url_template: str = ""
@@ -125,6 +135,12 @@ class Config:
             if item.strip()
         )
         concurrency_max = max(1, int(values.get("INGESTION_CONCURRENCY_MAX", "4")))
+        concurrency_value = values.get("INGESTION_CONCURRENCY", "auto").strip().lower()
+        ingestion_concurrency = (
+            None
+            if concurrency_value == "auto"
+            else min(concurrency_max, max(1, int(concurrency_value)))
+        )
         config = cls(
             openarchiver_base_url=values.get(
                 "OPENARCHIVER_BASE_URL",
@@ -175,10 +191,20 @@ class Config:
             openarchiver_requests_per_minute=max(
                 1, int(values.get("OPENARCHIVER_REQUESTS_PER_MINUTE", "90"))
             ),
-            ingestion_concurrency=min(
-                concurrency_max, max(1, int(values.get("INGESTION_CONCURRENCY", "2")))
+            ingestion_concurrency=ingestion_concurrency,
+            ingestion_concurrency_fallback=min(
+                concurrency_max,
+                max(1, int(values.get("INGESTION_CONCURRENCY_FALLBACK", "2"))),
             ),
             ingestion_concurrency_max=concurrency_max,
+            docling_metrics_url=values.get(
+                "DOCLING_METRICS_URL",
+                "http://docling-serve.docling.svc.cluster.local:5001/metrics",
+            ),
+            docling_metrics_timeout=max(
+                1, int(values.get("DOCLING_METRICS_TIMEOUT_SECONDS", "5"))
+            ),
+            docling_queue_name=values.get("DOCLING_RQ_QUEUE_NAME", "convert"),
             page_limit=max(1, int(values.get("OPENARCHIVER_PAGE_LIMIT", "250"))),
             openarchiver_link_template=values.get("OPENARCHIVER_LINK_TEMPLATE", ""),
             openarchiver_source_url_template=values.get(
@@ -196,6 +222,7 @@ class Config:
             config.openarchiver_base_url, "OPENARCHIVER_BASE_URL"
         )
         _validate_internal_http_url(config.openrag_base_url, "OPENRAG_BASE_URL")
+        _validate_internal_http_url(config.docling_metrics_url, "DOCLING_METRICS_URL")
         if not config.openrag_ingest_directory.is_absolute():
             raise ValueError("OPENRAG_INGEST_DIRECTORY doit être un chemin absolu")
         if config.openrag_ingest_mode not in {"auto", "path", "api"}:
@@ -1933,13 +1960,98 @@ def _safe_error(error: Exception) -> str:
     return error.__class__.__name__
 
 
+def parse_docling_worker_metrics(metrics: str, queue_name: str) -> int:
+    """Compte les workers RQ actifs qui consomment la file Docling attendue."""
+    family_present = False
+    workers = 0
+    for line in metrics.splitlines():
+        line = line.strip()
+        if line.startswith("# HELP rq_workers ") or line == "# TYPE rq_workers gauge":
+            family_present = True
+            continue
+        match = RQ_WORKER_METRIC.match(line)
+        if not match:
+            continue
+        family_present = True
+        labels = dict(PROMETHEUS_LABEL.findall(match.group("labels")))
+        queues = {item.strip() for item in labels.get("queues", "").split(",")}
+        if queue_name not in queues or labels.get("state") == "suspended":
+            continue
+        workers += max(0, int(float(match.group("value"))))
+    if not family_present:
+        raise RuntimeError("métrique rq_workers absente de la réponse Docling")
+    return workers
+
+
+def detect_docling_workers(config: Config) -> int:
+    request = urllib.request.Request(
+        config.docling_metrics_url,
+        headers={"Accept": "text/plain"},
+    )
+    with urllib.request.urlopen(
+        request, timeout=config.docling_metrics_timeout
+    ) as response:
+        payload = response.read(2_000_001)
+    if len(payload) > 2_000_000:
+        raise RuntimeError("réponse métriques Docling trop volumineuse")
+    return parse_docling_worker_metrics(
+        payload.decode("utf-8", errors="replace"),
+        config.docling_queue_name,
+    )
+
+
+def effective_ingestion_concurrency(
+    config: Config, state: RuntimeState | None = None
+) -> int:
+    """Résout la concurrence fixe ou automatique et publie son état runtime."""
+    detected = -1
+    detection_success = False
+    if config.ingestion_concurrency is not None:
+        effective = min(config.ingestion_concurrency, config.ingestion_concurrency_max)
+    else:
+        try:
+            detected = detect_docling_workers(config)
+            detection_success = True
+            effective = min(detected, config.ingestion_concurrency_max)
+            if effective == 0:
+                LOG.warning(
+                    "aucun worker Docling RQ détecté; aucune nouvelle ingestion"
+                )
+            else:
+                LOG.info(
+                    "%d worker(s) Docling détecté(s); concurrence effective=%d",
+                    detected,
+                    effective,
+                )
+        except Exception as error:
+            effective = min(
+                config.ingestion_concurrency_fallback,
+                config.ingestion_concurrency_max,
+            )
+            LOG.warning(
+                "détection des workers Docling impossible (%s); repli concurrence=%d",
+                _safe_error(error),
+                effective,
+            )
+    if state is not None:
+        state.worker_detection_updated(
+            detected=detected,
+            effective=effective,
+            success=detection_success,
+        )
+    return effective
+
+
 def process_queue(
     config: Config,
     openarchiver: OpenArchiverClient,
     openrag: OpenRAGClient,
     progress: Callable[[int, int], None] | None = None,
+    state: RuntimeState | None = None,
 ) -> int:
-    workers = min(config.ingestion_concurrency, config.ingestion_concurrency_max)
+    workers = effective_ingestion_concurrency(config, state)
+    if workers == 0:
+        return 0
     progress_lock = threading.Lock()
     processed_total = 0
     initial_total = selected_queue_pending_count(config)
@@ -1998,12 +2110,25 @@ class RuntimeState:
         self.last_processed = 0
         self.reset_requested_at = 0
         self.last_reset_at = 0
+        self.docling_workers_detected = -1
+        self.ingestion_concurrency_effective = 0
+        self.worker_detection_success = False
+        self.worker_detection_at = 0
         self.ready = False
         self.running = False
 
     def set_running(self, value: bool) -> None:
         with self.lock:
             self.running = value
+
+    def worker_detection_updated(
+        self, *, detected: int, effective: int, success: bool
+    ) -> None:
+        with self.lock:
+            self.docling_workers_detected = detected
+            self.ingestion_concurrency_effective = effective
+            self.worker_detection_success = success
+            self.worker_detection_at = int(time.time())
 
     def restore_cycle(
         self,
@@ -2117,6 +2242,10 @@ class RuntimeState:
                 "last_processed": self.last_processed,
                 "reset_requested_at": self.reset_requested_at,
                 "last_reset_at": self.last_reset_at,
+                "docling_workers_detected": self.docling_workers_detected,
+                "ingestion_concurrency_effective": self.ingestion_concurrency_effective,
+                "worker_detection_success": self.worker_detection_success,
+                "worker_detection_at": self.worker_detection_at,
                 "ready": self.ready,
                 "running": self.running,
             }
@@ -2128,6 +2257,7 @@ def run_cycle(
     openrag: OpenRAGClient,
     progress: Callable[[str, int | None, int | None], None] | None = None,
     force_inventory: bool = True,
+    state: RuntimeState | None = None,
 ) -> tuple[ScanResult, int]:
     report = progress or (lambda _phase, _current=None, _total=None: None)
     cached = cached_inventory(config)
@@ -2175,6 +2305,7 @@ def run_cycle(
         progress=lambda current, total: report(
             "Traitement de la file vers OpenRAG", current, total
         ),
+        state=state,
     )
     return scan, processed
 
@@ -2282,6 +2413,7 @@ def runtime_loop(
                     rag_client,
                     progress=state.cycle_progress,
                     force_inventory=force_inventory,
+                    state=state,
                 )
                 state.cycle_succeeded(scan, processed)
                 completed_at = int(state.snapshot()["last_cycle_completed_at"])
@@ -2640,6 +2772,14 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
     pause_label = "Reprendre l’indexation" if paused else "Mettre en pause"
     pause_action = "resume" if paused else "pause"
     activity = "En pause" if paused else "Active"
+    concurrency_mode = "auto" if config.ingestion_concurrency is None else "fixe"
+    effective_concurrency = int(snapshot["ingestion_concurrency_effective"])
+    detected_workers = int(snapshot["docling_workers_detected"])
+    worker_label = (
+        str(detected_workers)
+        if snapshot["worker_detection_success"]
+        else "indisponible"
+    )
     inventory_running = bool(snapshot["cycle_in_progress"])
     inventory_requested = bool(snapshot["cycle_requested_at"])
     if inventory_running:
@@ -2723,7 +2863,7 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 {error_alert}
 <section class="status-grid" aria-label="État du connecteur">
 <div class="stat-card"><span class="stat-label"><span class="dot {status_class}"></span>Service</span><strong id="service-status" class="stat-value">{ready}</strong><span id="last-sync" class="stat-detail">Dernière synchro : {last_sync}</span></div>
-<div class="stat-card"><span class="stat-label"><span class="dot {activity_class}"></span>Indexation</span><strong class="stat-value">{activity}</strong><span id="last-processed" class="stat-detail">{int(snapshot["last_processed"])} objet(s) au dernier cycle</span></div>
+<div class="stat-card"><span class="stat-label"><span class="dot {activity_class}"></span>Indexation</span><strong class="stat-value">{activity}</strong><span id="last-processed" class="stat-detail">{int(snapshot["last_processed"])} objet(s) au dernier cycle · concurrence {concurrency_mode} : {effective_concurrency} · workers Docling : {worker_label}</span></div>
 <div class="stat-card"><span class="stat-label">Mails dans la sélection</span><strong id="mail-count" class="stat-value">{email_total}</strong><span id="mailbox-selected-count" class="stat-detail">{selected_mailboxes} dossier(s) sélectionné(s)</span></div>
 <div class="stat-card"><span class="stat-label">Mails avec pièces jointes</span><strong id="selected-attachment-mail-count" class="stat-value">{selected_attachment_mails}</strong><span id="detailed-attachment-count" class="stat-detail">{attachment_total} pièce(s) déjà détaillée(s)</span></div>
 </section>
@@ -2768,6 +2908,12 @@ def render_metrics(config: Config, state: RuntimeState) -> str:
         f"openarchiver_connector_selected_mailboxes {selected_mailboxes}",
         "# TYPE openarchiver_connector_paused gauge",
         f"openarchiver_connector_paused {1 if paused else 0}",
+        "# TYPE openarchiver_connector_ingestion_concurrency gauge",
+        f"openarchiver_connector_ingestion_concurrency {snapshot['ingestion_concurrency_effective']}",
+        "# TYPE openarchiver_connector_docling_workers_detected gauge",
+        f"openarchiver_connector_docling_workers_detected {snapshot['docling_workers_detected']}",
+        "# TYPE openarchiver_connector_worker_detection_success gauge",
+        f"openarchiver_connector_worker_detection_success {1 if snapshot['worker_detection_success'] else 0}",
         "# TYPE openarchiver_connector_objects gauge",
     ]
     for kind, values in counts.items():

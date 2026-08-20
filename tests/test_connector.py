@@ -200,6 +200,13 @@ class ConnectorTests(unittest.TestCase):
                     "STATE_DB": str(config.state_db),
                 }
             )
+            self.assertIsNone(defaults.ingestion_concurrency)
+            self.assertEqual(defaults.ingestion_concurrency_fallback, 2)
+            self.assertEqual(defaults.ingestion_concurrency_max, 4)
+            self.assertEqual(
+                defaults.docling_metrics_url,
+                "http://docling-serve.docling.svc.cluster.local:5001/metrics",
+            )
             self.assertEqual(
                 defaults.supported_extensions,
                 frozenset(
@@ -218,6 +225,53 @@ class ConnectorTests(unittest.TestCase):
                     }
                 ),
             )
+
+    def test_docling_worker_metrics_count_active_convert_workers(self):
+        metrics = """# HELP rq_workers RQ workers
+# TYPE rq_workers gauge
+rq_workers{name="one",state="idle",queues="convert"} 1.0
+rq_workers{name="two",state="busy",queues="convert,low"} 1.0
+rq_workers{name="paused",state="suspended",queues="convert"} 1.0
+rq_workers{name="other",state="idle",queues="other"} 1.0
+"""
+        self.assertEqual(connector.parse_docling_worker_metrics(metrics, "convert"), 2)
+        with self.assertRaisesRegex(RuntimeError, "rq_workers"):
+            connector.parse_docling_worker_metrics(
+                "# TYPE rq_jobs gauge\n", "convert"
+            )
+
+    def test_automatic_concurrency_uses_detected_workers_and_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(
+                Path(directory),
+                ingestion_concurrency=None,
+                ingestion_concurrency_max=3,
+            )
+            state = connector.RuntimeState()
+            with mock.patch.object(connector, "detect_docling_workers", return_value=5):
+                self.assertEqual(
+                    connector.effective_ingestion_concurrency(config, state), 3
+                )
+            snapshot = state.snapshot()
+            self.assertEqual(snapshot["docling_workers_detected"], 5)
+            self.assertEqual(snapshot["ingestion_concurrency_effective"], 3)
+            self.assertTrue(snapshot["worker_detection_success"])
+
+    def test_automatic_concurrency_stops_at_zero_and_falls_back_on_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(
+                Path(directory),
+                ingestion_concurrency=None,
+                ingestion_concurrency_fallback=2,
+            )
+            with mock.patch.object(connector, "detect_docling_workers", return_value=0):
+                self.assertEqual(connector.effective_ingestion_concurrency(config), 0)
+            with mock.patch.object(
+                connector,
+                "detect_docling_workers",
+                side_effect=OSError("metrics indisponibles"),
+            ):
+                self.assertEqual(connector.effective_ingestion_concurrency(config), 2)
 
     def test_secret_rotation_is_atomic_private_and_never_rendered(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1703,6 +1757,10 @@ class ConnectorTests(unittest.TestCase):
             deployment,
         )
         self.assertIn("name: OPENRAG_INGEST_MODE\n              value: api", deployment)
+        self.assertIn("name: INGESTION_CONCURRENCY\n              value: auto", deployment)
+        self.assertIn("name: INGESTION_CONCURRENCY_FALLBACK", deployment)
+        self.assertIn("name: DOCLING_METRICS_URL", deployment)
+        self.assertIn("docling-serve.docling.svc.cluster.local:5001/metrics", deployment)
         self.assertIn("claimName: openrag-shared", deployment)
         self.assertIn("type: ClusterIP", service)
         self.assertNotIn("NodePort", service)
