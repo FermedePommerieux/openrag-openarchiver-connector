@@ -2497,6 +2497,14 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
         self.assertIn('data-workspace-tab="sources"', page)
         self.assertIn('data-workspace-tab="configuration"', page)
         self.assertIn('data-workspace-panel="sources" hidden', page)
+        ingestion_panel, sources_and_configuration = page.split(
+            '<section id="workspace-panel-sources"', 1
+        )
+        sources_panel = sources_and_configuration.split(
+            '<section id="workspace-panel-configuration"', 1
+        )[0]
+        self.assertNotIn('id="retry-card"', ingestion_panel)
+        self.assertIn('id="retry-card"', sources_panel)
         self.assertNotIn("Remise à zéro", page)
         self.assertNotIn('action="/reset"', page)
         self.assertNotIn('<script src="http', page)

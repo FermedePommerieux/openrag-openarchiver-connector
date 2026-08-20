@@ -258,10 +258,10 @@ Routes de lecture :
 | `/inventory-status` | fragment d'état de l'inventaire |
 
 L'interface est répartie en trois onglets persistants : **État de
-l'ingestion**, **Sources** et **Configuration**. Le premier regroupe le suivi,
-la pause, la réconciliation et les reprises ; le second contient l'inventaire
-IMAP et le périmètre OpenArchiver ; le dernier contient l'identité OpenRAG et
-les clés techniques.
+l'ingestion**, **Sources** et **Configuration**. Le premier regroupe le suivi et
+la pause ; le second contient l'inventaire IMAP, le périmètre OpenArchiver, la
+réconciliation et les reprises ; le dernier contient l'identité OpenRAG et les
+clés techniques.
 
 Actions POST : `/sources`, `/mailboxes`, `/scan`, `/pause`, `/retry`,
 `/reconcile` et `/secrets`. Elles exigent toutes le jeton CSRF de la
