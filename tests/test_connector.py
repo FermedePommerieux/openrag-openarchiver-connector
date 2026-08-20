@@ -1107,6 +1107,119 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                     )
                 )
 
+    def test_reconciliation_restores_found_and_marks_missing_validated_lost(self):
+        class ReconciliationOpenRAG:
+            def __init__(self, documents):
+                self.documents = documents
+                self.calls = []
+
+            def indexed_documents(self, filenames):
+                self.calls.append(list(filenames))
+                return {
+                    name: self.documents[name]
+                    for name in filenames
+                    if name in self.documents
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            missing_id = self._insert_email(
+                config, self.mail("missing-mail"), "validated"
+            )
+            restored_id = self._insert_email(
+                config, self.mail("restored-mail"), "lost"
+            )
+            failed_id = self._insert_email(
+                config, self.mail("failed-mail"), "failed"
+            )
+            hashes = {
+                missing_id: hashlib.sha256(b"missing").hexdigest(),
+                restored_id: hashlib.sha256(b"restored").hexdigest(),
+                failed_id: hashlib.sha256(b"failed").hexdigest(),
+            }
+            with connector.database(config) as db:
+                for object_id, sha256 in hashes.items():
+                    db.execute(
+                        "UPDATE emails SET sha256=?, attempts=3 WHERE id=?",
+                        (sha256, object_id),
+                    )
+                restored_name = db.execute(
+                    "SELECT openrag_filename FROM emails WHERE id=?", (restored_id,)
+                ).fetchone()[0]
+                failed_name = db.execute(
+                    "SELECT openrag_filename FROM emails WHERE id=?", (failed_id,)
+                ).fetchone()[0]
+            rag = ReconciliationOpenRAG(
+                {
+                    restored_name: {
+                        "filename": restored_name,
+                        "document_id": connector.openrag_document_id(
+                            hashes[restored_id]
+                        ),
+                        "chunk_count": 4,
+                    },
+                    failed_name: {
+                        "filename": failed_name,
+                        "document_id": "obsolete",
+                        "chunk_count": 1,
+                    },
+                }
+            )
+            progress = []
+            result = connector.reconcile_openrag(
+                config, rag, progress=lambda current, total: progress.append((current, total))
+            )
+            self.assertEqual(result, connector.ReconciliationResult(3, 1, 1))
+            self.assertEqual(progress, [(0, 3), (3, 3)])
+            rows = {row["id"]: row for row in self.rows(config, "emails")}
+            self.assertEqual(rows[missing_id]["status"], "lost")
+            self.assertEqual(rows[missing_id]["attempts"], 0)
+            self.assertGreater(rows[missing_id]["next_retry_at"], 0)
+            self.assertEqual(rows[restored_id]["status"], "validated")
+            self.assertEqual(rows[restored_id]["last_error"], "")
+            self.assertEqual(rows[failed_id]["status"], "failed")
+
+    def test_reconciliation_button_exposes_live_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            state = connector.RuntimeState()
+            wake = threading.Event()
+            server = connector.ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                connector.make_http_handler(
+                    config, state, reconciliation_wake=wake
+                ),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                with urllib.request.urlopen(base + "/") as response:
+                    page = response.read().decode()
+                self.assertIn('action="/reconcile"', page)
+                self.assertIn('id="reconciliation-progress"', page)
+                request = urllib.request.Request(
+                    base + "/reconcile",
+                    data=urllib.parse.urlencode(
+                        {"csrf": state.snapshot()["csrf_token"]}
+                    ).encode(),
+                )
+                with urllib.request.urlopen(request) as response:
+                    self.assertEqual(response.status, 200)
+                self.assertTrue(wake.is_set())
+                self.assertTrue(state.snapshot()["reconciliation_requested_at"])
+                state.reconciliation_started()
+                state.reconciliation_progress(25, 100)
+                with urllib.request.urlopen(base + "/status.json") as response:
+                    status = json.loads(response.read())
+                self.assertTrue(status["reconciliation_in_progress"])
+                self.assertEqual(status["reconciliation_current"], 25)
+                self.assertEqual(status["reconciliation_total"], 100)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_openrag_ingest_path_uses_json_replace_duplicates(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

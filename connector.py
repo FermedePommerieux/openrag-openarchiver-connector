@@ -68,8 +68,10 @@ RQ_WORKER_METRIC = re.compile(
 PROMETHEUS_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
 STOP = threading.Event()
 WAKE = threading.Event()
+RECONCILE_WAKE = threading.Event()
 SCHEMA_VERSION = 2
 SCHEMA_LOCK = threading.Lock()
+RECONCILE_BATCH_SIZE = 100
 
 
 class ConnectorError(RuntimeError):
@@ -92,6 +94,13 @@ class IncompleteScanError(ConnectorError):
 
 class FileTooLargeError(ConnectorError):
     pass
+
+
+@dataclass(frozen=True)
+class ReconciliationResult:
+    checked: int
+    restored: int
+    lost: int
 
 
 @dataclass(frozen=True)
@@ -1762,8 +1771,21 @@ class OpenRAGClient:
 
     def indexed_document(self, filename: str) -> dict[str, object] | None:
         """Retourne le document durable correspondant exactement au nom fourni."""
+        return self.indexed_documents([filename]).get(filename)
+
+    def indexed_documents(
+        self, filenames: Sequence[str]
+    ) -> dict[str, dict[str, object]]:
+        """Retourne en une requête les documents durables demandés par leur nom."""
+        requested = list(dict.fromkeys(filenames))
+        if not requested or len(requested) > 500:
+            raise ConnectorError("lot de vérification OpenRAG invalide")
         query = urllib.parse.urlencode(
-            {"data_sources": filename, "page_size": 2, "sort_by": "filename"}
+            [
+                *(("data_sources", filename) for filename in requested),
+                ("page_size", str(len(requested))),
+                ("sort_by", "filename"),
+            ]
         )
         request = urllib.request.Request(
             f"{self.config.openrag_base_url}/v2/files?{query}",
@@ -1787,33 +1809,28 @@ class OpenRAGClient:
         files = result.get("files")
         if not isinstance(files, list):
             raise ConnectorError("réponse de documents OpenRAG sans liste de fichiers")
-        matches = [
-            item
-            for item in files
-            if isinstance(item, dict) and item.get("filename") == filename
-        ]
-        if len(matches) > 1:
-            raise ConnectorError(f"plusieurs documents OpenRAG nommés {filename}")
-        return matches[0] if matches else None
+        requested_set = set(requested)
+        matches: dict[str, dict[str, object]] = {}
+        for item in files:
+            if not isinstance(item, dict):
+                continue
+            filename = str(item.get("filename", ""))
+            if filename not in requested_set:
+                continue
+            if filename in matches:
+                raise ConnectorError(f"plusieurs documents OpenRAG nommés {filename}")
+            matches[filename] = item
+        return matches
 
     def document_is_indexed(
         self, filename: str, sha256: str, *, attempts: int = 3
     ) -> bool:
         """Prouve que les octets soumis sont disponibles comme chunks OpenRAG."""
-        expected_id = openrag_document_id(sha256)
         tries = max(1, attempts)
         for attempt in range(tries):
             document = self.indexed_document(filename)
-            if document is not None:
-                try:
-                    chunk_count = int(document.get("chunk_count", 0))
-                except (TypeError, ValueError):
-                    chunk_count = 0
-                if (
-                    chunk_count > 0
-                    and str(document.get("document_id", "")) == expected_id
-                ):
-                    return True
+            if document is not None and _document_matches(document, sha256):
+                return True
             if attempt + 1 < tries:
                 self.sleeper(1)
         return False
@@ -1881,6 +1898,104 @@ def wait_for_indexed_document(
         raise ConnectorError(
             "tâche OpenRAG terminée sans document indexé correspondant"
         )
+
+
+def reconciliation_rows(config: Config) -> list[sqlite3.Row]:
+    """Instantané des connaissances sélectionnées dont le contenu est vérifiable."""
+    with database(config) as db:
+        return list(
+            db.execute(
+                """
+                SELECT 'email' AS kind, e.id, e.openrag_filename, e.sha256, e.status
+                FROM emails e
+                WHERE e.status IN ('validated','lost','failed') AND e.sha256<>''
+                  AND EXISTS (
+                    SELECT 1 FROM sources s
+                    JOIN mailboxes m
+                      ON m.source_id=e.source_id AND m.path=e.mailbox_path
+                    WHERE s.id=e.source_id AND s.selected=1 AND m.selected=1
+                  )
+                UNION ALL
+                SELECT 'attachment' AS kind, a.id, a.openrag_filename,
+                       a.sha256, a.status
+                FROM attachments a
+                WHERE a.status IN ('validated','lost','failed') AND a.sha256<>''
+                  AND EXISTS (
+                    SELECT 1 FROM email_attachments ea
+                    JOIN emails e ON e.id=ea.email_id
+                    JOIN sources s ON s.id=e.source_id
+                    JOIN mailboxes m
+                      ON m.source_id=e.source_id AND m.path=e.mailbox_path
+                    WHERE ea.attachment_id=a.id
+                      AND s.selected=1 AND m.selected=1
+                  )
+                ORDER BY kind, id
+                """
+            )
+        )
+
+
+def _document_matches(document: Mapping[str, object] | None, sha256: str) -> bool:
+    if document is None:
+        return False
+    try:
+        chunk_count = int(document.get("chunk_count", 0))
+    except (TypeError, ValueError):
+        chunk_count = 0
+    return (
+        chunk_count > 0
+        and str(document.get("document_id", "")) == openrag_document_id(sha256)
+    )
+
+
+def reconcile_openrag(
+    config: Config,
+    openrag: OpenRAGClient,
+    progress: Callable[[int, int], None] | None = None,
+) -> ReconciliationResult:
+    """Réconcilie l'état SQLite avec les chunks réellement visibles dans OpenRAG."""
+    rows = reconciliation_rows(config)
+    total = len(rows)
+    checked = restored = lost = 0
+    report = progress or (lambda _current, _total: None)
+    report(0, total)
+    for offset in range(0, total, RECONCILE_BATCH_SIZE):
+        batch = rows[offset : offset + RECONCILE_BATCH_SIZE]
+        documents = openrag.indexed_documents(
+            [str(row["openrag_filename"]) for row in batch]
+        )
+        now = int(time.time())
+        with database(config) as db:
+            for row in batch:
+                filename = str(row["openrag_filename"])
+                matches = _document_matches(documents.get(filename), str(row["sha256"]))
+                table = "emails" if row["kind"] == "email" else "attachments"
+                if matches and row["status"] in {"lost", "failed"}:
+                    cursor = db.execute(
+                        f"""
+                        UPDATE {table}
+                        SET status='validated', last_success_at=?, last_error='',
+                            next_retry_at=0
+                        WHERE id=? AND status=? AND sha256=?
+                        """,
+                        (now, row["id"], row["status"], row["sha256"]),
+                    )
+                    restored += cursor.rowcount
+                elif not matches and row["status"] == "validated":
+                    cursor = db.execute(
+                        f"""
+                        UPDATE {table}
+                        SET status='lost', attempts=0, task_id='',
+                            last_error='document absent ou obsolète dans OpenRAG',
+                            next_retry_at=?
+                        WHERE id=? AND status='validated' AND sha256=?
+                        """,
+                        (now, row["id"], row["sha256"]),
+                    )
+                    lost += cursor.rowcount
+        checked += len(batch)
+        report(checked, total)
+    return ReconciliationResult(checked, restored, lost)
 
 
 def claim_next(config: Config, *, now: int | None = None) -> WorkItem | None:
@@ -2311,6 +2426,15 @@ class RuntimeState:
         self.last_processed = 0
         self.reset_requested_at = 0
         self.last_reset_at = 0
+        self.reconciliation_requested_at = 0
+        self.reconciliation_started_at = 0
+        self.reconciliation_completed_at = 0
+        self.reconciliation_in_progress = False
+        self.reconciliation_current = 0
+        self.reconciliation_total = 0
+        self.reconciliation_restored = 0
+        self.reconciliation_lost = 0
+        self.reconciliation_error = ""
         self.docling_workers_detected = -1
         self.ingestion_concurrency_effective = 0
         self.worker_detection_success = False
@@ -2430,6 +2554,56 @@ class RuntimeState:
             self.last_error = _safe_error(error)
             self._notify_changed()
 
+    def reconciliation_requested(self) -> bool:
+        with self.changed:
+            if self.reconciliation_requested_at or self.reconciliation_in_progress:
+                return False
+            self.reconciliation_requested_at = int(time.time())
+            self.reconciliation_error = ""
+            self._notify_changed()
+            return True
+
+    def reconciliation_pending(self) -> bool:
+        with self.lock:
+            return bool(self.reconciliation_requested_at)
+
+    def reconciliation_started(self) -> None:
+        with self.changed:
+            self.reconciliation_requested_at = 0
+            self.reconciliation_started_at = int(time.time())
+            self.reconciliation_in_progress = True
+            self.reconciliation_current = 0
+            self.reconciliation_total = 0
+            self.reconciliation_restored = 0
+            self.reconciliation_lost = 0
+            self.reconciliation_error = ""
+            self._notify_changed()
+
+    def reconciliation_progress(self, current: int, total: int) -> None:
+        with self.changed:
+            if self.reconciliation_in_progress:
+                self.reconciliation_current = max(0, current)
+                self.reconciliation_total = max(0, total)
+                self._notify_changed()
+
+    def reconciliation_succeeded(self, result: ReconciliationResult) -> None:
+        with self.changed:
+            self.reconciliation_completed_at = int(time.time())
+            self.reconciliation_in_progress = False
+            self.reconciliation_current = result.checked
+            self.reconciliation_total = result.checked
+            self.reconciliation_restored = result.restored
+            self.reconciliation_lost = result.lost
+            self.reconciliation_error = ""
+            self._notify_changed()
+
+    def reconciliation_failed(self, error: Exception) -> None:
+        with self.changed:
+            self.reconciliation_completed_at = int(time.time())
+            self.reconciliation_in_progress = False
+            self.reconciliation_error = _safe_error(error)
+            self._notify_changed()
+
     def cycle_succeeded(self, scan: ScanResult, processed: int) -> None:
         with self.changed:
             self.last_cycle_completed_at = int(time.time())
@@ -2468,6 +2642,15 @@ class RuntimeState:
                 "last_processed": self.last_processed,
                 "reset_requested_at": self.reset_requested_at,
                 "last_reset_at": self.last_reset_at,
+                "reconciliation_requested_at": self.reconciliation_requested_at,
+                "reconciliation_started_at": self.reconciliation_started_at,
+                "reconciliation_completed_at": self.reconciliation_completed_at,
+                "reconciliation_in_progress": self.reconciliation_in_progress,
+                "reconciliation_current": self.reconciliation_current,
+                "reconciliation_total": self.reconciliation_total,
+                "reconciliation_restored": self.reconciliation_restored,
+                "reconciliation_lost": self.reconciliation_lost,
+                "reconciliation_error": self.reconciliation_error,
                 "docling_workers_detected": self.docling_workers_detected,
                 "ingestion_concurrency_effective": self.ingestion_concurrency_effective,
                 "worker_detection_success": self.worker_detection_success,
@@ -2691,6 +2874,42 @@ def runtime_loop(
         state.set_running(False)
 
 
+def reconciliation_loop(
+    config: Config,
+    state: RuntimeState,
+    *,
+    openrag: OpenRAGClient | None = None,
+    stop: threading.Event = STOP,
+    wake: threading.Event = RECONCILE_WAKE,
+    queue_wake: threading.Event = WAKE,
+) -> None:
+    """Exécute les audits OpenRAG demandés sans bloquer l'ingestion courante."""
+    rag_client = openrag or OpenRAGClient(config)
+    while not stop.is_set():
+        wake.wait(1)
+        wake.clear()
+        if stop.is_set() or not state.reconciliation_pending():
+            continue
+        state.reconciliation_started()
+        try:
+            result = reconcile_openrag(
+                config, rag_client, progress=state.reconciliation_progress
+            )
+            state.reconciliation_succeeded(result)
+            if result.lost:
+                state.cycle_requested()
+                queue_wake.set()
+            LOG.info(
+                "réconciliation terminée: vérifiés=%d restaurés=%d perdus=%d",
+                result.checked,
+                result.restored,
+                result.lost,
+            )
+        except Exception as error:
+            state.reconciliation_failed(error)
+            LOG.error("réconciliation OpenRAG en échec: %s", _safe_error(error))
+
+
 def _status_counts(
     config: Config, *, selected_only: bool = False
 ) -> dict[str, dict[str, int]]:
@@ -2802,10 +3021,10 @@ STATUS_PAGE_STYLE = """
 .app{min-height:100vh;display:grid;grid-template-rows:64px 1fr;grid-template-columns:224px minmax(0,1fr)}.topbar{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);background:var(--background);padding:0 20px;position:sticky;top:0;z-index:2}.brand{display:flex;align-items:center;gap:10px;font:600 18px/1 ui-monospace,SFMono-Regular,Menlo,monospace}.brand-logo{width:24px;height:22px;fill:currentColor}.connector-chip{border:1px solid var(--border);border-radius:999px;padding:5px 10px;color:var(--muted-foreground);font-size:12px}.sidebar{border-right:1px solid var(--border);background:var(--sidebar);padding:16px}.nav-label{display:block;margin:8px 12px 10px;color:var(--muted-foreground);font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}.nav-item{display:flex;align-items:center;gap:10px;border-radius:var(--radius);padding:11px 12px;background:var(--muted);font-size:13px;font-weight:600}.nav-icon{width:18px;height:18px}.main{min-width:0;padding:32px}.content{max-width:1120px;margin:0 auto}.page-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.eyebrow{margin:0 0 4px;color:var(--muted-foreground);font-size:12px;font-weight:600}.page-heading h1{margin:0;font-size:24px;line-height:1.25;letter-spacing:-.02em}.page-heading p{margin:7px 0 0;color:var(--muted-foreground)}.toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.toolbar form{margin:0}
 .status-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:20px}.stat-card,.card{border:1px solid var(--border);border-radius:var(--radius);background:var(--card);box-shadow:var(--shadow)}.stat-card{padding:16px}.stat-label{display:flex;align-items:center;gap:7px;color:var(--muted-foreground);font-size:12px;font-weight:600}.dot{width:8px;height:8px;border-radius:50%;background:var(--muted-foreground)}.dot.success{background:var(--success)}.dot.warning{background:#f59e0b}.dot.danger{background:var(--danger)}.stat-value{display:block;margin-top:8px;font-size:22px;font-weight:650;letter-spacing:-.03em}.stat-detail{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px}.card{margin-bottom:16px;overflow:hidden}.card-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:18px 20px;border-bottom:1px solid var(--border)}.card-title{margin:0;font-size:15px}.card-description{margin:3px 0 0;color:var(--muted-foreground);font-size:13px}.card-body{padding:20px}.card-footer{display:flex;justify-content:flex-end;padding:14px 20px;border-top:1px solid var(--border);background:var(--sidebar)}.badge{display:inline-flex;align-items:center;border-radius:999px;background:var(--muted);padding:3px 8px;color:var(--muted-foreground);font-size:11px;font-weight:600}.badge.success{background:var(--success-soft);color:var(--success)}.badge.warning{background:var(--warning-soft);color:var(--warning)}.badge.danger{background:var(--danger-soft);color:var(--danger)}
 .inventory-row{display:flex;align-items:center;gap:12px}.inventory-status{display:block;width:100%;min-height:24px;font-weight:600}.inventory-status.running{color:var(--success)}.progress-wrap{margin-top:12px}.progress-track{height:10px;overflow:hidden;border-radius:999px;background:var(--muted)}.progress-bar{height:100%;width:0;border-radius:inherit;background:var(--success);transition:width .25s ease}.progress-bar.indeterminate{width:35%;animation:progress-slide 1.2s ease-in-out infinite}.progress-label{display:block;margin-top:5px;color:var(--muted-foreground);font-size:12px;text-align:right}@keyframes progress-slide{0%{transform:translateX(-110%)}100%{transform:translateX(300%)}}.helper{margin:10px 0 0;color:var(--muted-foreground);font-size:12px}.error-alert{display:flex;gap:10px;margin-bottom:16px;border:1px solid #fecaca;border-radius:var(--radius);background:var(--danger-soft);padding:13px 15px;color:#991b1b}.error-alert strong{display:block}.selection-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:320px;overflow:auto}.selection-item{display:flex;align-items:flex-start;gap:11px;margin:0;border:1px solid var(--border);border-radius:var(--radius);padding:12px;cursor:pointer;transition:background .15s,border-color .15s}.selection-item:hover{background:var(--muted)}.selection-item:has(input:checked){border-color:#a1a1aa;background:var(--muted)}.selection-item input{width:16px;height:16px;margin:2px 0 0;accent-color:var(--primary);flex:0 0 auto}.selection-copy{min-width:0}.selection-title{display:block;font-weight:600;overflow-wrap:anywhere}.selection-meta{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px;overflow-wrap:anywhere}.empty{grid-column:1/-1;margin:0;border:1px dashed var(--border);border-radius:var(--radius);padding:22px;text-align:center;color:var(--muted-foreground)}.counts{display:flex;flex-wrap:wrap;gap:6px}.operation-grid,.secret-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.secret-field{display:grid;gap:6px;color:var(--muted-foreground);font-size:12px;font-weight:600}.secret-field input{width:100%;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}.danger-card{border-color:#fecaca}.danger-card .card-header{background:var(--danger-soft)}.confirm-row{display:flex;align-items:end;gap:10px}.confirm-row label{flex:1;margin:0;color:var(--muted-foreground);font-size:12px;font-weight:600}.confirm-row input{display:block;width:100%;margin-top:6px;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}code{border-radius:4px;background:var(--muted);padding:2px 5px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.footer-note{padding:8px 0 24px;text-align:center;color:var(--muted-foreground);font-size:12px}
-.retry-tabs{position:relative}.tab-toggle{position:absolute;opacity:0;pointer-events:none}.tab-label{display:inline-flex;margin:0 6px 14px 0;border:1px solid var(--border);border-radius:999px;padding:7px 12px;color:var(--muted-foreground);cursor:pointer;font-weight:600}.tab-panel{display:none}.retry-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px}.retry-select-all{display:flex;align-items:center;gap:8px;color:var(--muted-foreground);font-size:12px}.retry-select-all input{width:16px;height:16px;accent-color:var(--primary)}#retry-tab-lost:checked~label[for="retry-tab-lost"],#retry-tab-failed:checked~label[for="retry-tab-failed"]{border-color:var(--primary);background:var(--primary);color:var(--primary-foreground)}#retry-tab-lost:checked~.tab-panels>#retry-panel-lost,#retry-tab-failed:checked~.tab-panels>#retry-panel-failed{display:block}
+.reconciliation-row{display:flex;align-items:center;justify-content:space-between;gap:16px}.reconciliation-row form{flex:0 0 auto}.section-rule{margin:18px 0;border:0;border-top:1px solid var(--border)}.retry-tabs{position:relative}.tab-toggle{position:absolute;opacity:0;pointer-events:none}.tab-label{display:inline-flex;margin:0 6px 14px 0;border:1px solid var(--border);border-radius:999px;padding:7px 12px;color:var(--muted-foreground);cursor:pointer;font-weight:600}.tab-panel{display:none}.retry-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px}.retry-select-all{display:flex;align-items:center;gap:8px;color:var(--muted-foreground);font-size:12px}.retry-select-all input{width:16px;height:16px;accent-color:var(--primary)}#retry-tab-lost:checked~label[for="retry-tab-lost"],#retry-tab-failed:checked~label[for="retry-tab-failed"]{border-color:var(--primary);background:var(--primary);color:var(--primary-foreground)}#retry-tab-lost:checked~.tab-panels>#retry-panel-lost,#retry-tab-failed:checked~.tab-panels>#retry-panel-failed{display:block}
 @media(prefers-color-scheme:dark){:root{--background:#18181b;--foreground:#fafafa;--muted:#27272a;--muted-foreground:#a1a1aa;--border:#3f3f46;--card:#18181b;--sidebar:#111113;--primary:#fafafa;--primary-foreground:#09090b;--danger:#f87171;--danger-soft:#2b1719;--success:#34d399;--success-soft:#10251e;--warning:#fbbf24;--warning-soft:#2b2414;--shadow:none}.primary:hover{background:#e4e4e7}.danger-card,.error-alert{border-color:#7f1d1d}.danger-card .card-header{background:var(--danger-soft)}.error-alert{color:#fecaca}.selection-item:has(input:checked){border-color:#71717a}}
 @media(max-width:900px){.app{grid-template-columns:1fr;grid-template-rows:64px auto 1fr}.sidebar{border-right:0;border-bottom:1px solid var(--border);padding:8px 16px}.nav-label{display:none}.nav-item{width:max-content;padding:8px 12px}.main{padding:24px 18px}.status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.operation-grid,.secret-grid{grid-template-columns:1fr}}
-@media(max-width:620px){.connector-chip{display:none}.page-heading{display:block}.toolbar{margin-top:16px}.toolbar button{flex:1}.toolbar form{display:flex;flex:1}.selection-list{grid-template-columns:1fr}.status-grid{grid-template-columns:1fr 1fr}.stat-card{padding:13px}.stat-value{font-size:19px}.card-header,.card-body{padding:16px}.card-footer{padding:12px 16px}.card-footer button{width:100%}.confirm-row{align-items:stretch;flex-direction:column}.confirm-row button{width:100%}}
+@media(max-width:620px){.connector-chip{display:none}.page-heading{display:block}.toolbar{margin-top:16px}.toolbar button{flex:1}.toolbar form{display:flex;flex:1}.selection-list{grid-template-columns:1fr}.status-grid{grid-template-columns:1fr 1fr}.stat-card{padding:13px}.stat-value{font-size:19px}.card-header,.card-body{padding:16px}.card-footer{padding:12px 16px}.card-footer button{width:100%}.reconciliation-row{align-items:stretch;flex-direction:column}.reconciliation-row button{width:100%}.confirm-row{align-items:stretch;flex-direction:column}.confirm-row button{width:100%}}
 """
 
 
@@ -2835,6 +3054,16 @@ def render_live_status(state: RuntimeState) -> str:
             "last_processed": int(snapshot["last_processed"]),
             "progress_current": int(snapshot["progress_current"]),
             "progress_total": int(snapshot["progress_total"]),
+            "reconciliation_requested": bool(snapshot["reconciliation_requested_at"]),
+            "reconciliation_in_progress": bool(snapshot["reconciliation_in_progress"]),
+            "reconciliation_completed_at": int(
+                snapshot["reconciliation_completed_at"]
+            ),
+            "reconciliation_current": int(snapshot["reconciliation_current"]),
+            "reconciliation_total": int(snapshot["reconciliation_total"]),
+            "reconciliation_restored": int(snapshot["reconciliation_restored"]),
+            "reconciliation_lost": int(snapshot["reconciliation_lost"]),
+            "reconciliation_error": str(snapshot["reconciliation_error"] or ""),
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -2855,9 +3084,16 @@ UI_SCRIPT = r"""(() => {
   const progressLabel = document.getElementById("cycle-progress-label");
   const cycleTitle = document.getElementById("cycle-card-title");
   const cycleDescription = document.getElementById("cycle-card-description");
+  const reconciliationButton = document.getElementById("reconciliation-button");
+  const reconciliationStatus = document.getElementById("reconciliation-status");
+  const reconciliationDetail = document.getElementById("reconciliation-detail");
+  const reconciliationProgress = document.getElementById("reconciliation-progress");
+  const reconciliationBar = document.getElementById("reconciliation-progress-bar");
+  const reconciliationLabel = document.getElementById("reconciliation-progress-label");
   if (!badge || !summary || !dot || !button || !completion) return;
   let observedActive = document.body.dataset.cycleActive === "true";
   let observedStage = document.body.dataset.cycleStage || "idle";
+  let observedReconciliation = document.body.dataset.reconciliationActive === "true";
   const refreshInventoryDisplay = async () => {
     const response = await fetch("/?inventory-fragment=1", {cache: "no-store"});
     if (!response.ok) throw new Error("actualisation de l’inventaire impossible");
@@ -2888,6 +3124,29 @@ UI_SCRIPT = r"""(() => {
       const replacement = fresh.getElementById(id);
       if (current && replacement) current.innerHTML = replacement.innerHTML;
     });
+  };
+  const bindRetrySelectors = () => {
+    document.querySelectorAll(".retry-select-all input").forEach(control => {
+      if (control.dataset.bound === "true") return;
+      control.dataset.bound = "true";
+      control.addEventListener("change", () => {
+        const status = control.dataset.retryStatus;
+        document.querySelectorAll(`input[data-retry-object="${status}"]`).forEach(input => {
+          input.checked = control.checked;
+        });
+      });
+    });
+  };
+  const refreshRetryDisplay = async () => {
+    const response = await fetch("/", {cache: "no-store"});
+    if (!response.ok) throw new Error("actualisation de la réindexation impossible");
+    const fresh = new DOMParser().parseFromString(await response.text(), "text/html");
+    ["retry-count-badge", "retry-tabs"].forEach(id => {
+      const current = document.getElementById(id);
+      const replacement = fresh.getElementById(id);
+      if (current && replacement) current.innerHTML = replacement.innerHTML;
+    });
+    bindRetrySelectors();
   };
   const applyStatus = async status => {
       const active = Boolean(status.cycle_in_progress);
@@ -2941,6 +3200,38 @@ UI_SCRIPT = r"""(() => {
           progressWrap.removeAttribute("aria-valuenow");
         }
       }
+      const reconciling = Boolean(status.reconciliation_in_progress);
+      const reconciliationRequested = Boolean(status.reconciliation_requested);
+      const reconciliationActive = reconciling || reconciliationRequested;
+      observedReconciliation = observedReconciliation || reconciliationActive;
+      if (reconciliationButton) {
+        reconciliationButton.disabled = reconciliationActive;
+        reconciliationButton.type = reconciliationActive ? "button" : "submit";
+        reconciliationButton.textContent = reconciling ? "Réconciliation en cours…" :
+          (reconciliationRequested ? "Réconciliation demandée…" : "Réconcilier avec OpenRAG");
+      }
+      if (reconciliationStatus) {
+        reconciliationStatus.textContent = reconciling ? "Réconciliation en cours…" :
+          (reconciliationRequested ? "Réconciliation demandée…" :
+            (status.reconciliation_error ? "Réconciliation interrompue" : "Réconciliation terminée"));
+      }
+      if (reconciliationDetail) {
+        reconciliationDetail.textContent = status.reconciliation_error ||
+          (reconciliationActive ? "Comparaison des connaissances locales avec OpenRAG." :
+            `${status.reconciliation_current} vérifié(s) · ${status.reconciliation_restored} restauré(s) · ${status.reconciliation_lost} perdu(s) détecté(s)`);
+      }
+      if (reconciliationProgress && reconciliationBar && reconciliationLabel) {
+        const current = Number(status.reconciliation_current || 0);
+        const total = Number(status.reconciliation_total || 0);
+        reconciliationProgress.hidden = !reconciliationActive;
+        reconciliationBar.classList.toggle("indeterminate", reconciliationActive && total <= 0);
+        reconciliationBar.style.width = total > 0 ? Math.min(100, current * 100 / total) + "%" : "";
+        reconciliationLabel.textContent = total > 0 ? current + " / " + total + " · " + Math.round(current * 100 / total) + " %" : "Préparation…";
+      }
+      if (observedReconciliation && !reconciliationActive) {
+        await refreshRetryDisplay();
+        observedReconciliation = false;
+      }
       if (observedActive && !active && !requested) {
         await refreshInventoryDisplay();
         completion.hidden = false;
@@ -2962,14 +3253,7 @@ UI_SCRIPT = r"""(() => {
       // Le flux SSE ou la prochaine vérification reprendra automatiquement.
     }
   };
-  document.querySelectorAll(".retry-select-all input").forEach(control => {
-    control.addEventListener("change", () => {
-      const status = control.dataset.retryStatus;
-      document.querySelectorAll(`input[data-retry-object="${status}"]`).forEach(input => {
-        input.checked = control.checked;
-      });
-    });
-  });
+  bindRetrySelectors();
   if (window.EventSource) {
     const events = new EventSource("/events");
     events.addEventListener("status", event => {
@@ -3190,13 +3474,45 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
         if current_stage == "ingestion"
         else "État du cycle de découverte des sources et dossiers."
     )
+    reconciliation_active = bool(
+        snapshot["reconciliation_requested_at"]
+        or snapshot["reconciliation_in_progress"]
+    )
+    reconciliation_error = str(snapshot["reconciliation_error"] or "")
+    if snapshot["reconciliation_in_progress"]:
+        reconciliation_label = "Réconciliation en cours…"
+        reconciliation_detail = "Comparaison des connaissances locales avec OpenRAG."
+    elif snapshot["reconciliation_requested_at"]:
+        reconciliation_label = "Réconciliation demandée…"
+        reconciliation_detail = "Le scan va démarrer."
+    elif reconciliation_error:
+        reconciliation_label = "Réconciliation interrompue"
+        reconciliation_detail = reconciliation_error
+    elif snapshot["reconciliation_completed_at"]:
+        reconciliation_label = "Réconciliation terminée"
+        reconciliation_detail = (
+            f'{int(snapshot["reconciliation_current"])} vérifié(s) · '
+            f'{int(snapshot["reconciliation_restored"])} restauré(s) · '
+            f'{int(snapshot["reconciliation_lost"])} perdu(s) détecté(s)'
+        )
+    else:
+        reconciliation_label = "Aucune réconciliation lancée"
+        reconciliation_detail = (
+            "Le scan compare les documents validés, lost et failed avec les chunks OpenRAG."
+        )
+    reconciliation_button = (
+        '<button id="reconciliation-button" class="primary" type="button" disabled>'
+        f'{html.escape(reconciliation_label)}</button>'
+        if reconciliation_active
+        else '<button id="reconciliation-button" class="primary" type="submit">Réconcilier avec OpenRAG</button>'
+    )
     return f"""<!doctype html>
 <html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>Connecteur OpenArchiver · OpenRAG</title>
 <style>{STATUS_PAGE_STYLE}</style><script src="/ui.js" defer></script></head>
-<body data-cycle-active="{str(inventory_running or inventory_requested).lower()}" data-cycle-stage="{current_stage}" data-cycle-completed="{last_completed}">
+<body data-cycle-active="{str(inventory_running or inventory_requested).lower()}" data-cycle-stage="{current_stage}" data-cycle-completed="{last_completed}" data-reconciliation-active="{str(reconciliation_active).lower()}">
 <div class="app">
 <header class="topbar"><div class="brand">{OPENRAG_LOGO}<span>OpenRAG</span></div>
 <span class="connector-chip">OpenArchiver connector</span></header>
@@ -3224,8 +3540,8 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 <div id="email-status-counts" class="counts" aria-label="États des mails de la sélection"><span class="badge success">Sélection actuelle</span>{count_badges(selected_counts["emails"], "aucun mail")}</div>
 <p id="history-summary" class="helper">Historique local conservé : {historical_email_total} mail(s) ; {historical_attachment_total} pièce(s) jointe(s) déjà détaillée(s). Les éléments hors sélection ne sont pas envoyés à OpenRAG.</p></div>
 <div class="card-footer"><form method="post" action="/scan"><input type="hidden" name="csrf" value="{csrf}">{scan_button}</form></div></section>
-<section class="card"><div class="card-header"><div><h2 class="card-title">Réindexation</h2><p class="card-description">Sélectionnez les tâches perdues ou en échec à soumettre de nouveau à OpenRAG.</p></div><span class="badge warning">Lost {lost_total} · Failed {failed_total}</span></div>
-<div class="card-body"><div class="retry-tabs"><input class="tab-toggle" type="radio" name="retry-tab" id="retry-tab-lost" checked><label class="tab-label" for="retry-tab-lost">Lost · {lost_total}</label><input class="tab-toggle" type="radio" name="retry-tab" id="retry-tab-failed"><label class="tab-label" for="retry-tab-failed">Failed · {failed_total}</label><div class="tab-panels">{lost_panel}{failed_panel}</div></div><p class="helper">La réindexation réinitialise les tentatives des objets choisis. Si le connecteur est en pause, utilisez ensuite « Reprendre l’indexation ».</p></div></section>
+<section id="retry-card" class="card"><div class="card-header"><div><h2 class="card-title">Réindexation</h2><p class="card-description">Contrôlez OpenRAG puis resoumettez les tâches réellement perdues ou en échec.</p></div><span id="retry-count-badge" class="badge warning">Lost {lost_total} · Failed {failed_total}</span></div>
+<div class="card-body"><div class="reconciliation-row"><div><strong id="reconciliation-status">{html.escape(reconciliation_label)}</strong><p id="reconciliation-detail" class="helper">{html.escape(reconciliation_detail)}</p></div><form method="post" action="/reconcile"><input type="hidden" name="csrf" value="{csrf}">{reconciliation_button}</form></div><div id="reconciliation-progress" class="progress-wrap" role="progressbar" aria-label="Progression de la réconciliation" {'hidden' if not reconciliation_active else ''}><div class="progress-track"><div id="reconciliation-progress-bar" class="progress-bar"></div></div><span id="reconciliation-progress-label" class="progress-label">Préparation…</span></div><hr class="section-rule"><div id="retry-tabs" class="retry-tabs"><input class="tab-toggle" type="radio" name="retry-tab" id="retry-tab-lost" checked><label class="tab-label" for="retry-tab-lost">Lost · {lost_total}</label><input class="tab-toggle" type="radio" name="retry-tab" id="retry-tab-failed"><label class="tab-label" for="retry-tab-failed">Failed · {failed_total}</label><div class="tab-panels">{lost_panel}{failed_panel}</div></div><p class="helper">La réindexation réinitialise les tentatives des objets choisis. Si le connecteur est en pause, utilisez ensuite « Reprendre l’indexation ».</p></div></section>
 <form method="post" action="/secrets" class="card" autocomplete="off"><div class="card-header"><div><h2 class="card-title">Clés API</h2><p class="card-description">Renouvelez séparément les accès OpenArchiver et OpenRAG.</p></div><span class="badge">OpenArchiver : {openarchiver_key_state} · OpenRAG : {openrag_key_state}</span></div>
 <div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="secret-grid"><label class="secret-field">Nouvelle clé OpenArchiver<input type="password" name="openarchiver_key" autocomplete="new-password"></label><label class="secret-field">Nouvelle clé OpenRAG<input type="password" name="openrag_key" autocomplete="new-password"></label></div><p class="helper">Laissez un champ vide pour conserver sa valeur actuelle. Les clés ne sont jamais réaffichées ni enregistrées dans SQLite.</p></div>
 <div class="card-footer"><button class="primary" type="submit">Enregistrer les clés renseignées</button></div></form>
@@ -3278,6 +3594,7 @@ def make_http_handler(
     state: RuntimeState,
     *,
     wake: threading.Event = WAKE,
+    reconciliation_wake: threading.Event = RECONCILE_WAKE,
 ) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "OpenArchiverConnector/1"
@@ -3468,6 +3785,11 @@ def make_http_handler(
                     state.cycle_requested()
                     wake.set()
                     self._redirect()
+                elif path == "/reconcile":
+                    if not state.reconciliation_requested():
+                        raise ConnectorError("réconciliation OpenRAG déjà en cours")
+                    reconciliation_wake.set()
+                    self._redirect()
                 elif path == "/pause":
                     action = form.get("action", [""])[0]
                     if action not in {"pause", "resume"}:
@@ -3516,12 +3838,14 @@ def main() -> None:
 
     STOP.clear()
     WAKE.clear()
+    RECONCILE_WAKE.clear()
     state = RuntimeState()
     restore_cycle_outcome(config, state)
 
     def stop_service(_signum: int, _frame: object) -> None:
         STOP.set()
         WAKE.set()
+        RECONCILE_WAKE.set()
 
     signal.signal(signal.SIGTERM, stop_service)
     signal.signal(signal.SIGINT, stop_service)
@@ -3532,6 +3856,13 @@ def main() -> None:
         daemon=True,
     )
     worker.start()
+    reconciliation_worker = threading.Thread(
+        target=reconciliation_loop,
+        args=(config, state),
+        name="openarchiver-reconciliation",
+        daemon=True,
+    )
+    reconciliation_worker.start()
     server = ThreadingHTTPServer(
         (config.http_host, config.http_port), make_http_handler(config, state)
     )
@@ -3543,8 +3874,10 @@ def main() -> None:
     finally:
         STOP.set()
         WAKE.set()
+        RECONCILE_WAKE.set()
         server.server_close()
         worker.join(timeout=5)
+        reconciliation_worker.join(timeout=5)
 
 
 if __name__ == "__main__":
