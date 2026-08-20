@@ -1040,28 +1040,6 @@ def set_paused(config: Config, paused: bool) -> None:
         )
 
 
-def reset_state_database(config: Config) -> None:
-    """Vide l'état local du connecteur sans toucher aux systèmes sources.
-
-    Ce que l'on veut : repartir avec un inventaire OpenArchiver vierge.
-    Pourquoi : permettre une reconstruction propre après un test ou un mauvais choix.
-    Comment : vider les tables fonctionnelles dans une transaction et rester en pause.
-    Compatibilité : aucun mail OpenArchiver ni document OpenRAG n'est supprimé.
-    KISS : le schéma et le PVC restent en place ; seul leur contenu fonctionnel est effacé.
-    """
-    with database(config) as db:
-        for table in (
-            "email_attachments",
-            "attachments",
-            "emails",
-            "mailboxes",
-            "sources",
-            "settings",
-        ):
-            db.execute(f"DELETE FROM {table}")
-        db.execute("INSERT INTO settings(key,value) VALUES ('paused','1')")
-
-
 def mailbox_rows(config: Config) -> list[sqlite3.Row]:
     with database(config) as db:
         return list(
@@ -3109,8 +3087,6 @@ class RuntimeState:
         self.last_error = ""
         self.last_scan: ScanResult | None = None
         self.last_processed = 0
-        self.reset_requested_at = 0
-        self.last_reset_at = 0
         self.reconciliation_requested_at = 0
         self.reconciliation_started_at = 0
         self.reconciliation_completed_at = 0
@@ -3220,37 +3196,6 @@ class RuntimeState:
     def cycle_pending(self) -> bool:
         with self.lock:
             return bool(self.cycle_requested_at)
-
-    def reset_requested(self) -> None:
-        with self.changed:
-            self.reset_requested_at = int(time.time())
-            self._notify_changed()
-
-    def reset_pending(self) -> bool:
-        with self.lock:
-            return bool(self.reset_requested_at)
-
-    def reset_succeeded(self) -> None:
-        with self.changed:
-            self.reset_requested_at = 0
-            self.last_reset_at = int(time.time())
-            self.last_cycle_started_at = 0
-            self.last_cycle_completed_at = 0
-            self.cycle_requested_at = 0
-            self.force_inventory_requested = False
-            self.last_error = ""
-            self.last_scan = None
-            self.last_processed = 0
-            self.cycle_phase = ""
-            self.progress_current = 0
-            self.progress_total = 0
-            self.ready = True
-            self._notify_changed()
-
-    def reset_failed(self, error: Exception) -> None:
-        with self.changed:
-            self.last_error = _safe_error(error)
-            self._notify_changed()
 
     def reconciliation_requested(self) -> bool:
         with self.changed:
@@ -3395,8 +3340,6 @@ class RuntimeState:
                 "last_error": self.last_error,
                 "last_scan": self.last_scan,
                 "last_processed": self.last_processed,
-                "reset_requested_at": self.reset_requested_at,
-                "last_reset_at": self.last_reset_at,
                 "reconciliation_requested_at": self.reconciliation_requested_at,
                 "reconciliation_started_at": self.reconciliation_started_at,
                 "reconciliation_completed_at": self.reconciliation_completed_at,
@@ -3568,19 +3511,6 @@ def runtime_loop(
         if recovered:
             LOG.warning("%d opération(s) interrompue(s) récupérée(s)", recovered)
         while not stop.is_set():
-            if state.reset_pending():
-                try:
-                    reset_state_database(config)
-                    state.reset_succeeded()
-                    LOG.info("base locale remise à zéro")
-                    delay = config.scan_interval_seconds
-                except Exception as error:
-                    state.reset_failed(error)
-                    LOG.error("remise à zéro en échec: %s", _safe_error(error))
-                    delay = config.cycle_retry_seconds
-                wake.wait(delay)
-                wake.clear()
-                continue
             paused = is_paused(config)
             if paused and not state.cycle_pending():
                 if cached_inventory(config) is not None:
@@ -3824,15 +3754,16 @@ OPENRAG_LOGO = """<svg class="brand-logo" viewBox="0 0 200 164" aria-hidden="tru
 
 STATUS_PAGE_STYLE = """
 :root{color-scheme:light dark;--background:#fff;--foreground:#09090b;--muted:#f4f4f5;--muted-foreground:#71717a;--border:#e4e4e7;--card:#fff;--sidebar:#fafafa;--primary:#09090b;--primary-foreground:#fff;--danger:#dc2626;--danger-soft:#fef2f2;--success:#059669;--success-soft:#ecfdf5;--warning:#b45309;--warning-soft:#fffbeb;--radius:8px;--shadow:0 1px 2px rgba(0,0,0,.04)}
-*{box-sizing:border-box}html{background:var(--background)}body{margin:0;background:var(--background);color:var(--foreground);font:14px/1.5 Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input{font:inherit}button,input[type=text],input[type=password]{min-height:40px}button{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:1px solid var(--border);border-radius:var(--radius);background:var(--card);color:var(--foreground);padding:9px 14px;font-weight:600;cursor:pointer;transition:background .15s,border-color .15s,transform .05s}button:hover{background:var(--muted)}button:active{transform:translateY(1px)}button:focus-visible,input:focus-visible{outline:2px solid var(--foreground);outline-offset:2px}.primary{border-color:var(--primary);background:var(--primary);color:var(--primary-foreground)}.primary:hover{background:#27272a}.danger-button{border-color:var(--danger);color:var(--danger)}.danger-button:hover{background:var(--danger-soft)}
-.app{min-height:100vh;display:grid;grid-template-rows:64px 1fr;grid-template-columns:224px minmax(0,1fr)}.topbar{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);background:var(--background);padding:0 20px;position:sticky;top:0;z-index:2}.brand{display:flex;align-items:center;gap:10px;font:600 18px/1 ui-monospace,SFMono-Regular,Menlo,monospace}.brand-logo{width:24px;height:22px;fill:currentColor}.connector-chip{border:1px solid var(--border);border-radius:999px;padding:5px 10px;color:var(--muted-foreground);font-size:12px}.user-menu{display:flex;align-items:center;gap:9px}.user-menu form{margin:0}.user-menu button{min-height:32px;padding:5px 10px;font-size:12px}.sidebar{border-right:1px solid var(--border);background:var(--sidebar);padding:16px}.nav-label{display:block;margin:8px 12px 10px;color:var(--muted-foreground);font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}.nav-item{display:flex;align-items:center;gap:10px;border-radius:var(--radius);padding:11px 12px;background:var(--muted);font-size:13px;font-weight:600}.nav-icon{width:18px;height:18px}.main{min-width:0;padding:32px}.content{max-width:1120px;margin:0 auto}.page-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.eyebrow{margin:0 0 4px;color:var(--muted-foreground);font-size:12px;font-weight:600}.page-heading h1{margin:0;font-size:24px;line-height:1.25;letter-spacing:-.02em}.page-heading p{margin:7px 0 0;color:var(--muted-foreground)}.toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.toolbar form{margin:0}
+*{box-sizing:border-box}html{background:var(--background)}body{margin:0;background:var(--background);color:var(--foreground);font:14px/1.5 Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input{font:inherit}button,input[type=text],input[type=password]{min-height:40px}button{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:1px solid var(--border);border-radius:var(--radius);background:var(--card);color:var(--foreground);padding:9px 14px;font-weight:600;cursor:pointer;transition:background .15s,border-color .15s,transform .05s}button:hover{background:var(--muted)}button:active{transform:translateY(1px)}button:focus-visible,input:focus-visible{outline:2px solid var(--foreground);outline-offset:2px}.primary{border-color:var(--primary);background:var(--primary);color:var(--primary-foreground)}.primary:hover{background:#27272a}
+.app{min-height:100vh}.topbar{display:flex;align-items:center;justify-content:space-between;height:64px;border-bottom:1px solid var(--border);background:color-mix(in srgb,var(--background) 94%,transparent);padding:0 24px;position:sticky;top:0;z-index:2;backdrop-filter:blur(10px)}.brand{display:flex;align-items:center;gap:10px;font:600 18px/1 ui-monospace,SFMono-Regular,Menlo,monospace}.brand-logo{width:24px;height:22px;fill:currentColor}.connector-chip{border:1px solid var(--border);border-radius:999px;padding:5px 10px;color:var(--muted-foreground);font-size:12px}.user-menu{display:flex;align-items:center;gap:9px}.user-menu form{margin:0}.user-menu button{min-height:32px;padding:5px 10px;font-size:12px}.main{min-width:0;padding:38px 24px}.content{max-width:1120px;margin:0 auto}.page-heading{margin-bottom:24px}.eyebrow{margin:0 0 4px;color:var(--muted-foreground);font-size:12px;font-weight:600}.page-heading h1{margin:0;font-size:26px;line-height:1.25;letter-spacing:-.025em}.page-heading p{margin:7px 0 0;color:var(--muted-foreground)}.section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:18px}.section-heading h2{margin:0;font-size:18px;letter-spacing:-.015em}.section-heading p{margin:4px 0 0;color:var(--muted-foreground)}.toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.toolbar form{margin:0}
+.workspace-tabs{display:flex;gap:4px;width:max-content;max-width:100%;margin-bottom:28px;border:1px solid var(--border);border-radius:10px;background:var(--muted);padding:4px;overflow-x:auto}.workspace-tab{min-height:38px;border:0;background:transparent;padding:8px 15px;color:var(--muted-foreground);white-space:nowrap;box-shadow:none}.workspace-tab:hover{background:color-mix(in srgb,var(--card) 55%,transparent);color:var(--foreground)}.workspace-tab[aria-selected="true"]{background:var(--card);color:var(--foreground);box-shadow:var(--shadow)}.workspace-panel[hidden]{display:none}.workspace-panel{animation:panel-in .14s ease-out}@keyframes panel-in{from{opacity:.55;transform:translateY(2px)}to{opacity:1;transform:none}}
 .status-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:20px}.stat-card,.card{border:1px solid var(--border);border-radius:var(--radius);background:var(--card);box-shadow:var(--shadow)}.stat-card{padding:16px}.stat-label{display:flex;align-items:center;gap:7px;color:var(--muted-foreground);font-size:12px;font-weight:600}.dot{width:8px;height:8px;border-radius:50%;background:var(--muted-foreground)}.dot.success{background:var(--success)}.dot.warning{background:#f59e0b}.dot.danger{background:var(--danger)}.stat-value{display:block;margin-top:8px;font-size:22px;font-weight:650;letter-spacing:-.03em}.stat-detail{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px}.card{margin-bottom:16px;overflow:hidden}.card-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:18px 20px;border-bottom:1px solid var(--border)}.card-title{margin:0;font-size:15px}.card-description{margin:3px 0 0;color:var(--muted-foreground);font-size:13px}.card-body{padding:20px}.card-footer{display:flex;justify-content:flex-end;padding:14px 20px;border-top:1px solid var(--border);background:var(--sidebar)}.badge{display:inline-flex;align-items:center;border-radius:999px;background:var(--muted);padding:3px 8px;color:var(--muted-foreground);font-size:11px;font-weight:600}.badge.success{background:var(--success-soft);color:var(--success)}.badge.warning{background:var(--warning-soft);color:var(--warning)}.badge.danger{background:var(--danger-soft);color:var(--danger)}
-.inventory-row{display:flex;align-items:center;gap:12px}.inventory-status{display:block;width:100%;min-height:24px;font-weight:600}.inventory-status.running{color:var(--success)}.queue-monitor{margin-top:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--sidebar);padding:14px}.queue-monitor .progress-wrap{margin-top:9px}.progress-wrap{margin-top:12px}.progress-track{height:10px;overflow:hidden;border-radius:999px;background:var(--muted)}.progress-bar{height:100%;width:0;border-radius:inherit;background:var(--success);transition:width .25s ease}.progress-bar.indeterminate{width:35%;animation:progress-slide 1.2s ease-in-out infinite}.progress-label{display:block;margin-top:5px;color:var(--muted-foreground);font-size:12px;text-align:right}@keyframes progress-slide{0%{transform:translateX(-110%)}100%{transform:translateX(300%)}}.helper{margin:10px 0 0;color:var(--muted-foreground);font-size:12px}.error-alert{display:flex;gap:10px;margin-bottom:16px;border:1px solid #fecaca;border-radius:var(--radius);background:var(--danger-soft);padding:13px 15px;color:#991b1b}.error-alert strong{display:block}.selection-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:320px;overflow:auto}.selection-item{display:flex;align-items:flex-start;gap:11px;margin:0;border:1px solid var(--border);border-radius:var(--radius);padding:12px;cursor:pointer;transition:background .15s,border-color .15s}.selection-item:hover{background:var(--muted)}.selection-item:has(input:checked){border-color:#a1a1aa;background:var(--muted)}.selection-item input{width:16px;height:16px;margin:2px 0 0;accent-color:var(--primary);flex:0 0 auto}.selection-copy{min-width:0}.selection-title{display:block;font-weight:600;overflow-wrap:anywhere}.selection-meta{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px;overflow-wrap:anywhere}.empty{grid-column:1/-1;margin:0;border:1px dashed var(--border);border-radius:var(--radius);padding:22px;text-align:center;color:var(--muted-foreground)}.counts{display:flex;flex-wrap:wrap;gap:6px}.operation-grid,.secret-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.secret-field{display:grid;gap:6px;color:var(--muted-foreground);font-size:12px;font-weight:600}.secret-field input{width:100%;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}.danger-card{border-color:#fecaca}.danger-card .card-header{background:var(--danger-soft)}.confirm-row{display:flex;align-items:end;gap:10px}.confirm-row label{flex:1;margin:0;color:var(--muted-foreground);font-size:12px;font-weight:600}.confirm-row input{display:block;width:100%;margin-top:6px;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}code{border-radius:4px;background:var(--muted);padding:2px 5px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.footer-note{padding:8px 0 24px;text-align:center;color:var(--muted-foreground);font-size:12px}
+.inventory-row{display:flex;align-items:center;gap:12px}.inventory-status{display:block;width:100%;min-height:24px;font-weight:600}.inventory-status.running{color:var(--success)}.queue-monitor{margin-top:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--sidebar);padding:14px}.queue-monitor .progress-wrap{margin-top:9px}.progress-wrap{margin-top:12px}.progress-track{height:10px;overflow:hidden;border-radius:999px;background:var(--muted)}.progress-bar{height:100%;width:0;border-radius:inherit;background:var(--success);transition:width .25s ease}.progress-bar.indeterminate{width:35%;animation:progress-slide 1.2s ease-in-out infinite}.progress-label{display:block;margin-top:5px;color:var(--muted-foreground);font-size:12px;text-align:right}@keyframes progress-slide{0%{transform:translateX(-110%)}100%{transform:translateX(300%)}}.helper{margin:10px 0 0;color:var(--muted-foreground);font-size:12px}.error-alert{display:flex;gap:10px;margin-bottom:16px;border:1px solid #fecaca;border-radius:var(--radius);background:var(--danger-soft);padding:13px 15px;color:#991b1b}.error-alert strong{display:block}.selection-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:390px;overflow:auto}.selection-item{display:flex;align-items:flex-start;gap:11px;margin:0;border:1px solid var(--border);border-radius:var(--radius);padding:12px;cursor:pointer;transition:background .15s,border-color .15s}.selection-item:hover{background:var(--muted)}.selection-item:has(input:checked){border-color:#a1a1aa;background:var(--muted)}.selection-item input{width:16px;height:16px;margin:2px 0 0;accent-color:var(--primary);flex:0 0 auto}.selection-copy{min-width:0}.selection-title{display:block;font-weight:600;overflow-wrap:anywhere}.selection-meta{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px;overflow-wrap:anywhere}.empty{grid-column:1/-1;margin:0;border:1px dashed var(--border);border-radius:var(--radius);padding:22px;text-align:center;color:var(--muted-foreground)}.counts{display:flex;flex-wrap:wrap;gap:6px}.secret-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.secret-field{display:grid;gap:6px;color:var(--muted-foreground);font-size:12px;font-weight:600}.secret-field input{width:100%;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}.footer-note{padding:8px 0 24px;text-align:center;color:var(--muted-foreground);font-size:12px}
 .reconciliation-row{display:flex;align-items:center;justify-content:space-between;gap:16px}.reconciliation-row form{flex:0 0 auto}.section-rule{margin:18px 0;border:0;border-top:1px solid var(--border)}.retry-tabs{position:relative}.tab-toggle{position:absolute;opacity:0;pointer-events:none}.tab-label{display:inline-flex;margin:0 6px 14px 0;border:1px solid var(--border);border-radius:999px;padding:7px 12px;color:var(--muted-foreground);cursor:pointer;font-weight:600}.tab-panel{display:none}.retry-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px}.retry-select-all{display:flex;align-items:center;gap:8px;color:var(--muted-foreground);font-size:12px}.retry-select-all input{width:16px;height:16px;accent-color:var(--primary)}#retry-tab-lost:checked~label[for="retry-tab-lost"],#retry-tab-failed:checked~label[for="retry-tab-failed"]{border-color:var(--primary);background:var(--primary);color:var(--primary-foreground)}#retry-tab-lost:checked~.tab-panels>#retry-panel-lost,#retry-tab-failed:checked~.tab-panels>#retry-panel-failed{display:block}
 .login-page{min-height:100vh;display:grid;place-items:center;padding:24px;background:var(--muted)}.login-card{width:min(440px,100%);border:1px solid var(--border);border-radius:14px;background:var(--card);padding:42px;box-shadow:var(--shadow);text-align:center}.login-card .brand-logo{width:50px;height:42px}.login-card h1{margin:24px 0 8px;font-size:24px}.login-card p{margin:0 0 28px;color:var(--muted-foreground)}.login-card form{margin:0}.login-card button{width:100%;min-height:46px}.identity-notice{margin-bottom:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--sidebar);padding:11px 14px;color:var(--muted-foreground);font-size:12px}
-@media(prefers-color-scheme:dark){:root{--background:#18181b;--foreground:#fafafa;--muted:#27272a;--muted-foreground:#a1a1aa;--border:#3f3f46;--card:#18181b;--sidebar:#111113;--primary:#fafafa;--primary-foreground:#09090b;--danger:#f87171;--danger-soft:#2b1719;--success:#34d399;--success-soft:#10251e;--warning:#fbbf24;--warning-soft:#2b2414;--shadow:none}.primary:hover{background:#e4e4e7}.danger-card,.error-alert{border-color:#7f1d1d}.danger-card .card-header{background:var(--danger-soft)}.error-alert{color:#fecaca}.selection-item:has(input:checked){border-color:#71717a}}
-@media(max-width:900px){.app{grid-template-columns:1fr;grid-template-rows:64px auto 1fr}.sidebar{border-right:0;border-bottom:1px solid var(--border);padding:8px 16px}.nav-label{display:none}.nav-item{width:max-content;padding:8px 12px}.main{padding:24px 18px}.status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.operation-grid,.secret-grid{grid-template-columns:1fr}}
-@media(max-width:620px){.connector-chip{display:none}.page-heading{display:block}.toolbar{margin-top:16px}.toolbar button{flex:1}.toolbar form{display:flex;flex:1}.selection-list{grid-template-columns:1fr}.status-grid{grid-template-columns:1fr 1fr}.stat-card{padding:13px}.stat-value{font-size:19px}.card-header,.card-body{padding:16px}.card-footer{padding:12px 16px}.card-footer button{width:100%}.reconciliation-row{align-items:stretch;flex-direction:column}.reconciliation-row button{width:100%}.confirm-row{align-items:stretch;flex-direction:column}.confirm-row button{width:100%}}
+@media(prefers-color-scheme:dark){:root{--background:#18181b;--foreground:#fafafa;--muted:#27272a;--muted-foreground:#a1a1aa;--border:#3f3f46;--card:#18181b;--sidebar:#111113;--primary:#fafafa;--primary-foreground:#09090b;--danger:#f87171;--danger-soft:#2b1719;--success:#34d399;--success-soft:#10251e;--warning:#fbbf24;--warning-soft:#2b2414;--shadow:none}.primary:hover{background:#e4e4e7}.error-alert{border-color:#7f1d1d;color:#fecaca}.selection-item:has(input:checked){border-color:#71717a}}
+@media(max-width:900px){.main{padding:28px 18px}.status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.secret-grid{grid-template-columns:1fr}}
+@media(max-width:620px){.topbar{height:58px;padding:0 16px}.connector-chip{display:none}.main{padding:24px 14px}.page-heading h1{font-size:23px}.section-heading{align-items:stretch;flex-direction:column}.toolbar button{width:100%}.toolbar form{display:flex;width:100%}.workspace-tabs{width:100%;margin-bottom:22px}.workspace-tab{flex:1;padding:8px 11px}.selection-list{grid-template-columns:1fr}.status-grid{grid-template-columns:1fr 1fr}.stat-card{padding:13px}.stat-value{font-size:19px}.card-header,.card-body{padding:16px}.card-footer{padding:12px 16px}.card-footer button{width:100%}.reconciliation-row{align-items:stretch;flex-direction:column}.reconciliation-row button{width:100%}}
 """
 
 
@@ -3897,6 +3828,55 @@ def render_live_status(state: RuntimeState) -> str:
 
 
 UI_SCRIPT = r"""(() => {
+  const workspaceTabs = Array.from(document.querySelectorAll("[data-workspace-tab]"));
+  const workspacePanels = Array.from(document.querySelectorAll("[data-workspace-panel]"));
+  const availableTabs = workspaceTabs.map(tab => tab.dataset.workspaceTab);
+  const selectWorkspaceTab = (name, focus = false) => {
+    if (!availableTabs.includes(name)) name = "ingestion";
+    workspaceTabs.forEach(tab => {
+      const selected = tab.dataset.workspaceTab === name;
+      tab.setAttribute("aria-selected", selected ? "true" : "false");
+      tab.tabIndex = selected ? 0 : -1;
+      if (selected && focus) tab.focus();
+    });
+    workspacePanels.forEach(panel => {
+      panel.hidden = panel.dataset.workspacePanel !== name;
+    });
+    try {
+      window.localStorage.setItem("openarchiver-connector-tab", name);
+    } catch (_error) {
+      // La navigation reste fonctionnelle si le stockage local est bloqué.
+    }
+    window.history.replaceState(
+      null,
+      "",
+      window.location.pathname + window.location.search + "#" + name
+    );
+  };
+  if (workspaceTabs.length && workspacePanels.length) {
+    let initialTab = window.location.hash.slice(1);
+    if (!availableTabs.includes(initialTab)) {
+      try {
+        initialTab = window.localStorage.getItem("openarchiver-connector-tab") || "";
+      } catch (_error) {
+        initialTab = "";
+      }
+    }
+    selectWorkspaceTab(initialTab || "ingestion");
+    workspaceTabs.forEach((tab, index) => {
+      tab.addEventListener("click", () => selectWorkspaceTab(tab.dataset.workspaceTab));
+      tab.addEventListener("keydown", event => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        let next = index;
+        if (event.key === "ArrowLeft") next = (index - 1 + workspaceTabs.length) % workspaceTabs.length;
+        if (event.key === "ArrowRight") next = (index + 1) % workspaceTabs.length;
+        if (event.key === "Home") next = 0;
+        if (event.key === "End") next = workspaceTabs.length - 1;
+        selectWorkspaceTab(workspaceTabs[next].dataset.workspaceTab, true);
+      });
+    });
+  }
   const badge = document.getElementById("inventory-badge");
   const summary = document.getElementById("inventory-summary");
   const dot = document.getElementById("inventory-dot");
@@ -3926,7 +3906,7 @@ UI_SCRIPT = r"""(() => {
     alert.setAttribute("role", "alert");
     alert.textContent = "L’interface a été renouvelée après un redémarrage. Recommencez l’action.";
     document.querySelector(".content")?.prepend(alert);
-    window.history.replaceState(null, "", "/");
+    window.history.replaceState(null, "", window.location.pathname + window.location.hash);
   }
   let observedActive = document.body.dataset.cycleActive === "true";
   let observedStage = document.body.dataset.cycleStage || "idle";
@@ -4359,16 +4339,6 @@ def render_status_page(
             '<div class="error-alert" role="alert"><span aria-hidden="true">⚠</span>'
             f'<div><strong>Dernière erreur</strong>{error}</div></div>'
         )
-    if snapshot["reset_requested_at"]:
-        reset_status = (
-            "Remise à zéro demandée ; attente de la fin des opérations en cours."
-        )
-    elif snapshot["last_reset_at"]:
-        reset_status = "Dernière remise à zéro : " + time.strftime(
-            "%Y-%m-%d %H:%M:%S UTC", time.gmtime(int(snapshot["last_reset_at"]))
-        )
-    else:
-        reset_status = "Aucune remise à zéro depuis le démarrage."
     cycle_title = "Ingestion OpenRAG" if current_stage == "ingestion" else "Inventaire IMAP"
     cycle_description = (
         "Progression de l’envoi des mails et pièces jointes sélectionnés."
@@ -4435,14 +4405,17 @@ def render_status_page(
 <div class="app">
 <header class="topbar"><div class="brand">{OPENRAG_LOGO}<span>OpenRAG</span></div>
 {identity_menu}</header>
-<aside class="sidebar" aria-label="Navigation"><span class="nav-label">Intégrations</span>
-<div class="nav-item"><svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M8 12h8M12 8v8"/><path d="M7 7.5 4.5 5M17 7.5 19.5 5M7 16.5 4.5 19M17 16.5 19.5 19"/><rect x="7" y="7" width="10" height="10" rx="2"/></svg>Connecteur</div></aside>
 <main class="main"><div class="content">
-<div class="page-heading"><div><p class="eyebrow">Connecteurs / OpenArchiver</p>
-<h1>OpenArchiver vers OpenRAG</h1><p>Configurez et supervisez l’indexation de vos archives e-mail.</p></div>
-<div class="toolbar"><form method="get" action="/"><button type="submit">↻&nbsp; Rafraîchir l’état</button></form>
-<form method="post" action="/pause"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="action" value="{pause_action}"><button type="submit">{pause_label}</button></form></div></div>
-{identity_notice}
+<div class="page-heading"><p class="eyebrow">Connecteurs / OpenArchiver</p>
+<h1>OpenArchiver vers OpenRAG</h1><p>Supervisez l’ingestion et choisissez précisément son périmètre.</p></div>
+<div class="workspace-tabs" role="tablist" aria-label="Sections du connecteur">
+<button id="workspace-tab-ingestion" class="workspace-tab" type="button" role="tab" aria-selected="true" aria-controls="workspace-panel-ingestion" data-workspace-tab="ingestion">État de l’ingestion</button>
+<button id="workspace-tab-sources" class="workspace-tab" type="button" role="tab" aria-selected="false" aria-controls="workspace-panel-sources" data-workspace-tab="sources" tabindex="-1">Sources</button>
+<button id="workspace-tab-configuration" class="workspace-tab" type="button" role="tab" aria-selected="false" aria-controls="workspace-panel-configuration" data-workspace-tab="configuration" tabindex="-1">Configuration</button>
+</div>
+<section id="workspace-panel-ingestion" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-ingestion" data-workspace-panel="ingestion">
+<div class="section-heading"><div><h2>État de l’ingestion</h2><p>Suivi en direct de la file locale et des traitements OpenRAG.</p></div>
+<div class="toolbar"><form method="post" action="/pause"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="action" value="{pause_action}"><button type="submit">{pause_label}</button></form></div></div>
 {error_alert}
 <section class="status-grid" aria-label="État du connecteur">
 <div class="stat-card"><span class="stat-label"><span class="dot {status_class}"></span>Service</span><strong id="service-status" class="stat-value">{ready}</strong><span id="last-sync" class="stat-detail">Dernière synchro : {last_sync}</span></div>
@@ -4463,18 +4436,23 @@ def render_status_page(
 <div class="card-footer"><form method="post" action="/scan"><input type="hidden" name="csrf" value="{csrf}">{scan_button}</form></div></section>
 <section id="retry-card" class="card"><div class="card-header"><div><h2 class="card-title">Réindexation</h2><p class="card-description">Contrôlez OpenRAG puis resoumettez les tâches réellement perdues ou en échec.</p></div><span id="retry-count-badge" class="badge warning">Lost {lost_total} · Failed {failed_total}</span></div>
 <div class="card-body"><div class="reconciliation-row"><div><strong id="reconciliation-status">{html.escape(reconciliation_label)}</strong><p id="reconciliation-detail" class="helper">{html.escape(reconciliation_detail)}</p></div><form method="post" action="/reconcile"><input type="hidden" name="csrf" value="{csrf}">{reconciliation_button}</form></div><div id="reconciliation-progress" class="progress-wrap" role="progressbar" aria-label="Progression de la réconciliation" {'hidden' if not reconciliation_active else ''}><div class="progress-track"><div id="reconciliation-progress-bar" class="progress-bar"></div></div><span id="reconciliation-progress-label" class="progress-label">Préparation…</span></div><hr class="section-rule"><div id="retry-tabs" class="retry-tabs"><input class="tab-toggle" type="radio" name="retry-tab" id="retry-tab-lost" checked><label class="tab-label" for="retry-tab-lost">Lost · {lost_total}</label><input class="tab-toggle" type="radio" name="retry-tab" id="retry-tab-failed"><label class="tab-label" for="retry-tab-failed">Failed · {failed_total}</label><div class="tab-panels">{lost_panel}{failed_panel}</div></div><p class="helper">La réindexation réinitialise les tentatives des objets choisis. Si le connecteur est en pause, utilisez ensuite « Reprendre l’indexation ».</p></div></section>
-<form method="post" action="/secrets" class="card" autocomplete="off"><div class="card-header"><div><h2 class="card-title">Clés API</h2><p class="card-description">Renouvelez séparément les accès OpenArchiver et OpenRAG.</p></div><span class="badge">OpenArchiver : {openarchiver_key_state} · OpenRAG : {openrag_key_state}</span></div>
-<div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="secret-grid"><label class="secret-field">Nouvelle clé OpenArchiver<input type="password" name="openarchiver_key" autocomplete="new-password"></label><label class="secret-field">Nouvelle clé OpenRAG<input type="password" name="openrag_key" autocomplete="new-password"></label></div><p class="helper">Laissez un champ vide pour conserver sa valeur actuelle. Les clés ne sont jamais réaffichées ni enregistrées dans SQLite.</p></div>
-<div class="card-footer"><button class="primary" type="submit">Enregistrer les clés renseignées</button></div></form>
+</section>
+<section id="workspace-panel-sources" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-sources" data-workspace-panel="sources" hidden>
+<div class="section-heading"><div><h2>Sources</h2><p>Sélectionnez les comptes et dossiers OpenArchiver à indexer.</p></div></div>
 <form method="post" action="/sources" class="card"><div class="card-header"><div><h2 class="card-title">Sources indexées</h2><p class="card-description">Choisissez les comptes OpenArchiver à rendre disponibles dans OpenRAG.</p></div><span class="badge">{selected_sources}/{len(sources)} sélectionnée(s)</span></div>
 <div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="selection-list">{"".join(source_lines)}</div></div>
 <div class="card-footer"><button class="primary" type="submit">Enregistrer et lancer l’inventaire</button></div></form>
 <form method="post" action="/mailboxes" class="card"><div class="card-header"><div><h2 class="card-title">Dossiers IMAP indexés</h2><p class="card-description">Affinez l’indexation aux dossiers utiles de chaque source.</p></div><span id="mailbox-selection-badge" class="badge">{selected_mailboxes}/{len(mailboxes)} sélectionné(s)</span></div>
 <div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div id="mailbox-selection-list" class="selection-list">{"".join(mailbox_lines)}</div><div id="attachment-status-counts" class="counts" aria-label="États des pièces jointes détaillées de la sélection" style="margin-top:14px"><span class="badge success">Pièces jointes détaillées</span>{count_badges(selected_counts["attachments"], "pas encore détaillées")}</div></div>
 <div class="card-footer"><button class="primary" type="submit">Enregistrer les dossiers</button></div></form>
-<section class="card danger-card"><div class="card-header"><div><h2 class="card-title">Remise à zéro</h2><p class="card-description">Efface l’inventaire, les sélections et l’historique local uniquement.</p></div><span class="badge danger">Zone sensible</span></div>
-<div class="card-body"><p>Aucun mail OpenArchiver ni document OpenRAG n’est supprimé. Le connecteur reste en pause.</p><p class="helper">{html.escape(reset_status)}</p>
-<form method="post" action="/reset" class="confirm-row"><input type="hidden" name="csrf" value="{csrf}"><label>Saisir <code>RESET</code> pour confirmer<input type="text" name="confirmation" required pattern="RESET" autocomplete="off"></label><button class="danger-button" type="submit">Remettre la base locale à zéro</button></form></div></section>
+</section>
+<section id="workspace-panel-configuration" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-configuration" data-workspace-panel="configuration" hidden>
+<div class="section-heading"><div><h2>Configuration</h2><p>Accès techniques et identité héritée d’OpenRAG.</p></div></div>
+{identity_notice}
+<form method="post" action="/secrets" class="card" autocomplete="off"><div class="card-header"><div><h2 class="card-title">Clés API</h2><p class="card-description">Renouvelez séparément les accès OpenArchiver et OpenRAG.</p></div><span class="badge">OpenArchiver : {openarchiver_key_state} · OpenRAG : {openrag_key_state}</span></div>
+<div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="secret-grid"><label class="secret-field">Nouvelle clé OpenArchiver<input type="password" name="openarchiver_key" autocomplete="new-password"></label><label class="secret-field">Nouvelle clé OpenRAG<input type="password" name="openrag_key" autocomplete="new-password"></label></div><p class="helper">Laissez un champ vide pour conserver sa valeur actuelle. Les clés ne sont jamais réaffichées ni enregistrées dans SQLite.</p></div>
+<div class="card-footer"><button class="primary" type="submit">Enregistrer les clés renseignées</button></div></form>
+</section>
 <p class="footer-note">Aucune suppression OpenRAG n’est automatique · Interface d’exploitation autonome</p>
 </div></main></div></body></html>"""
 
@@ -4824,11 +4802,19 @@ def make_http_handler(
                 principal = self._require_principal()
                 if principal is None:
                     return
-                required_permission = (
-                    "config:write"
-                    if path in {"/secrets", "/sources", "/mailboxes", "/pause", "/reset"}
-                    else "knowledge:upload"
-                )
+                permission_by_path = {
+                    "/secrets": "config:write",
+                    "/sources": "config:write",
+                    "/mailboxes": "config:write",
+                    "/pause": "config:write",
+                    "/retry": "knowledge:upload",
+                    "/reconcile": "knowledge:upload",
+                    "/scan": "knowledge:upload",
+                }
+                required_permission = permission_by_path.get(path)
+                if required_permission is None:
+                    self._send(404, "not found\n", "text/plain; charset=utf-8")
+                    return
                 if not principal.can(required_permission):
                     self._send(
                         403,
@@ -4909,16 +4895,6 @@ def make_http_handler(
                     state.cycle_requested(force_inventory=True)
                     wake.set()
                     self._finish_action(principal, "inventory.scan")
-                elif path == "/reset":
-                    if form.get("confirmation", [""])[0] != "RESET":
-                        raise ConnectorError("confirmation de remise à zéro absente")
-                    # La pause empêche les workers de réserver un nouvel objet.
-                    # Le thread runtime exécute ensuite le reset, après la fin
-                    # des quelques tâches qui étaient déjà en cours.
-                    set_paused(config, True)
-                    state.reset_requested()
-                    wake.set()
-                    self._finish_action(principal, "state.reset")
                 else:
                     self._send(404, "not found\n", "text/plain; charset=utf-8")
             except (UnicodeDecodeError, ValueError, ConnectorError) as error:

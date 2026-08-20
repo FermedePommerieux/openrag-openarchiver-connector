@@ -86,11 +86,11 @@ Le parcours OAuth reste entièrement piloté par OpenRAG :
 Le JWT n'est jamais stocké dans SQLite. La table `users` ne conserve que
 l'identifiant opaque OpenRAG, le fournisseur, les rôles, les permissions et
 les dates de présence ; elle ne conserve ni nom ni adresse e-mail. La table
-`audit_log` attribue les mutations globales (scan, pause, reset, changement de
+`audit_log` attribue les mutations globales (scan, pause, changement de
 sélection ou de secret) à cet identifiant.
 
 Lorsque le RBAC OpenRAG est actif, les actions partagées sensibles (`secrets`,
-sélections, pause et reset) demandent `config:write`. Le scan, la
+sélections et pause) demandent `config:write`. Le scan, la
 réconciliation et la réindexation demandent `knowledge:upload`. Lorsque le
 RBAC est désactivé, le connecteur reproduit le coupe-circuit OpenRAG et laisse
 les utilisateurs authentifiés agir.
@@ -227,18 +227,15 @@ La réconciliation ne supprime jamais de document OpenRAG. Le bouton
 **Réindexer la sélection** remet explicitement les lignes `failed`/`lost` en
 `queued` avec leur compteur de tentatives à zéro.
 
-## Pause, reset et arrêt
+## Pause et arrêt
 
 - **Pause** empêche uniquement de nouvelles réservations. Les objets déjà en
   cours terminent leur tentative.
 - **Reprendre** réveille immédiatement le cycle.
-- **Reset** attend la fin des quelques objets déjà réservés, vide l'état
-  fonctionnel SQLite et laisse le connecteur en pause.
 - `SIGTERM`/`SIGINT` réveillent les threads, ferment le serveur et laissent les
   opérations en cours être récupérées au prochain démarrage.
 
-Ni la pause ni le reset ne suppriment de mails OpenArchiver ou de connaissances
-OpenRAG.
+La pause ne supprime aucun mail OpenArchiver ni aucune connaissance OpenRAG.
 
 ## Processus et interface HTTP
 
@@ -262,8 +259,13 @@ Routes de lecture :
 | `/healthz`, `/readyz` | probes Kubernetes |
 | `/inventory-status` | fragment d'état de l'inventaire |
 
+L'interface est répartie en trois onglets persistants : **État de
+l'ingestion**, **Sources** et **Configuration**. Le premier regroupe le suivi,
+la pause, la réconciliation et les reprises ; le second contient le périmètre
+OpenArchiver ; le dernier contient l'identité OpenRAG et les clés techniques.
+
 Actions POST : `/sources`, `/mailboxes`, `/scan`, `/pause`, `/retry`,
-`/reconcile`, `/reset` et `/secrets`. Elles exigent toutes le jeton CSRF de la
+`/reconcile` et `/secrets`. Elles exigent toutes le jeton CSRF de la
 page. Les clés saisies sont écrites atomiquement dans `/state/secrets`, jamais
 enregistrées dans SQLite ni écrites dans les logs.
 
@@ -351,7 +353,7 @@ Pour diagnostiquer une ingestion lente, regarder dans cet ordre :
   au SHA-256.
 - Réserver une ligne dans une transaction SQLite avant tout téléchargement.
 - Ne jamais supprimer automatiquement de connaissance OpenRAG pendant une
-  réconciliation ou un reset local.
+  réconciliation.
 - Ne jamais journaliser une clé, un corps de mail ou le contenu d'une pièce
   jointe.
 - Borner les réponses, sélections, lots, noms et tailles provenant des API.

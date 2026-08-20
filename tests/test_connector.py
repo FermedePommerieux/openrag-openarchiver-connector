@@ -2116,7 +2116,9 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                 with urllib.request.urlopen(base + "/") as response:
                     requested_page = response.read().decode("utf-8")
                 self.assertNotIn('http-equiv="refresh"', requested_page)
-                self.assertIn("Rafraîchir l’état", requested_page)
+                self.assertIn('role="tablist"', requested_page)
+                self.assertIn("État de l’ingestion", requested_page)
+                self.assertIn("Configuration", requested_page)
                 self.assertIn('id="inventory-summary"', requested_page)
                 with urllib.request.urlopen(base + "/inventory-status") as response:
                     status_page = response.read().decode("utf-8")
@@ -2144,6 +2146,7 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                 self.assertNotIn("window.location.reload()", ui_script)
                 self.assertIn("champs et sélections ont été conservés", ui_script)
                 self.assertIn("Inventaire interrompu", ui_script)
+                self.assertIn("openarchiver-connector-tab", ui_script)
 
                 pause = urllib.request.Request(
                     base + "/pause",
@@ -2187,7 +2190,7 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                     mailbox_page,
                 )
 
-                reset = urllib.request.Request(
+                removed_reset = urllib.request.Request(
                     base + "/reset",
                     data=urllib.parse.urlencode(
                         {
@@ -2196,11 +2199,9 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                         }
                     ).encode("ascii"),
                 )
-                with urllib.request.urlopen(reset) as response:
-                    reset_page = response.read().decode("utf-8")
-                self.assertTrue(state.snapshot()["reset_requested_at"])
-                self.assertIn("Remise à zéro demandée", reset_page)
-                self.assertIn("Remettre la base locale à zéro", reset_page)
+                with self.assertRaises(urllib.error.HTTPError) as removed:
+                    urllib.request.urlopen(removed_reset)
+                self.assertEqual(removed.exception.code, 404)
 
                 bad = urllib.request.Request(
                     base + "/scan",
@@ -2324,11 +2325,11 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                 self.assertIn("espace d’exploitation partagé", page)
 
                 forbidden = urllib.request.Request(
-                    base + "/reset",
+                    base + "/pause",
                     data=urllib.parse.urlencode(
                         {
                             "csrf": state.snapshot()["csrf_token"],
-                            "confirmation": "RESET",
+                            "action": "pause",
                         }
                     ).encode(),
                     headers={"Cookie": "auth_token=valid-token"},
@@ -2336,7 +2337,17 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                 with self.assertRaises(urllib.error.HTTPError) as denied:
                     urllib.request.urlopen(forbidden)
                 self.assertEqual(denied.exception.code, 403)
-                self.assertFalse(state.snapshot()["reset_requested_at"])
+
+                removed_reset = urllib.request.Request(
+                    base + "/reset",
+                    data=urllib.parse.urlencode(
+                        {"csrf": state.snapshot()["csrf_token"]}
+                    ).encode(),
+                    headers={"Cookie": "auth_token=valid-token"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as removed:
+                    urllib.request.urlopen(removed_reset)
+                self.assertEqual(removed.exception.code, 404)
 
                 with connector.database(config) as db:
                     users = db.execute("SELECT id FROM users").fetchall()
@@ -2395,7 +2406,8 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
 
         self.assertIn('<div class="app">', page)
         self.assertIn('class="brand-logo"', page)
-        self.assertIn('aria-label="Navigation"', page)
+        self.assertIn('aria-label="Sections du connecteur"', page)
+        self.assertEqual(page.count('role="tab"'), 3)
         self.assertIn('class="status-grid"', page)
         self.assertIn("@media(max-width:620px)", page)
         self.assertIn('name="viewport"', page)
@@ -2507,6 +2519,13 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
         self.assertIn('id="cycle-progress"', page)
         self.assertIn('id="cycle-progress-bar"', page)
         self.assertIn('id="cycle-progress-label"', page)
+        self.assertIn('role="tablist"', page)
+        self.assertIn('data-workspace-tab="ingestion"', page)
+        self.assertIn('data-workspace-tab="sources"', page)
+        self.assertIn('data-workspace-tab="configuration"', page)
+        self.assertIn('data-workspace-panel="sources" hidden', page)
+        self.assertNotIn("Remise à zéro", page)
+        self.assertNotIn('action="/reset"', page)
         self.assertNotIn('<script src="http', page)
         self.assertNotIn("https://", page)
         self.assertNotIn("http://", page)
@@ -2641,53 +2660,6 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             self.assertIsNone(connector.claim_next(config, now=1))
             connector.set_paused(config, False)
             self.assertEqual(connector.claim_next(config, now=1).object_id, "archive")
-
-    def test_pending_reset_clears_local_database_and_stays_paused(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config = self.config(Path(directory), scan_interval_seconds=3600)
-            self._insert_email(config)
-            state = connector.RuntimeState()
-            state.reset_requested()
-            connector.set_paused(config, True)
-            stop = threading.Event()
-            wake = threading.Event()
-            thread = threading.Thread(
-                target=connector.runtime_loop,
-                args=(config, state),
-                kwargs={
-                    "openarchiver": FakeArchive(),
-                    "openrag": FakeOpenRAG(),
-                    "stop": stop,
-                    "wake": wake,
-                },
-                daemon=True,
-            )
-            thread.start()
-            deadline = time.monotonic() + 2
-            while time.monotonic() < deadline and not state.snapshot()["last_reset_at"]:
-                time.sleep(0.01)
-            stop.set()
-            wake.set()
-            thread.join(timeout=2)
-
-            self.assertFalse(thread.is_alive())
-            self.assertGreater(state.snapshot()["last_reset_at"], 0)
-            self.assertTrue(connector.is_paused(config))
-            db = connector.connect_db(config)
-            try:
-                counts = {
-                    table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                    for table in (
-                        "sources",
-                        "mailboxes",
-                        "emails",
-                        "attachments",
-                        "email_attachments",
-                    )
-                }
-            finally:
-                db.close()
-            self.assertEqual(counts, {table: 0 for table in counts})
 
     def test_paused_runtime_creates_initial_inventory_without_indexing(self):
         with tempfile.TemporaryDirectory() as directory:
