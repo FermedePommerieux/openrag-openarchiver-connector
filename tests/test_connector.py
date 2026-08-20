@@ -318,12 +318,6 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                 email_columns = {
                     row["name"] for row in db.execute("PRAGMA table_info(emails)")
                 }
-                indexes = {
-                    row[0]
-                    for row in db.execute(
-                        "SELECT name FROM sqlite_master WHERE type='index'"
-                    )
-                }
                 db.close()
             self.assertTrue(
                 {
@@ -338,14 +332,6 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             )
             self.assertIn("sha256", email_columns)
             self.assertIn("mailbox_path", email_columns)
-            self.assertTrue(
-                {
-                    "emails_mailbox_status",
-                    "emails_mailbox_attachments",
-                    "email_attachments_by_attachment",
-                }
-                <= indexes
-            )
             version_db = connector.connect_db(config)
             try:
                 self.assertEqual(

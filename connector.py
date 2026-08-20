@@ -66,7 +66,7 @@ RQ_WORKER_METRIC = re.compile(
 PROMETHEUS_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
 STOP = threading.Event()
 WAKE = threading.Event()
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 2
 SCHEMA_LOCK = threading.Lock()
 
 
@@ -462,18 +462,6 @@ def connect_db(config: Config) -> sqlite3.Connection:
             db.execute(
                 "ALTER TABLE emails ADD COLUMN mailbox_path TEXT NOT NULL DEFAULT ''"
             )
-        db.execute(
-            """CREATE INDEX IF NOT EXISTS emails_mailbox_status
-               ON emails(source_id, mailbox_path, status)"""
-        )
-        db.execute(
-            """CREATE INDEX IF NOT EXISTS emails_mailbox_attachments
-               ON emails(source_id, mailbox_path, has_attachments)"""
-        )
-        db.execute(
-            """CREATE INDEX IF NOT EXISTS email_attachments_by_attachment
-               ON email_attachments(attachment_id, email_id)"""
-        )
         db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES ('paused','0')")
         db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         db.commit()
