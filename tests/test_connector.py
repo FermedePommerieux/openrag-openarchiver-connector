@@ -359,6 +359,10 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                     version_db.execute("PRAGMA journal_mode").fetchone()[0],
                     "delete",
                 )
+                self.assertEqual(
+                    version_db.execute("PRAGMA temp_store").fetchone()[0],
+                    2,
+                )
             finally:
                 version_db.close()
             self.assertFalse(connector.is_paused(config))

@@ -390,6 +390,9 @@ def connect_db(config: Config) -> sqlite3.Connection:
     db = sqlite3.connect(config.state_db, timeout=30)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA busy_timeout=30000")
+    # Le conteneur utilise un système de fichiers racine en lecture seule.
+    # Les tris volumineux ne doivent donc pas déborder dans /tmp.
+    db.execute("PRAGMA temp_store=MEMORY")
     with SCHEMA_LOCK:
         version = int(db.execute("PRAGMA user_version").fetchone()[0])
         if version >= SCHEMA_VERSION:
