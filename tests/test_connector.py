@@ -202,7 +202,8 @@ class ConnectorTests(unittest.TestCase):
             )
             self.assertIsNone(defaults.ingestion_concurrency)
             self.assertEqual(defaults.ingestion_concurrency_fallback, 2)
-            self.assertEqual(defaults.ingestion_concurrency_max, 4)
+            self.assertEqual(defaults.ingestion_concurrency_max, 8)
+            self.assertEqual(defaults.ingestion_prefetch_per_worker, 2)
             self.assertEqual(
                 defaults.docling_metrics_url,
                 "http://docling-serve.docling.svc.cluster.local:5001/metrics",
@@ -256,6 +257,17 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             self.assertEqual(snapshot["docling_workers_detected"], 5)
             self.assertEqual(snapshot["ingestion_concurrency_effective"], 3)
             self.assertTrue(snapshot["worker_detection_success"])
+
+    def test_automatic_concurrency_prefetches_two_tasks_per_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(
+                Path(directory),
+                ingestion_concurrency=None,
+                ingestion_concurrency_max=8,
+                ingestion_prefetch_per_worker=2,
+            )
+            with mock.patch.object(connector, "detect_docling_workers", return_value=3):
+                self.assertEqual(connector.effective_ingestion_concurrency(config), 6)
 
     def test_automatic_concurrency_stops_at_zero_and_falls_back_on_error(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1834,6 +1846,9 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
         self.assertIn("name: OPENRAG_INGEST_MODE\n              value: api", deployment)
         self.assertIn("name: INGESTION_CONCURRENCY\n              value: auto", deployment)
         self.assertIn("name: INGESTION_CONCURRENCY_FALLBACK", deployment)
+        self.assertIn(
+            'name: INGESTION_PREFETCH_PER_WORKER\n              value: "2"', deployment
+        )
         self.assertIn("name: DOCLING_METRICS_URL", deployment)
         self.assertIn("docling-serve.docling.svc.cluster.local:5001/metrics", deployment)
         self.assertIn("claimName: openrag-shared", deployment)

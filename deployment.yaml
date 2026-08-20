@@ -115,7 +115,9 @@ spec:
             - name: INGESTION_CONCURRENCY_FALLBACK
               value: "2"
             - name: INGESTION_CONCURRENCY_MAX
-              value: "4"
+              value: "8"
+            - name: INGESTION_PREFETCH_PER_WORKER
+              value: "2"
             - name: DOCLING_METRICS_URL
               value: http://docling-serve.docling.svc.cluster.local:5001/metrics
             - name: DOCLING_METRICS_TIMEOUT_SECONDS

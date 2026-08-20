@@ -110,7 +110,8 @@ class Config:
     openarchiver_requests_per_minute: int = 90
     ingestion_concurrency: int | None = None
     ingestion_concurrency_fallback: int = 2
-    ingestion_concurrency_max: int = 4
+    ingestion_concurrency_max: int = 8
+    ingestion_prefetch_per_worker: int = 2
     docling_metrics_url: str = (
         "http://docling-serve.docling.svc.cluster.local:5001/metrics"
     )
@@ -134,7 +135,7 @@ class Config:
             )
             if item.strip()
         )
-        concurrency_max = max(1, int(values.get("INGESTION_CONCURRENCY_MAX", "4")))
+        concurrency_max = max(1, int(values.get("INGESTION_CONCURRENCY_MAX", "8")))
         concurrency_value = values.get("INGESTION_CONCURRENCY", "auto").strip().lower()
         ingestion_concurrency = (
             None
@@ -197,6 +198,9 @@ class Config:
                 max(1, int(values.get("INGESTION_CONCURRENCY_FALLBACK", "2"))),
             ),
             ingestion_concurrency_max=concurrency_max,
+            ingestion_prefetch_per_worker=max(
+                1, int(values.get("INGESTION_PREFETCH_PER_WORKER", "2"))
+            ),
             docling_metrics_url=values.get(
                 "DOCLING_METRICS_URL",
                 "http://docling-serve.docling.svc.cluster.local:5001/metrics",
@@ -2012,16 +2016,21 @@ def effective_ingestion_concurrency(
         try:
             detected = detect_docling_workers(config)
             detection_success = True
-            effective = min(detected, config.ingestion_concurrency_max)
+            effective = min(
+                detected * config.ingestion_prefetch_per_worker,
+                config.ingestion_concurrency_max,
+            )
             if effective == 0:
                 LOG.warning(
                     "aucun worker Docling RQ détecté; aucune nouvelle ingestion"
                 )
             else:
                 LOG.info(
-                    "%d worker(s) Docling détecté(s); concurrence effective=%d",
+                    "%d worker(s) Docling détecté(s); concurrence effective=%d "
+                    "(%d tâche(s) en vol par worker)",
                     detected,
                     effective,
+                    config.ingestion_prefetch_per_worker,
                 )
         except Exception as error:
             effective = min(
