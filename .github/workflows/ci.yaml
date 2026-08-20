@@ -48,7 +48,7 @@ jobs:
           build-args: |
             SOURCE_SHA=${{ github.sha }}
           tags: |
-            ghcr.io/${{ github.repository }}:${{ github.sha }}
-            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/fermedepommerieux/openrag-openarchiver-connector:${{ github.sha }}
+            ghcr.io/fermedepommerieux/openrag-openarchiver-connector:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
