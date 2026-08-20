@@ -2535,87 +2535,6 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
         self.assertIn("Cycle en cours…", ingestion_page)
         self.assertNotIn("Inventaire en cours…", ingestion_page)
 
-    def test_runtime_manifests_expose_the_interface_securely_on_the_lan(self):
-        root = MODULE_PATH.parent
-        deployment = (root / "deployment.yaml").read_text(encoding="utf-8")
-        service = (root / "service.yaml").read_text(encoding="utf-8")
-        kustomization = (root / "kustomization.yaml").read_text(encoding="utf-8")
-        ingress_http = (root / "ingress-http.yaml").read_text(encoding="utf-8")
-        ingress_https = (root / "ingress-https.yaml").read_text(encoding="utf-8")
-        middleware_headers = (root / "middleware-headers.yaml").read_text(
-            encoding="utf-8"
-        )
-        middleware_redirect = (root / "middleware-redirect-https.yaml").read_text(
-            encoding="utf-8"
-        )
-        hostname = "openrag-openarchiver-connector.ferme-de-pommerieux.fr"
-        self.assertIn("automountServiceAccountToken: false", deployment)
-        self.assertIn("readOnlyRootFilesystem: true", deployment)
-        self.assertIn("openrag-openarchiver-connector-api", deployment)
-        self.assertIn(
-            "http://openarchiver-api.openarchiver.svc.cluster.local:4000/v1",
-            deployment,
-        )
-        self.assertIn("openarchiver-api-key", deployment)
-        self.assertIn("openrag-api-key", deployment)
-        self.assertIn("name: bootstrap-api-keys", deployment)
-        self.assertIn("optional: true", deployment)
-        self.assertIn("/state/secrets/openarchiver-api-key", deployment)
-        self.assertIn("/state/secrets/openrag-api-key", deployment)
-        self.assertIn("chmod 0600", deployment)
-        self.assertIn("OPENRAG_INGEST_DIRECTORY", deployment)
-        self.assertIn("/shared/openrag-documents/openarchiver", deployment)
-        self.assertIn("/v1/documents/ingest-path", deployment)
-        self.assertIn("name: OPENRAG_AUTH_MODE\n              value: auto", deployment)
-        self.assertIn("name: CONNECTOR_PUBLIC_URL", deployment)
-        self.assertIn(f"value: https://{hostname}", deployment)
-        self.assertIn(
-            "https://openarchiver.ferme-de-pommerieux.fr/dashboard/archived-emails/{email_id}",
-            deployment,
-        )
-        self.assertIn("name: OPENRAG_INGEST_MODE\n              value: api", deployment)
-        self.assertIn("name: INGESTION_CONCURRENCY\n              value: auto", deployment)
-        self.assertIn("name: INGESTION_CONCURRENCY_FALLBACK", deployment)
-        self.assertIn(
-            'name: INGESTION_PREFETCH_PER_WORKER\n              value: "2"', deployment
-        )
-        self.assertIn("name: DOCLING_METRICS_URL", deployment)
-        self.assertIn("docling-serve.docling.svc.cluster.local:5001/metrics", deployment)
-        self.assertIn("claimName: openrag-shared", deployment)
-        self.assertIn("type: ClusterIP", service)
-        self.assertNotIn("NodePort", service)
-        self.assertIn(hostname, ingress_http)
-        self.assertIn(hostname, ingress_https)
-        self.assertIn("router.entrypoints: web\n", ingress_http)
-        self.assertIn("redirect-https@kubernetescrd", ingress_http)
-        self.assertIn("router.entrypoints: websecure", ingress_https)
-        self.assertIn('router.tls: "true"', ingress_https)
-        self.assertNotIn("auth@kubernetescrd", ingress_https)
-        self.assertNotIn("middleware-auth.yaml", kustomization)
-        self.assertIn("headers@kubernetescrd", ingress_https)
-        self.assertIn("contentTypeNosniff: true", middleware_headers)
-        self.assertIn("scheme: https", middleware_redirect)
-        self.assertNotIn("ipAllowList", middleware_headers)
-        for resource in (
-            "pvc.yaml",
-            "deployment.yaml",
-            "service.yaml",
-            "middleware-headers.yaml",
-            "middleware-redirect-https.yaml",
-            "ingress-http.yaml",
-            "ingress-https.yaml",
-        ):
-            self.assertIn(f"- {resource}", kustomization)
-
-    def test_runtime_bundle_contains_no_kubernetes_secret_value(self):
-        root = MODULE_PATH.parent
-        manifests = "\n".join(
-            path.read_text(encoding="utf-8") for path in root.glob("*.yaml")
-        )
-        self.assertNotIn("kind: Secret", manifests)
-        self.assertNotIn("stringData:", manifests)
-        self.assertNotIn("data:\n  openarchiver-api-key", manifests)
-
     def test_mailbox_discovery_selection_and_pause_are_conservative(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory), page_limit=10)
@@ -2736,18 +2655,6 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             claimed = connector.claim_next(config, now=1)
             self.assertIsNotNone(claimed)
             self.assertEqual((claimed.kind, claimed.object_id), ("attachment", "att-1"))
-
-    def test_openarchiver_backend_has_a_private_service(self):
-        manifest = (
-            MODULE_PATH.parents[3] / "apps/openarchiver/openarchiver.yaml"
-        ).read_text(encoding="utf-8")
-        api_service = manifest.split("  name: openarchiver-api", 1)[1].split("---", 1)[
-            0
-        ]
-        self.assertIn("type: ClusterIP", api_service)
-        self.assertIn("port: 4000", api_service)
-        self.assertIn("targetPort: backend", api_service)
-        self.assertNotIn("NodePort", api_service)
 
     def test_process_mail_downloads_once_then_validates(self):
         with tempfile.TemporaryDirectory() as directory:

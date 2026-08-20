@@ -9,6 +9,27 @@ Le connecteur est un orchestrateur avec une mémoire locale : il sait ce qui a
 été découvert, sélectionné, soumis, validé ou perdu. Cette mémoire est une base
 SQLite conservée sur le PVC `openrag-openarchiver-connector-state`.
 
+## Compatibilité OpenRAG — dépendance obligatoire
+
+Ce connecteur **ne cible pas actuellement OpenRAG upstream seul**. Il dépend du
+fork [`FermedePommerieux/openrag-compose`](https://github.com/FermedePommerieux/openrag-compose)
+et des contrats d'API ajoutés sur la branche
+[`agent/local-source-lifecycle`](https://github.com/FermedePommerieux/openrag-compose/tree/agent/local-source-lifecycle).
+
+La branche d'intégration prévue est `agent/openarchiver-connector-ui`. Elle sera
+créée au-dessus de `agent/local-source-lifecycle` pour déclarer OpenArchiver
+dans l'onglet **Connectors** d'OpenRAG, tout en conservant ce processus autonome
+pour l'inventaire, SQLite et les reprises. Tant que cette branche n'existe pas,
+`agent/local-source-lifecycle` est la base compatible et déployée.
+
+Les points de couplage à vérifier avant tout changement de branche OpenRAG sont :
+
+- `POST /v1/documents/ingest` et `replace_duplicates` ;
+- `/v1/tasks/{task_id}/enhanced`, avec repli sur `/v1/tasks/{task_id}` ;
+- `/v2/files`, les chunks et le `document_id` dérivé du SHA-256 ;
+- `/auth/me`, `/users/me` et le flux OAuth délégué ;
+- la métrique Docling RQ `rq_workers` utilisée par la concurrence automatique.
+
 ## Vue d'ensemble
 
 ```mermaid
@@ -39,9 +60,9 @@ suffit pas à déclarer le fichier indexé.
 
 ## Où commencer dans le code
 
-Le service tient dans un seul module Python afin de pouvoir être injecté par
-une ConfigMap sans construire une image spécifique. Les séparateurs dans
-`connector.py` permettent de le lire dans cet ordre :
+Le service tient dans un seul module Python sans dépendance externe. Il est
+publié dans une image dédiée ; les séparateurs dans `connector.py` permettent
+de le lire dans cet ordre :
 
 1. `Config` : lecture et validation des variables d'environnement ;
 2. `connect_db` : schéma SQLite et migrations ;
@@ -270,9 +291,9 @@ enregistrées dans SQLite ni écrites dans les logs. Comme dans OpenRAG,
 l'interface n'affiche que leurs 12 premiers caractères suivis de `...` et
 masque toujours au moins les quatre derniers caractères.
 
-## Configuration de production
+## Configuration
 
-Les valeurs actives sont définies dans `deployment.yaml`. Les principales sont :
+Les valeurs sont fournies par l'environnement d'exécution. Les principales sont :
 
 | Variable | Valeur actuelle | Rôle |
 | --- | --- | --- |
@@ -304,26 +325,23 @@ remplacées par `SUPPORTED_EXTENSIONS`.
 Les URL d'API doivent rester des URL HTTP internes sans identifiants. Les clés
 sont lues depuis `OPENARCHIVER_API_KEY_FILE` et `OPENRAG_API_KEY_FILE`.
 
-## Fichiers Kubernetes
+## Image et déploiement GitOps
 
-| Fichier | Rôle |
-| --- | --- |
-| `connector.py` | application complète |
-| `deployment.yaml` | pod, configuration, probes, volumes et limites |
-| `pvc.yaml` | PVC SQLite et secrets persistés |
-| `service.yaml` | Service ClusterIP HTTP |
-| `ingress-http.yaml`, `ingress-https.yaml` | exposition Traefik |
-| `middleware-*.yaml` | redirection et en-têtes HTTP |
-| `kustomization.yaml` | assemble les ressources et génère la ConfigMap du code |
-| `tests/test_connector.py` | tests unitaires et contrats Kubernetes |
+La CI publie après chaque push sur `main` une image Linux `amd64`/`arm64` dans :
 
-Tout changement de `connector.py` modifie le hash de la ConfigMap générée et
-provoque donc un redémarrage du pod lors de la réconciliation Fleet. Un simple
-changement de ce README ne redémarre pas le service.
+```text
+ghcr.io/fermedepommerieux/openrag-openarchiver-connector:<commit-sha>
+```
+
+Le tag SHA est immuable et doit être utilisé en production. Le tag `latest`
+sert uniquement aux essais manuels. Les manifestes Kubernetes, les URL internes,
+les PVC, les Secrets et les limites de ressources restent dans le dépôt privé
+[`Pommerieux-GitOps`](https://github.com/FermedePommerieux/Pommerieux-GitOps).
+Le dépôt applicatif ne contient donc aucune valeur propre au cluster.
 
 ## Tester et diagnostiquer
 
-Depuis ce dossier :
+Depuis la racine du dépôt :
 
 ```bash
 PYTHONPYCACHEPREFIX=/private/tmp/openarchiver-pycache \
@@ -332,7 +350,13 @@ PYTHONPYCACHEPREFIX=/private/tmp/openarchiver-pycache \
   python3 -m unittest discover -s tests
 ```
 
-Points de contrôle utiles dans le cluster :
+L'image locale peut aussi être vérifiée avec :
+
+```bash
+docker build -t openrag-openarchiver-connector:dev .
+```
+
+Points de contrôle utiles dans un déploiement Kubernetes :
 
 ```bash
 kubectl -n openrag get pods
@@ -344,9 +368,8 @@ Pour diagnostiquer une ingestion lente, regarder dans cet ordre :
 
 1. le nombre d'objets `downloading`/`ingesting` et la concurrence effective ;
 2. le débit **mails traités par minute** ;
-3. les tâches OpenRAG `pending`/`running` du connecteur ;
-4. la file et la charge Langflow ;
-5. la file RQ, la mémoire et la température des workers Docling.
+3. la charge Langflow ;
+4. la file RQ, la mémoire et la température des workers Docling.
 
 ## Invariants à préserver lors d'une modification
 

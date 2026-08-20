@@ -1,0 +1,13 @@
+.git
+.github
+__pycache__
+*.py[cod]
+.pytest_cache
+tests
+deployment.yaml
+fleet.yaml
+ingress-*.yaml
+kustomization.yaml
+middleware-*.yaml
+pvc.yaml
+service.yaml
