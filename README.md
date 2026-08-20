@@ -282,18 +282,24 @@ L'interface est répartie en trois onglets persistants : **État de
 l'ingestion**, **Sources** et **Configuration**. Le premier regroupe le suivi et
 la pause ; le second contient l'inventaire IMAP, le périmètre OpenArchiver, la
 réconciliation et les reprises ; le dernier contient l'identité OpenRAG et les
-clés techniques.
+adresses de service ainsi que les clés techniques.
 
 Actions POST : `/sources`, `/mailboxes`, `/scan`, `/pause`, `/retry`,
-`/reconcile` et `/secrets`. Elles exigent toutes le jeton CSRF de la
-page. Les clés saisies sont écrites atomiquement dans `/state/secrets`, jamais
+`/reconcile`, `/configuration` et `/secrets`. Elles exigent toutes le jeton
+CSRF de la page. Les URL enregistrées dans **Configuration → Adresses des
+services** sont validées, conservées dans SQLite sur le PVC et deviennent
+actives sans redémarrage. Les requêtes déjà commencées terminent sur leur
+ancienne destination.
+
+Les clés saisies sont écrites atomiquement dans `/state/secrets`, jamais
 enregistrées dans SQLite ni écrites dans les logs. Comme dans OpenRAG,
 l'interface n'affiche que leurs 12 premiers caractères suivis de `...` et
 masque toujours au moins les quatre derniers caractères.
 
 ## Configuration
 
-Les valeurs sont fournies par l'environnement d'exécution. Les principales sont :
+Les variables d'environnement fournissent l'amorçage du premier démarrage. Les
+principales sont :
 
 | Variable | Valeur actuelle | Rôle |
 | --- | --- | --- |
@@ -318,12 +324,50 @@ Les valeurs sont fournies par l'environnement d'exécution. Les principales sont
 | `DOCLING_RQ_QUEUE_NAME` | `convert` | file comptée dans les métriques |
 | `REQUEST_TIMEOUT_SECONDS` | `30` | timeout des appels HTTP courts |
 
+`OPENRAG_BASE_URL` et `CONNECTOR_PUBLIC_URL` ont un fonctionnement particulier :
+
+1. au premier démarrage, le connecteur utilise les valeurs du Deployment ;
+2. l'opérateur ouvre l'onglet **Configuration** et les enregistre ;
+3. les valeurs sont alors conservées dans la table `settings` de SQLite sur le
+   PVC ;
+4. au prochain redémarrage, les valeurs SQLite sont chargées et ont priorité
+   sur l'environnement Rancher/Fleet.
+
+L'URL OpenRAG doit être une URL HTTP interne au cluster, sans identifiants.
+L'URL du connecteur doit être une URL HTTPS publique sans chemin, paramètres ni
+fragment.
+
 Les extensions acceptées par défaut sont `.asc`, `.asciidoc`, `.adoc`, `.csv`,
 `.docx`, `.htm`, `.html`, `.md`, `.pdf`, `.txt` et `.xlsx`. Elles peuvent être
 remplacées par `SUPPORTED_EXTENSIONS`.
 
-Les URL d'API doivent rester des URL HTTP internes sans identifiants. Les clés
+Les autres URL d'API restent des URL HTTP internes sans identifiants. Les clés
 sont lues depuis `OPENARCHIVER_API_KEY_FILE` et `OPENRAG_API_KEY_FILE`.
+
+### Amorçage des valeurs dans Rancher
+
+Le Deployment est piloté par Fleet. Une modification directe dans
+**Workloads → Deployments → Edit Config** serait donc annulée lors de la
+prochaine réconciliation. La source de vérité d'amorçage reste le manifeste
+GitOps `apps/openrag/openarchiver-connector/deployment.yaml`.
+
+Dans Rancher, les valeurs actives peuvent être contrôlées ainsi :
+
+1. ouvrir le cluster puis **Workloads → Deployments** ;
+2. choisir le namespace `openrag` ;
+3. ouvrir `openrag-openarchiver-connector` ;
+4. consulter **Config → Environment Variables** ;
+5. vérifier les valeurs d'amorçage :
+
+   ```text
+   OPENRAG_BASE_URL=http://openrag-backend.openrag.svc.cluster.local:8000
+   CONNECTOR_PUBLIC_URL=https://openrag-openarchiver-connector.ferme-de-pommerieux.fr
+   ```
+
+Pour les modifier durablement, changer le manifeste GitOps et laisser Fleet le
+réconcilier. Pour une modification fonctionnelle courante, utiliser plutôt
+l'onglet **Configuration** du connecteur : aucune modification Rancher ni
+reconstruction d'image n'est alors nécessaire.
 
 ## Image et déploiement GitOps
 

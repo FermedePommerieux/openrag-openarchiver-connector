@@ -255,6 +255,63 @@ class ConnectorTests(unittest.TestCase):
                         {**env, "CONNECTOR_PUBLIC_URL": public_url}
                     )
 
+    def test_runtime_urls_are_persisted_validated_and_restored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config(
+                root,
+                connector_public_url="https://bootstrap.example.test",
+            )
+            self.assertFalse(connector.runtime_urls_are_persisted(config))
+            connector.persist_runtime_urls(
+                config,
+                openrag_base_url="http://openrag-api.openrag.svc.cluster.local:8000/",
+                connector_public_url="https://connector.example.test/",
+            )
+
+            self.assertEqual(
+                config.openrag_base_url,
+                "http://openrag-api.openrag.svc.cluster.local:8000",
+            )
+            self.assertEqual(
+                config.connector_public_url, "https://connector.example.test"
+            )
+            self.assertTrue(connector.runtime_urls_are_persisted(config))
+
+            restored = self.config(
+                root,
+                openrag_base_url="http://bootstrap-openrag:8000",
+                connector_public_url="https://bootstrap.example.test",
+            )
+            self.assertTrue(connector.restore_runtime_urls(restored))
+            self.assertEqual(restored.openrag_base_url, config.openrag_base_url)
+            self.assertEqual(
+                restored.connector_public_url, config.connector_public_url
+            )
+
+            with self.assertRaises(connector.ConnectorError):
+                connector.persist_runtime_urls(
+                    restored,
+                    openrag_base_url="https://public-openrag.example.test",
+                    connector_public_url="https://connector.example.test",
+                )
+            with self.assertRaises(connector.ConnectorError):
+                connector.persist_runtime_urls(
+                    restored,
+                    openrag_base_url="http://openrag-backend:8000",
+                    connector_public_url="http://connector.example.test",
+                )
+            with self.assertRaises(connector.ConnectorError):
+                connector.persist_runtime_urls(
+                    restored,
+                    openrag_base_url="http://openrag-backend:8000",
+                    connector_public_url="https://connector.example.test/callback",
+                )
+            self.assertEqual(restored.openrag_base_url, config.openrag_base_url)
+            self.assertEqual(
+                restored.connector_public_url, config.connector_public_url
+            )
+
     def test_openrag_auth_client_mirrors_noauth_identity_and_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(
@@ -2059,6 +2116,7 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                     page = response.read().decode("utf-8")
                 self.assertIn("source-1", page)
                 self.assertIn("Clés API", page)
+                self.assertIn("Amorçage Rancher/Fleet", page)
 
                 secrets_request = urllib.request.Request(
                     base + "/secrets",
@@ -2084,6 +2142,30 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                 )
                 self.assertNotIn("oa-rotated", rotated_page)
                 self.assertNotIn("rag-rotated", rotated_page)
+                self.assertTrue(wake.is_set())
+                wake.clear()
+
+                configuration_request = urllib.request.Request(
+                    base + "/configuration",
+                    data=urllib.parse.urlencode(
+                        {
+                            "csrf": state.snapshot()["csrf_token"],
+                            "openrag_base_url": "http://new-openrag:8000/",
+                            "connector_public_url": "https://connector.example.test/",
+                        }
+                    ).encode("ascii"),
+                )
+                with urllib.request.urlopen(configuration_request) as response:
+                    configuration_page = response.read().decode("utf-8")
+                self.assertEqual(config.openrag_base_url, "http://new-openrag:8000")
+                self.assertEqual(
+                    config.connector_public_url, "https://connector.example.test"
+                )
+                self.assertIn('value="http://new-openrag:8000"', configuration_page)
+                self.assertIn(
+                    'value="https://connector.example.test"', configuration_page
+                )
+                self.assertIn("Enregistrée sur le PVC", configuration_page)
                 self.assertTrue(wake.is_set())
                 wake.clear()
 
@@ -2519,8 +2601,10 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
         self.assertNotIn("Remise à zéro", page)
         self.assertNotIn('action="/reset"', page)
         self.assertNotIn('<script src="http', page)
-        self.assertNotIn("https://", page)
-        self.assertNotIn("http://", page)
+        self.assertIn('action="/configuration"', page)
+        self.assertIn('name="openrag_base_url"', page)
+        self.assertIn('name="connector_public_url"', page)
+        self.assertIn('value="http://openrag-backend:8000"', page)
 
         state.cycle_progress("Traitement de l’ingestion OpenRAG", 6, 10)
         ingestion_page = connector.render_status_page(config, state)

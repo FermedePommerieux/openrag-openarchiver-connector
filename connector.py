@@ -14,7 +14,7 @@ le soumet, attend la fin de la tâche OpenRAG, puis vérifie que ``/v2/files`` e
 au moins un chunk portant l'identifiant dérivé de ce SHA-256. Le statut local ne
 passe à ``validated`` qu'après cette dernière preuve.
 
-Ce module reste volontairement autonome pour être monté depuis une ConfigMap.
+Ce module reste volontairement autonome et est publié dans sa propre image.
 Le guide d'architecture, les états et les procédures d'exploitation sont dans
 le fichier ``README.md`` situé à côté de ce module.
 """
@@ -85,6 +85,9 @@ RECONCILE_BATCH_SIZE = 100
 MAIL_RATE_POLL_SECONDS = 5
 OPENRAG_TASK_POLL_SECONDS = 0.25
 API_KEY_DISPLAY_PREFIX_LENGTH = 12
+RUNTIME_OPENRAG_URL_KEY = "runtime_openrag_base_url"
+RUNTIME_CONNECTOR_URL_KEY = "runtime_connector_public_url"
+CONFIG_LOCK = threading.RLock()
 
 
 # ---------------------------------------------------------------------------
@@ -150,9 +153,14 @@ class ConnectorPrincipal:
         )
 
 
-@dataclass(frozen=True)
+@dataclass
 class Config:
-    """Configuration immuable chargée depuis les variables du Deployment."""
+    """Configuration chargée au démarrage puis partiellement éditable.
+
+    Les variables du Deployment amorcent le service. Les deux URL utilisées
+    par l'interface peuvent ensuite être remplacées dans SQLite ; seuls ces
+    deux attributs sont modifiés à chaud, sous ``CONFIG_LOCK``.
+    """
 
     openarchiver_base_url: str
     openarchiver_api_key_file: Path
@@ -308,18 +316,7 @@ class Config:
         if config.openrag_auth_mode not in {"disabled", "auto", "required"}:
             raise ValueError("OPENRAG_AUTH_MODE doit être disabled, auto ou required")
         if config.openrag_auth_mode != "disabled":
-            parsed_public_url = urllib.parse.urlsplit(config.connector_public_url)
-            if (
-                parsed_public_url.scheme != "https"
-                or not parsed_public_url.hostname
-                or parsed_public_url.username is not None
-                or parsed_public_url.password is not None
-                or parsed_public_url.query
-                or parsed_public_url.fragment
-            ):
-                raise ValueError(
-                    "CONNECTOR_PUBLIC_URL doit être une URL HTTPS publique sans identifiants"
-                )
+            _validate_connector_public_url(config.connector_public_url)
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", config.openrag_auth_cookie_name):
             raise ValueError("OPENRAG_AUTH_COOKIE_NAME invalide")
         return config
@@ -358,6 +355,22 @@ def _validate_internal_http_url(value: str, variable: str) -> None:
     )
     if parsed.scheme != "http" or not internal or parsed.username or parsed.password:
         raise ValueError(f"{variable} doit être une URL HTTP interne sans identifiants")
+
+
+def _validate_connector_public_url(value: str) -> None:
+    parsed = urllib.parse.urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "CONNECTOR_PUBLIC_URL doit être une origine HTTPS publique sans identifiants, chemin ni paramètres"
+        )
 
 
 def _validate_source_url(value: str) -> str:
@@ -1021,6 +1034,99 @@ def set_paused(config: Config, paused: bool) -> None:
             "INSERT OR REPLACE INTO settings(key,value) VALUES ('paused',?)",
             ("1" if paused else "0",),
         )
+
+
+def normalize_runtime_urls(
+    *, openrag_base_url: str, connector_public_url: str
+) -> tuple[str, str]:
+    """Normalise et valide les deux URL éditables."""
+    normalized_openrag_url = openrag_base_url.strip().rstrip("/")
+    normalized_connector_url = connector_public_url.strip().rstrip("/")
+    try:
+        _validate_internal_http_url(normalized_openrag_url, "OPENRAG_BASE_URL")
+        _validate_connector_public_url(normalized_connector_url)
+    except ValueError as error:
+        raise ConnectorError(str(error)) from None
+    return normalized_openrag_url, normalized_connector_url
+
+
+def apply_runtime_urls(
+    config: Config, *, openrag_base_url: str, connector_public_url: str
+) -> None:
+    """Valide puis active les deux URL éditables.
+
+    L'URL OpenRAG reste volontairement limitée au réseau HTTP interne afin
+    qu'un compte d'exploitation ne transforme pas le connecteur en relais
+    HTTP arbitraire. L'URL du connecteur est publique car elle sert de callback
+    OAuth et doit donc utiliser HTTPS. Le verrou sérialise les modifications
+    concurrentes issues de l'interface.
+    """
+    normalized_openrag_url, normalized_connector_url = normalize_runtime_urls(
+        openrag_base_url=openrag_base_url,
+        connector_public_url=connector_public_url,
+    )
+    with CONFIG_LOCK:
+        config.openrag_base_url = normalized_openrag_url
+        config.connector_public_url = normalized_connector_url
+
+
+def persist_runtime_urls(
+    config: Config, *, openrag_base_url: str, connector_public_url: str
+) -> None:
+    """Conserve les URL sur le PVC puis les rend actives sans redémarrage."""
+    normalized_openrag_url, normalized_connector_url = normalize_runtime_urls(
+        openrag_base_url=openrag_base_url,
+        connector_public_url=connector_public_url,
+    )
+    # Valider avant toute écriture afin de ne jamais persister un état qui
+    # empêcherait le prochain démarrage du connecteur.
+    with database(config) as db:
+        db.executemany(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)",
+            (
+                (RUNTIME_OPENRAG_URL_KEY, normalized_openrag_url),
+                (RUNTIME_CONNECTOR_URL_KEY, normalized_connector_url),
+            ),
+        )
+    apply_runtime_urls(
+        config,
+        openrag_base_url=normalized_openrag_url,
+        connector_public_url=normalized_connector_url,
+    )
+
+
+def restore_runtime_urls(config: Config) -> bool:
+    """Charge les URL de l'interface, ou conserve l'amorçage du Deployment."""
+    with database(config) as db:
+        values = {
+            str(row["key"]): str(row["value"])
+            for row in db.execute(
+                "SELECT key,value FROM settings WHERE key IN (?,?)",
+                (RUNTIME_OPENRAG_URL_KEY, RUNTIME_CONNECTOR_URL_KEY),
+            )
+        }
+    if not values:
+        return False
+    apply_runtime_urls(
+        config,
+        openrag_base_url=values.get(
+            RUNTIME_OPENRAG_URL_KEY, config.openrag_base_url
+        ),
+        connector_public_url=values.get(
+            RUNTIME_CONNECTOR_URL_KEY, config.connector_public_url
+        ),
+    )
+    return True
+
+
+def runtime_urls_are_persisted(config: Config) -> bool:
+    """Indique si les deux valeurs de l'interface existent sur le PVC."""
+    with database(config) as db:
+        row = db.execute(
+            "SELECT COUNT(*) FROM settings WHERE key IN (?,?)",
+            (RUNTIME_OPENRAG_URL_KEY, RUNTIME_CONNECTOR_URL_KEY),
+        ).fetchone()
+    return bool(row and int(row[0]) == 2)
 
 
 def mailbox_rows(config: Config) -> list[sqlite3.Row]:
@@ -4157,6 +4263,13 @@ def render_status_page(
         if openrag_key_prefix
         else '<span class="secret-missing">Aucune clé configurée</span>'
     )
+    openrag_base_url = html.escape(config.openrag_base_url, quote=True)
+    connector_public_url = html.escape(config.connector_public_url, quote=True)
+    url_configuration_state = (
+        "Enregistrée sur le PVC"
+        if runtime_urls_are_persisted(config)
+        else "Amorçage Rancher/Fleet"
+    )
     status_class = "success" if snapshot["ready"] else "danger"
     activity_class = "warning" if paused else "success"
     last_completed = int(snapshot["last_cycle_completed_at"])
@@ -4264,6 +4377,9 @@ def render_status_page(
 <section id="workspace-panel-configuration" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-configuration" data-workspace-panel="configuration" hidden>
 <div class="section-heading"><div><h2>Configuration</h2><p>Accès techniques et identité héritée d’OpenRAG.</p></div></div>
 {identity_notice}
+<form method="post" action="/configuration" class="card" autocomplete="off"><div class="card-header"><div><h2 class="card-title">Adresses des services</h2><p class="card-description">Configurez la cible OpenRAG et l’adresse publique utilisée par le callback de connexion.</p></div><span class="badge success">{url_configuration_state}</span></div>
+<div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="secret-grid"><label class="secret-field">URL interne de l’API OpenRAG<span class="secret-current">Service HTTP joignable depuis le cluster</span><input type="url" name="openrag_base_url" value="{openrag_base_url}" required spellcheck="false" autocomplete="url"></label><label class="secret-field">URL publique du connecteur<span class="secret-current">Adresse HTTPS sans chemin ni paramètres</span><input type="url" name="connector_public_url" value="{connector_public_url}" required spellcheck="false" autocomplete="url"></label></div><p class="helper">Ces valeurs sont conservées dans SQLite sur le PVC et deviennent actives immédiatement. Les variables Rancher/Fleet ne servent qu’à amorcer le premier démarrage. Les requêtes déjà en cours terminent avec leur ancienne destination.</p></div>
+<div class="card-footer"><button class="primary" type="submit">Enregistrer les adresses</button></div></form>
 <form method="post" action="/secrets" class="card" autocomplete="off"><div class="card-header"><div><h2 class="card-title">Clés API</h2><p class="card-description">Renouvelez séparément les accès OpenArchiver et OpenRAG.</p></div><span class="badge">OpenArchiver : {openarchiver_key_state} · OpenRAG : {openrag_key_state}</span></div>
 <div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="secret-grid"><label class="secret-field">Nouvelle clé OpenArchiver<span class="secret-current">Clé actuelle : {openarchiver_key_display}</span><input type="password" name="openarchiver_key" autocomplete="new-password"></label><label class="secret-field">Nouvelle clé OpenRAG<span class="secret-current">Clé actuelle : {openrag_key_display}</span><input type="password" name="openrag_key" autocomplete="new-password"></label></div><p class="helper">Laissez un champ vide pour conserver sa valeur actuelle. Seul le début des clés est affiché ; leur valeur complète n’est jamais placée dans la page ni enregistrée dans SQLite.</p></div>
 <div class="card-footer"><button class="primary" type="submit">Enregistrer les clés renseignées</button></div></form>
@@ -4618,6 +4734,7 @@ def make_http_handler(
                 if principal is None:
                     return
                 permission_by_path = {
+                    "/configuration": "config:write",
                     "/secrets": "config:write",
                     "/sources": "config:write",
                     "/mailboxes": "config:write",
@@ -4637,7 +4754,20 @@ def make_http_handler(
                         "text/plain; charset=utf-8",
                     )
                     return
-                if path == "/secrets":
+                if path == "/configuration":
+                    openrag_base_url = form.get("openrag_base_url", [""])[0]
+                    connector_public_url = form.get(
+                        "connector_public_url", [""]
+                    )[0]
+                    persist_runtime_urls(
+                        config,
+                        openrag_base_url=openrag_base_url,
+                        connector_public_url=connector_public_url,
+                    )
+                    state.cycle_requested()
+                    wake.set()
+                    self._finish_action(principal, "configuration.urls.update")
+                elif path == "/secrets":
                     changed = []
                     openarchiver_key = form.get("openarchiver_key", [""])[0]
                     openrag_key = form.get("openrag_key", [""])[0]
@@ -4734,6 +4864,8 @@ def main() -> None:
     config = Config.from_env()
     with database(config):
         pass
+    if restore_runtime_urls(config):
+        LOG.info("URL OpenRAG et URL publique restaurées depuis la configuration")
 
     STOP.clear()
     WAKE.clear()
