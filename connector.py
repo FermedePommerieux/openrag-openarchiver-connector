@@ -4,8 +4,9 @@ Le connecteur orchestre quatre responsabilités, sans modifier OpenRAG :
 
 1. inventorier les sources, dossiers, mails et pièces jointes d'OpenArchiver ;
 2. conserver les sélections et l'état de reprise dans une base SQLite locale ;
-3. soumettre les fichiers originaux à l'API d'ingestion OpenRAG ;
-4. valider et réconcilier le résultat avec les chunks durables d'OpenRAG.
+3. déléguer l'identité, les rôles et les permissions de l'interface à OpenRAG ;
+4. soumettre les fichiers originaux à l'API d'ingestion OpenRAG ;
+5. valider et réconcilier le résultat avec les chunks durables d'OpenRAG.
 
 Le chemin normal en production est l'upload multipart (``OPENRAG_INGEST_MODE=api``).
 Chaque worker télécharge un fichier dans le volume partagé, calcule son SHA-256,
@@ -24,6 +25,7 @@ import base64
 import hashlib
 import html
 import http.client
+import http.cookies
 import json
 import logging
 import mimetypes
@@ -77,7 +79,7 @@ PROMETHEUS_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
 STOP = threading.Event()
 WAKE = threading.Event()
 RECONCILE_WAKE = threading.Event()
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SCHEMA_LOCK = threading.Lock()
 RECONCILE_BATCH_SIZE = 100
 OPENRAG_QUEUE_POLL_SECONDS = 5
@@ -132,6 +134,35 @@ class OpenRAGQueueSnapshot:
 
 
 @dataclass(frozen=True)
+class ConnectorPrincipal:
+    """Identité et autorisations relues depuis OpenRAG pour une requête UI."""
+
+    user_id: str
+    email: str = ""
+    name: str = ""
+    picture: str = ""
+    provider: str = ""
+    roles: frozenset[str] = frozenset()
+    permissions: frozenset[str] = frozenset()
+    authenticated: bool = False
+    no_auth_mode: bool = False
+    rbac_enforced: bool = False
+
+    def can(self, permission: str) -> bool:
+        """Reproduit le coupe-circuit RBAC d'OpenRAG.
+
+        En mode sans authentification ou lorsque le RBAC OpenRAG est désactivé,
+        OpenRAG autorise toutes les actions. Sinon sa liste de permissions est
+        la seule source de décision.
+        """
+        return (
+            self.no_auth_mode
+            or not self.rbac_enforced
+            or permission in self.permissions
+        )
+
+
+@dataclass(frozen=True)
 class Config:
     """Configuration immuable chargée depuis les variables du Deployment."""
 
@@ -142,6 +173,9 @@ class Config:
     openrag_task_path: str
     openrag_api_key_file: Path
     state_db: Path
+    connector_public_url: str = ""
+    openrag_auth_mode: str = "disabled"
+    openrag_auth_cookie_name: str = "auth_token"
     openrag_ingest_directory: Path = Path("/shared/openrag-documents/openarchiver")
     openrag_ingest_mode: str = "auto"
     openrag_upload_path: str = "/v1/documents/ingest"
@@ -223,6 +257,13 @@ class Config:
                 values.get("OPENRAG_API_KEY_FILE", "/var/run/secrets/openrag/api-key")
             ),
             state_db=Path(values.get("STATE_DB", "/state/connector.sqlite3")),
+            connector_public_url=values.get("CONNECTOR_PUBLIC_URL", "").rstrip("/"),
+            openrag_auth_mode=values.get("OPENRAG_AUTH_MODE", "disabled")
+            .strip()
+            .lower(),
+            openrag_auth_cookie_name=values.get(
+                "OPENRAG_AUTH_COOKIE_NAME", "auth_token"
+            ).strip(),
             scan_interval_seconds=max(
                 60, int(values.get("SCAN_INTERVAL_SECONDS", "3600"))
             ),
@@ -276,6 +317,23 @@ class Config:
             raise ValueError("OPENRAG_INGEST_DIRECTORY doit être un chemin absolu")
         if config.openrag_ingest_mode not in {"auto", "path", "api"}:
             raise ValueError("OPENRAG_INGEST_MODE doit être auto, path ou api")
+        if config.openrag_auth_mode not in {"disabled", "auto", "required"}:
+            raise ValueError("OPENRAG_AUTH_MODE doit être disabled, auto ou required")
+        if config.openrag_auth_mode != "disabled":
+            parsed_public_url = urllib.parse.urlsplit(config.connector_public_url)
+            if (
+                parsed_public_url.scheme != "https"
+                or not parsed_public_url.hostname
+                or parsed_public_url.username is not None
+                or parsed_public_url.password is not None
+                or parsed_public_url.query
+                or parsed_public_url.fragment
+            ):
+                raise ValueError(
+                    "CONNECTOR_PUBLIC_URL doit être une URL HTTPS publique sans identifiants"
+                )
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", config.openrag_auth_cookie_name):
+            raise ValueError("OPENRAG_AUTH_COOKIE_NAME invalide")
         return config
 
 
@@ -401,6 +459,241 @@ def write_secret(path: Path, value: str, label: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Authentification déléguée à OpenRAG
+# ---------------------------------------------------------------------------
+
+
+class OpenRAGAuthClient:
+    """Façade synchrone du login OpenRAG pour l'interface du connecteur.
+
+    Le connecteur ne signe aucun token et ne conserve aucun mot de passe. Il
+    demande à OpenRAG d'initialiser et de terminer Google OAuth, puis copie le
+    JWT ``auth_token`` émis par OpenRAG dans un cookie de son propre domaine.
+    Chaque requête protégée est revalidée par ``/auth/me`` ; rôles et
+    permissions viennent de ``/users/me``.
+    """
+
+    MAX_RESPONSE_BYTES = 1_000_000
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        opener: Callable[..., object] = urllib.request.urlopen,
+    ) -> None:
+        self.config = config
+        self.opener = opener
+
+    def _json_request(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        payload: Mapping[str, object] | None = None,
+        token: str = "",
+    ) -> tuple[int, dict[str, object], object]:
+        data = None
+        headers = {"Accept": "application/json"}
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if token:
+            if len(token) > 16_384 or not re.fullmatch(r"[A-Za-z0-9._~-]+", token):
+                raise ConnectorError("cookie de session OpenRAG invalide")
+            headers["Cookie"] = f"{self.config.openrag_auth_cookie_name}={token}"
+        request = urllib.request.Request(
+            self.config.openrag_base_url + path,
+            data=data,
+            method=method,
+            headers=headers,
+        )
+        try:
+            response = self.opener(
+                request, timeout=self.config.request_timeout_seconds
+            )
+            status = int(getattr(response, "status", 200))
+            response_headers = getattr(response, "headers", {})
+            with response:
+                raw = response.read(self.MAX_RESPONSE_BYTES + 1)
+        except urllib.error.HTTPError as error:
+            status = error.code
+            response_headers = error.headers
+            raw = error.read(self.MAX_RESPONSE_BYTES + 1)
+        except (TimeoutError, urllib.error.URLError, OSError):
+            raise ConnectorError("authentification OpenRAG indisponible") from None
+        if len(raw) > self.MAX_RESPONSE_BYTES:
+            raise ConnectorError("réponse d'authentification OpenRAG trop volumineuse")
+        try:
+            decoded = json.loads(raw.decode("utf-8")) if raw else {}
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ConnectorError("réponse d'authentification OpenRAG invalide") from None
+        result = _require_object(decoded, "authentification OpenRAG")
+        return status, result, response_headers
+
+    def resolve(self, token: str = "") -> ConnectorPrincipal | None:
+        """Retourne l'identité OpenRAG, ``None`` si une connexion est requise."""
+        if self.config.openrag_auth_mode == "disabled":
+            return ConnectorPrincipal(user_id="anonymous", no_auth_mode=True)
+
+        status, auth, _headers = self._json_request("/auth/me", token=token)
+        if status >= 500:
+            raise ConnectorError("service d'authentification OpenRAG indisponible")
+        if bool(auth.get("no_auth_mode")):
+            if self.config.openrag_auth_mode == "required":
+                raise ConnectorError(
+                    "OpenRAG est sans authentification alors que le login est obligatoire"
+                )
+            return ConnectorPrincipal(user_id="anonymous", no_auth_mode=True)
+        if status == 401 or not bool(auth.get("authenticated")):
+            return None
+
+        raw_user = _require_object(auth.get("user"), "utilisateur OpenRAG")
+        user_id = raw_user.get("user_id")
+        if not isinstance(user_id, str) or not user_id:
+            raise ConnectorError("utilisateur OpenRAG sans identifiant")
+
+        permissions: frozenset[str] = frozenset()
+        roles: frozenset[str] = frozenset()
+        rbac_enforced = False
+        permission_status, permission_data, _headers = self._json_request(
+            "/users/me", token=token
+        )
+        if permission_status == 401:
+            return None
+        if permission_status >= 400:
+            raise ConnectorError(
+                f"lecture des permissions OpenRAG: HTTP {permission_status}"
+            )
+        raw_permissions = permission_data.get("permissions", [])
+        raw_roles = permission_data.get("roles", [])
+        if not isinstance(raw_permissions, list) or not all(
+            isinstance(item, str) for item in raw_permissions
+        ):
+            raise ConnectorError("permissions OpenRAG invalides")
+        if not isinstance(raw_roles, list) or not all(
+            isinstance(item, str) for item in raw_roles
+        ):
+            raise ConnectorError("rôles OpenRAG invalides")
+        permissions = frozenset(raw_permissions)
+        roles = frozenset(raw_roles)
+        rbac_enforced = bool(permission_data.get("rbac_enforced"))
+
+        return ConnectorPrincipal(
+            user_id=user_id,
+            email=str(raw_user.get("email") or ""),
+            name=str(raw_user.get("name") or ""),
+            picture=str(raw_user.get("picture") or ""),
+            provider=str(raw_user.get("provider") or "unknown"),
+            roles=roles,
+            permissions=permissions,
+            authenticated=True,
+            rbac_enforced=rbac_enforced,
+        )
+
+    def begin_login(self) -> tuple[str, str]:
+        """Initialise OAuth dans OpenRAG et retourne ``(URL, state)``."""
+        if self.config.openrag_auth_mode == "disabled":
+            raise ConnectorError("authentification OpenRAG désactivée")
+        status, current, _headers = self._json_request("/auth/me")
+        if status >= 500:
+            raise ConnectorError("service d'authentification OpenRAG indisponible")
+        if bool(current.get("no_auth_mode")):
+            raise ConnectorError("OpenRAG est actuellement en mode sans authentification")
+
+        callback_url = self.config.connector_public_url + "/auth/callback"
+        status, result, _headers = self._json_request(
+            "/auth/init",
+            method="POST",
+            payload={
+                "connector_type": "google_drive",
+                "purpose": "app_auth",
+                "name": "OpenArchiver connector authentication",
+                "redirect_uri": callback_url,
+            },
+        )
+        if status >= 400:
+            detail = str(result.get("error") or "initialisation OAuth refusée")
+            raise ConnectorError(detail[:1000])
+        connection_id = result.get("connection_id")
+        oauth = _require_object(result.get("oauth_config"), "configuration OAuth")
+        if not isinstance(connection_id, str) or not connection_id:
+            raise ConnectorError("initialisation OAuth sans identifiant")
+        endpoint = str(oauth.get("authorization_endpoint") or "")
+        parsed_endpoint = urllib.parse.urlsplit(endpoint)
+        if parsed_endpoint.scheme != "https" or not parsed_endpoint.hostname:
+            raise ConnectorError("URL d'autorisation OAuth invalide")
+        client_id = str(oauth.get("client_id") or "")
+        redirect_uri = str(oauth.get("redirect_uri") or "")
+        scopes = oauth.get("scopes")
+        if (
+            not client_id
+            or redirect_uri != callback_url
+            or not isinstance(scopes, list)
+            or not scopes
+            or not all(isinstance(scope, str) and scope for scope in scopes)
+        ):
+            raise ConnectorError("configuration OAuth OpenRAG incomplète")
+        query = urllib.parse.urlencode(
+            {
+                "client_id": client_id,
+                "response_type": "code",
+                "scope": " ".join(scopes),
+                "redirect_uri": redirect_uri,
+                "access_type": "offline",
+                "prompt": str(oauth.get("prompt") or "consent"),
+                "state": connection_id,
+            }
+        )
+        return endpoint + "?" + query, connection_id
+
+    def complete_login(self, connection_id: str, code: str) -> str:
+        """Termine OAuth dans OpenRAG et extrait son JWT du ``Set-Cookie``."""
+        if (
+            not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", connection_id)
+            or not code
+            or len(code) > 4096
+        ):
+            raise ConnectorError("retour OAuth invalide")
+        status, result, headers = self._json_request(
+            "/auth/callback",
+            method="POST",
+            payload={
+                "connection_id": connection_id,
+                "authorization_code": code,
+                "state": connection_id,
+            },
+        )
+        if status >= 400:
+            detail = str(result.get("error") or "callback OAuth refusé")
+            raise ConnectorError(detail[:1000])
+        raw_cookies = (
+            headers.get_all("Set-Cookie")
+            if hasattr(headers, "get_all")
+            else [headers.get("Set-Cookie", "")]
+        )
+        for raw_cookie in raw_cookies:
+            cookie = http.cookies.SimpleCookie()
+            cookie.load(raw_cookie or "")
+            morsel = cookie.get(self.config.openrag_auth_cookie_name)
+            if morsel is not None and morsel.value:
+                token = morsel.value
+                if len(token) <= 16_384 and re.fullmatch(
+                    r"[A-Za-z0-9._~-]+", token
+                ):
+                    return token
+        raise ConnectorError("OpenRAG n'a pas émis de cookie de session")
+
+    def logout(self, token: str) -> None:
+        """Informe OpenRAG de la déconnexion, sans empêcher l'effacement local."""
+        if not token or self.config.openrag_auth_mode == "disabled":
+            return
+        try:
+            self._json_request("/auth/logout", method="POST", token=token)
+        except ConnectorError:
+            LOG.warning("déconnexion distante OpenRAG indisponible")
+
+
+# ---------------------------------------------------------------------------
 # Persistance SQLite, sélection et reprise
 # ---------------------------------------------------------------------------
 
@@ -415,6 +708,8 @@ def connect_db(config: Config) -> sqlite3.Connection:
     La migration v3 change l'identité visible des connaissances. Elle efface
     donc le SHA et le ``task_id`` précédents, puis remet chaque objet indexable
     en file afin qu'OpenRAG reçoive le même contenu sous son nouveau nom.
+    La v4 ne touche pas aux objets d'ingestion : elle ajoute seulement les
+    tables d'identité OpenRAG et de journal d'audit.
     """
     config.state_db.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(config.state_db, timeout=30)
@@ -502,6 +797,22 @@ def connect_db(config: Config) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL DEFAULT '',
+            roles_json TEXT NOT NULL DEFAULT '[]',
+            permissions_json TEXT NOT NULL DEFAULT '[]',
+            rbac_enforced INTEGER NOT NULL DEFAULT 0,
+            first_seen_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_user_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (actor_user_id) REFERENCES users(id)
         );
         CREATE TABLE IF NOT EXISTS mailboxes (
             source_id TEXT NOT NULL,
@@ -602,6 +913,68 @@ def database(config: Config) -> Iterator[sqlite3.Connection]:
         raise
     finally:
         db.close()
+
+
+def sync_connector_user(config: Config, principal: ConnectorPrincipal) -> None:
+    """Mémorise l'identifiant OpenRAG et un instantané non-PII de ses droits."""
+    if not principal.authenticated:
+        return
+    now = int(time.time())
+    with database(config) as db:
+        db.execute(
+            """
+            INSERT INTO users(
+                id, provider, roles_json, permissions_json, rbac_enforced,
+                first_seen_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                provider=excluded.provider,
+                roles_json=excluded.roles_json,
+                permissions_json=excluded.permissions_json,
+                rbac_enforced=excluded.rbac_enforced,
+                last_seen_at=excluded.last_seen_at
+            WHERE users.provider<>excluded.provider
+               OR users.roles_json<>excluded.roles_json
+               OR users.permissions_json<>excluded.permissions_json
+               OR users.rbac_enforced<>excluded.rbac_enforced
+               OR users.last_seen_at<=excluded.last_seen_at-60
+            """,
+            (
+                principal.user_id,
+                principal.provider,
+                json.dumps(sorted(principal.roles), separators=(",", ":")),
+                json.dumps(sorted(principal.permissions), separators=(",", ":")),
+                int(principal.rbac_enforced),
+                now,
+                now,
+            ),
+        )
+
+
+def record_audit(
+    config: Config, principal: ConnectorPrincipal, action: str
+) -> None:
+    """Attribue une mutation globale du connecteur à l'identité OpenRAG."""
+    actor = principal.user_id if principal.authenticated else "anonymous"
+    with database(config) as db:
+        if not principal.authenticated:
+            now = int(time.time())
+            db.execute(
+                """
+                INSERT OR IGNORE INTO users(
+                    id, provider, first_seen_at, last_seen_at
+                ) VALUES ('anonymous', 'none', ?, ?)
+                """,
+                (now, now),
+            )
+        db.execute(
+            "INSERT INTO audit_log(actor_user_id,action,created_at) VALUES (?,?,?)",
+            (actor, action[:100], int(time.time())),
+        )
+        db.execute(
+            """DELETE FROM audit_log
+               WHERE id <= COALESCE((SELECT MAX(id) - 10000 FROM audit_log), 0)"""
+        )
 
 
 def set_source_selected(config: Config, source_id: str, selected: bool) -> None:
@@ -3452,10 +3825,11 @@ OPENRAG_LOGO = """<svg class="brand-logo" viewBox="0 0 200 164" aria-hidden="tru
 STATUS_PAGE_STYLE = """
 :root{color-scheme:light dark;--background:#fff;--foreground:#09090b;--muted:#f4f4f5;--muted-foreground:#71717a;--border:#e4e4e7;--card:#fff;--sidebar:#fafafa;--primary:#09090b;--primary-foreground:#fff;--danger:#dc2626;--danger-soft:#fef2f2;--success:#059669;--success-soft:#ecfdf5;--warning:#b45309;--warning-soft:#fffbeb;--radius:8px;--shadow:0 1px 2px rgba(0,0,0,.04)}
 *{box-sizing:border-box}html{background:var(--background)}body{margin:0;background:var(--background);color:var(--foreground);font:14px/1.5 Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input{font:inherit}button,input[type=text],input[type=password]{min-height:40px}button{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:1px solid var(--border);border-radius:var(--radius);background:var(--card);color:var(--foreground);padding:9px 14px;font-weight:600;cursor:pointer;transition:background .15s,border-color .15s,transform .05s}button:hover{background:var(--muted)}button:active{transform:translateY(1px)}button:focus-visible,input:focus-visible{outline:2px solid var(--foreground);outline-offset:2px}.primary{border-color:var(--primary);background:var(--primary);color:var(--primary-foreground)}.primary:hover{background:#27272a}.danger-button{border-color:var(--danger);color:var(--danger)}.danger-button:hover{background:var(--danger-soft)}
-.app{min-height:100vh;display:grid;grid-template-rows:64px 1fr;grid-template-columns:224px minmax(0,1fr)}.topbar{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);background:var(--background);padding:0 20px;position:sticky;top:0;z-index:2}.brand{display:flex;align-items:center;gap:10px;font:600 18px/1 ui-monospace,SFMono-Regular,Menlo,monospace}.brand-logo{width:24px;height:22px;fill:currentColor}.connector-chip{border:1px solid var(--border);border-radius:999px;padding:5px 10px;color:var(--muted-foreground);font-size:12px}.sidebar{border-right:1px solid var(--border);background:var(--sidebar);padding:16px}.nav-label{display:block;margin:8px 12px 10px;color:var(--muted-foreground);font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}.nav-item{display:flex;align-items:center;gap:10px;border-radius:var(--radius);padding:11px 12px;background:var(--muted);font-size:13px;font-weight:600}.nav-icon{width:18px;height:18px}.main{min-width:0;padding:32px}.content{max-width:1120px;margin:0 auto}.page-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.eyebrow{margin:0 0 4px;color:var(--muted-foreground);font-size:12px;font-weight:600}.page-heading h1{margin:0;font-size:24px;line-height:1.25;letter-spacing:-.02em}.page-heading p{margin:7px 0 0;color:var(--muted-foreground)}.toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.toolbar form{margin:0}
+.app{min-height:100vh;display:grid;grid-template-rows:64px 1fr;grid-template-columns:224px minmax(0,1fr)}.topbar{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);background:var(--background);padding:0 20px;position:sticky;top:0;z-index:2}.brand{display:flex;align-items:center;gap:10px;font:600 18px/1 ui-monospace,SFMono-Regular,Menlo,monospace}.brand-logo{width:24px;height:22px;fill:currentColor}.connector-chip{border:1px solid var(--border);border-radius:999px;padding:5px 10px;color:var(--muted-foreground);font-size:12px}.user-menu{display:flex;align-items:center;gap:9px}.user-menu form{margin:0}.user-menu button{min-height:32px;padding:5px 10px;font-size:12px}.sidebar{border-right:1px solid var(--border);background:var(--sidebar);padding:16px}.nav-label{display:block;margin:8px 12px 10px;color:var(--muted-foreground);font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}.nav-item{display:flex;align-items:center;gap:10px;border-radius:var(--radius);padding:11px 12px;background:var(--muted);font-size:13px;font-weight:600}.nav-icon{width:18px;height:18px}.main{min-width:0;padding:32px}.content{max-width:1120px;margin:0 auto}.page-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.eyebrow{margin:0 0 4px;color:var(--muted-foreground);font-size:12px;font-weight:600}.page-heading h1{margin:0;font-size:24px;line-height:1.25;letter-spacing:-.02em}.page-heading p{margin:7px 0 0;color:var(--muted-foreground)}.toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.toolbar form{margin:0}
 .status-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:20px}.stat-card,.card{border:1px solid var(--border);border-radius:var(--radius);background:var(--card);box-shadow:var(--shadow)}.stat-card{padding:16px}.stat-label{display:flex;align-items:center;gap:7px;color:var(--muted-foreground);font-size:12px;font-weight:600}.dot{width:8px;height:8px;border-radius:50%;background:var(--muted-foreground)}.dot.success{background:var(--success)}.dot.warning{background:#f59e0b}.dot.danger{background:var(--danger)}.stat-value{display:block;margin-top:8px;font-size:22px;font-weight:650;letter-spacing:-.03em}.stat-detail{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px}.card{margin-bottom:16px;overflow:hidden}.card-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:18px 20px;border-bottom:1px solid var(--border)}.card-title{margin:0;font-size:15px}.card-description{margin:3px 0 0;color:var(--muted-foreground);font-size:13px}.card-body{padding:20px}.card-footer{display:flex;justify-content:flex-end;padding:14px 20px;border-top:1px solid var(--border);background:var(--sidebar)}.badge{display:inline-flex;align-items:center;border-radius:999px;background:var(--muted);padding:3px 8px;color:var(--muted-foreground);font-size:11px;font-weight:600}.badge.success{background:var(--success-soft);color:var(--success)}.badge.warning{background:var(--warning-soft);color:var(--warning)}.badge.danger{background:var(--danger-soft);color:var(--danger)}
 .inventory-row{display:flex;align-items:center;gap:12px}.inventory-status{display:block;width:100%;min-height:24px;font-weight:600}.inventory-status.running{color:var(--success)}.queue-monitor{margin-top:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--sidebar);padding:14px}.queue-monitor .progress-wrap{margin-top:9px}.progress-wrap{margin-top:12px}.progress-track{height:10px;overflow:hidden;border-radius:999px;background:var(--muted)}.progress-bar{height:100%;width:0;border-radius:inherit;background:var(--success);transition:width .25s ease}.progress-bar.indeterminate{width:35%;animation:progress-slide 1.2s ease-in-out infinite}.progress-label{display:block;margin-top:5px;color:var(--muted-foreground);font-size:12px;text-align:right}@keyframes progress-slide{0%{transform:translateX(-110%)}100%{transform:translateX(300%)}}.helper{margin:10px 0 0;color:var(--muted-foreground);font-size:12px}.error-alert{display:flex;gap:10px;margin-bottom:16px;border:1px solid #fecaca;border-radius:var(--radius);background:var(--danger-soft);padding:13px 15px;color:#991b1b}.error-alert strong{display:block}.selection-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:320px;overflow:auto}.selection-item{display:flex;align-items:flex-start;gap:11px;margin:0;border:1px solid var(--border);border-radius:var(--radius);padding:12px;cursor:pointer;transition:background .15s,border-color .15s}.selection-item:hover{background:var(--muted)}.selection-item:has(input:checked){border-color:#a1a1aa;background:var(--muted)}.selection-item input{width:16px;height:16px;margin:2px 0 0;accent-color:var(--primary);flex:0 0 auto}.selection-copy{min-width:0}.selection-title{display:block;font-weight:600;overflow-wrap:anywhere}.selection-meta{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px;overflow-wrap:anywhere}.empty{grid-column:1/-1;margin:0;border:1px dashed var(--border);border-radius:var(--radius);padding:22px;text-align:center;color:var(--muted-foreground)}.counts{display:flex;flex-wrap:wrap;gap:6px}.operation-grid,.secret-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.secret-field{display:grid;gap:6px;color:var(--muted-foreground);font-size:12px;font-weight:600}.secret-field input{width:100%;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}.danger-card{border-color:#fecaca}.danger-card .card-header{background:var(--danger-soft)}.confirm-row{display:flex;align-items:end;gap:10px}.confirm-row label{flex:1;margin:0;color:var(--muted-foreground);font-size:12px;font-weight:600}.confirm-row input{display:block;width:100%;margin-top:6px;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}code{border-radius:4px;background:var(--muted);padding:2px 5px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.footer-note{padding:8px 0 24px;text-align:center;color:var(--muted-foreground);font-size:12px}
 .reconciliation-row{display:flex;align-items:center;justify-content:space-between;gap:16px}.reconciliation-row form{flex:0 0 auto}.section-rule{margin:18px 0;border:0;border-top:1px solid var(--border)}.retry-tabs{position:relative}.tab-toggle{position:absolute;opacity:0;pointer-events:none}.tab-label{display:inline-flex;margin:0 6px 14px 0;border:1px solid var(--border);border-radius:999px;padding:7px 12px;color:var(--muted-foreground);cursor:pointer;font-weight:600}.tab-panel{display:none}.retry-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px}.retry-select-all{display:flex;align-items:center;gap:8px;color:var(--muted-foreground);font-size:12px}.retry-select-all input{width:16px;height:16px;accent-color:var(--primary)}#retry-tab-lost:checked~label[for="retry-tab-lost"],#retry-tab-failed:checked~label[for="retry-tab-failed"]{border-color:var(--primary);background:var(--primary);color:var(--primary-foreground)}#retry-tab-lost:checked~.tab-panels>#retry-panel-lost,#retry-tab-failed:checked~.tab-panels>#retry-panel-failed{display:block}
+.login-page{min-height:100vh;display:grid;place-items:center;padding:24px;background:var(--muted)}.login-card{width:min(440px,100%);border:1px solid var(--border);border-radius:14px;background:var(--card);padding:42px;box-shadow:var(--shadow);text-align:center}.login-card .brand-logo{width:50px;height:42px}.login-card h1{margin:24px 0 8px;font-size:24px}.login-card p{margin:0 0 28px;color:var(--muted-foreground)}.login-card form{margin:0}.login-card button{width:100%;min-height:46px}.identity-notice{margin-bottom:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--sidebar);padding:11px 14px;color:var(--muted-foreground);font-size:12px}
 @media(prefers-color-scheme:dark){:root{--background:#18181b;--foreground:#fafafa;--muted:#27272a;--muted-foreground:#a1a1aa;--border:#3f3f46;--card:#18181b;--sidebar:#111113;--primary:#fafafa;--primary-foreground:#09090b;--danger:#f87171;--danger-soft:#2b1719;--success:#34d399;--success-soft:#10251e;--warning:#fbbf24;--warning-soft:#2b2414;--shadow:none}.primary:hover{background:#e4e4e7}.danger-card,.error-alert{border-color:#7f1d1d}.danger-card .card-header{background:var(--danger-soft)}.error-alert{color:#fecaca}.selection-item:has(input:checked){border-color:#71717a}}
 @media(max-width:900px){.app{grid-template-columns:1fr;grid-template-rows:64px auto 1fr}.sidebar{border-right:0;border-bottom:1px solid var(--border);padding:8px 16px}.nav-label{display:none}.nav-item{width:max-content;padding:8px 12px}.main{padding:24px 18px}.status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.operation-grid,.secret-grid{grid-template-columns:1fr}}
 @media(max-width:620px){.connector-chip{display:none}.page-heading{display:block}.toolbar{margin-top:16px}.toolbar button{flex:1}.toolbar form{display:flex;flex:1}.selection-list{grid-template-columns:1fr}.status-grid{grid-template-columns:1fr 1fr}.stat-card{padding:13px}.stat-value{font-size:19px}.card-header,.card-body{padding:16px}.card-footer{padding:12px 16px}.card-footer button{width:100%}.reconciliation-row{align-items:stretch;flex-direction:column}.reconciliation-row button{width:100%}.confirm-row{align-items:stretch;flex-direction:column}.confirm-row button{width:100%}}
@@ -3755,7 +4129,30 @@ UI_SCRIPT = r"""(() => {
 """
 
 
-def render_status_page(config: Config, state: RuntimeState) -> str:
+def render_login_page(state: RuntimeState, error: str = "") -> str:
+    """Page de connexion calquée sur le parcours Google OAuth d'OpenRAG."""
+    csrf = html.escape(str(state.snapshot()["csrf_token"]), quote=True)
+    error_alert = (
+        f'<div class="error-alert" role="alert">{html.escape(error)}</div>'
+        if error
+        else ""
+    )
+    return f"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark"><title>Connexion · OpenRAG</title>
+<style>{STATUS_PAGE_STYLE}</style></head><body><main class="login-page">
+<section class="login-card">{OPENRAG_LOGO}<h1>Connexion au connecteur</h1>
+<p>Utilisez la même identité Google que dans OpenRAG.</p>{error_alert}
+<form method="post" action="/auth/login"><input type="hidden" name="csrf" value="{csrf}">
+<button class="primary" type="submit">Continuer avec Google</button></form>
+</section></main></body></html>"""
+
+
+def render_status_page(
+    config: Config,
+    state: RuntimeState,
+    principal: ConnectorPrincipal | None = None,
+) -> str:
     snapshot = state.snapshot()
     sources = source_rows(config)
     mailboxes = mailbox_rows(config)
@@ -3765,6 +4162,26 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
     inventory_cache = cached_inventory(config, allow_expired=True)
     paused = is_paused(config)
     csrf = html.escape(str(snapshot["csrf_token"]), quote=True)
+    if principal is not None and principal.authenticated:
+        user_label = html.escape(
+            principal.name or principal.email or principal.user_id
+        )
+        identity_menu = (
+            f'<div class="user-menu"><span class="connector-chip">{user_label}</span>'
+            f'<form method="post" action="/auth/logout"><input type="hidden" '
+            f'name="csrf" value="{csrf}"><button type="submit">Déconnexion</button>'
+            "</form></div>"
+        )
+        roles_label = ", ".join(sorted(principal.roles)) or "droits hérités"
+        identity_notice = (
+            '<div class="identity-notice">Identité synchronisée avec OpenRAG : '
+            f'<strong>{user_label}</strong> · {html.escape(roles_label)}. '
+            "L’inventaire et la file actuels restent un espace d’exploitation partagé ; "
+            "leur découpage par propriétaire sera la prochaine étape.</div>"
+        )
+    else:
+        identity_menu = '<span class="connector-chip">OpenArchiver connector</span>'
+        identity_notice = ""
 
     source_lines = []
     for row in sources:
@@ -4017,7 +4434,7 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 <body data-cycle-active="{str(inventory_running or inventory_requested).lower()}" data-cycle-stage="{current_stage}" data-cycle-completed="{last_completed}" data-reconciliation-active="{str(reconciliation_active).lower()}">
 <div class="app">
 <header class="topbar"><div class="brand">{OPENRAG_LOGO}<span>OpenRAG</span></div>
-<span class="connector-chip">OpenArchiver connector</span></header>
+{identity_menu}</header>
 <aside class="sidebar" aria-label="Navigation"><span class="nav-label">Intégrations</span>
 <div class="nav-item"><svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M8 12h8M12 8v8"/><path d="M7 7.5 4.5 5M17 7.5 19.5 5M7 16.5 4.5 19M17 16.5 19.5 19"/><rect x="7" y="7" width="10" height="10" rx="2"/></svg>Connecteur</div></aside>
 <main class="main"><div class="content">
@@ -4025,6 +4442,7 @@ def render_status_page(config: Config, state: RuntimeState) -> str:
 <h1>OpenArchiver vers OpenRAG</h1><p>Configurez et supervisez l’indexation de vos archives e-mail.</p></div>
 <div class="toolbar"><form method="get" action="/"><button type="submit">↻&nbsp; Rafraîchir l’état</button></form>
 <form method="post" action="/pause"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="action" value="{pause_action}"><button type="submit">{pause_label}</button></form></div></div>
+{identity_notice}
 {error_alert}
 <section class="status-grid" aria-label="État du connecteur">
 <div class="stat-card"><span class="stat-label"><span class="dot {status_class}"></span>Service</span><strong id="service-status" class="stat-value">{ready}</strong><span id="last-sync" class="stat-detail">Dernière synchro : {last_sync}</span></div>
@@ -4098,18 +4516,29 @@ def make_http_handler(
     *,
     wake: threading.Event = WAKE,
     reconciliation_wake: threading.Event = RECONCILE_WAKE,
+    auth_client: OpenRAGAuthClient | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Construit le handler HTTP lié à la configuration et à l'état courant.
 
-    Les lectures sont publiques dans le cluster. Chaque mutation POST exige le
-    jeton CSRF rendu dans la page ; les réponses SSE publient uniquement lors
-    d'un changement d'état, avec un keepalive toutes les 15 secondes.
+    Les probes et métriques restent publiques. Les autres routes suivent le
+    mode d'authentification OpenRAG et chaque mutation POST exige aussi le jeton
+    CSRF rendu dans la page. Les réponses SSE publient uniquement lors d'un
+    changement d'état, avec un keepalive toutes les 15 secondes.
     """
+
+    auth = auth_client or OpenRAGAuthClient(config)
+    oauth_state_cookie = "openrag_oauth_state"
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "OpenArchiverConnector/1"
 
-        def _send(self, status: int, body: str, content_type: str) -> None:
+        def _send(
+            self,
+            status: int,
+            body: str,
+            content_type: str,
+            headers: Sequence[tuple[str, str]] = (),
+        ) -> None:
             payload = body.encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", content_type)
@@ -4122,15 +4551,77 @@ def make_http_handler(
                 "script-src 'self'; connect-src 'self'; frame-src 'self'; "
                 "form-action 'self'",
             )
+            for name, value in headers:
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(payload)
 
-        def _redirect(self, location: str = "/") -> None:
+        def _redirect(
+            self,
+            location: str = "/",
+            headers: Sequence[tuple[str, str]] = (),
+        ) -> None:
             self.send_response(303)
             self.send_header("Location", location)
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", "0")
+            for name, value in headers:
+                self.send_header(name, value)
             self.end_headers()
+
+        def _cookie(self, name: str) -> str:
+            raw = self.headers.get("Cookie", "")
+            if len(raw) > 32_768:
+                return ""
+            try:
+                cookies = http.cookies.SimpleCookie()
+                cookies.load(raw)
+                morsel = cookies.get(name)
+                return morsel.value if morsel is not None else ""
+            except http.cookies.CookieError:
+                return ""
+
+        @staticmethod
+        def _set_cookie(name: str, value: str, max_age: int) -> tuple[str, str]:
+            cookie = http.cookies.SimpleCookie()
+            cookie[name] = value
+            morsel = cookie[name]
+            morsel["path"] = "/"
+            morsel["max-age"] = str(max_age)
+            morsel["httponly"] = True
+            morsel["secure"] = True
+            morsel["samesite"] = "Lax"
+            return "Set-Cookie", morsel.OutputString()
+
+        def _principal(self) -> ConnectorPrincipal | None:
+            if hasattr(self, "_cached_principal"):
+                return self._cached_principal
+            token = self._cookie(config.openrag_auth_cookie_name)
+            principal = auth.resolve(token)
+            if principal is not None:
+                sync_connector_user(config, principal)
+            self._cached_principal = principal
+            return principal
+
+        def _require_principal(self, *, redirect: bool = False) -> ConnectorPrincipal | None:
+            principal = self._principal()
+            if principal is not None:
+                return principal
+            if redirect:
+                self._redirect("/login")
+            else:
+                self._send(
+                    401,
+                    "authentication required\n",
+                    "text/plain; charset=utf-8",
+                )
+            return None
+
+        def _finish_action(
+            self, principal: ConnectorPrincipal, action: str
+        ) -> None:
+            record_audit(config, principal, action)
+            self._redirect()
 
         def _send_status_events(self) -> None:
             self.send_response(200)
@@ -4164,8 +4655,59 @@ def make_http_handler(
                 LOG.debug("flux SSE fermé: %s", _safe_error(error))
 
         def do_GET(self) -> None:
-            path = urllib.parse.urlsplit(self.path).path
+            parsed_request = urllib.parse.urlsplit(self.path)
+            path = parsed_request.path
             try:
+                principal: ConnectorPrincipal | None = None
+                if path == "/auth/callback":
+                    query = urllib.parse.parse_qs(
+                        parsed_request.query, keep_blank_values=True
+                    )
+                    connection_id = query.get("state", [""])[0]
+                    code = query.get("code", [""])[0]
+                    provider_error = query.get("error", [""])[0]
+                    if provider_error:
+                        raise ConnectorError(
+                            f"connexion Google refusée: {provider_error}"
+                        )
+                    if connection_id != self._cookie(oauth_state_cookie):
+                        raise ConnectorError("état OAuth expiré ou invalide")
+                    token = auth.complete_login(connection_id, code)
+                    principal = auth.resolve(token)
+                    if principal is None or not principal.authenticated:
+                        raise ConnectorError("session OpenRAG non créée")
+                    sync_connector_user(config, principal)
+                    self._redirect(
+                        "/",
+                        headers=(
+                            self._set_cookie(
+                                config.openrag_auth_cookie_name,
+                                token,
+                                7 * 24 * 60 * 60,
+                            ),
+                            self._set_cookie(oauth_state_cookie, "", 0),
+                        ),
+                    )
+                    return
+                if path == "/login":
+                    principal = self._principal()
+                    if principal is not None:
+                        self._redirect("/")
+                    else:
+                        form_error = urllib.parse.parse_qs(
+                            parsed_request.query
+                        ).get("error", [""])[0]
+                        self._send(
+                            200,
+                            render_login_page(state, form_error[:500]),
+                            "text/html; charset=utf-8",
+                        )
+                    return
+                if path not in {"/healthz", "/readyz", "/metrics", "/ui.js"}:
+                    principal = self._require_principal(redirect=path == "/")
+                    if principal is None:
+                        return
+
                 if path == "/healthz":
                     running = bool(state.snapshot()["running"])
                     self._send(
@@ -4212,7 +4754,7 @@ def make_http_handler(
                     )
                 elif path == "/":
                     started_at = time.monotonic()
-                    body = render_status_page(config, state)
+                    body = render_status_page(config, state, principal)
                     LOG.info(
                         "page principale générée en %.3fs",
                         time.monotonic() - started_at,
@@ -4224,6 +4766,19 @@ def make_http_handler(
                     )
                 else:
                     self._send(404, "not found\n", "text/plain; charset=utf-8")
+            except ConnectorError as error:
+                if path == "/auth/callback":
+                    self._send(
+                        400,
+                        render_login_page(state, _safe_error(error)),
+                        "text/html; charset=utf-8",
+                    )
+                else:
+                    self._send(
+                        503,
+                        _safe_error(error) + "\n",
+                        "text/plain; charset=utf-8",
+                    )
             except Exception:
                 LOG.exception("échec de réponse HTTP")
                 self._send(500, "internal error\n", "text/plain; charset=utf-8")
@@ -4240,6 +4795,46 @@ def make_http_handler(
                 csrf = form.get("csrf", [""])[0]
                 if not isinstance(csrf, str) or csrf != state.snapshot()["csrf_token"]:
                     self._redirect("/?form=expired")
+                    return
+                if path == "/auth/login":
+                    authorization_url, oauth_state = auth.begin_login()
+                    self._redirect(
+                        authorization_url,
+                        headers=(
+                            self._set_cookie(oauth_state_cookie, oauth_state, 600),
+                        ),
+                    )
+                    return
+                if path == "/auth/logout":
+                    token = self._cookie(config.openrag_auth_cookie_name)
+                    principal = self._principal()
+                    auth.logout(token)
+                    if principal is not None:
+                        record_audit(config, principal, "auth.logout")
+                    self._redirect(
+                        "/login",
+                        headers=(
+                            self._set_cookie(
+                                config.openrag_auth_cookie_name, "", 0
+                            ),
+                        ),
+                    )
+                    return
+
+                principal = self._require_principal()
+                if principal is None:
+                    return
+                required_permission = (
+                    "config:write"
+                    if path in {"/secrets", "/sources", "/mailboxes", "/pause", "/reset"}
+                    else "knowledge:upload"
+                )
+                if not principal.can(required_permission):
+                    self._send(
+                        403,
+                        "permission OpenRAG insuffisante pour cette action\n",
+                        "text/plain; charset=utf-8",
+                    )
                     return
                 if path == "/secrets":
                     changed = []
@@ -4261,12 +4856,12 @@ def make_http_handler(
                         raise ConnectorError("aucune nouvelle clé renseignée")
                     state.cycle_requested()
                     wake.set()
-                    self._redirect()
+                    self._finish_action(principal, "secrets.update")
                 elif path == "/sources":
                     replace_source_selection(config, form.get("source_id", []))
                     state.cycle_requested(force_inventory=True)
                     wake.set()
-                    self._redirect()
+                    self._finish_action(principal, "sources.select")
                 elif path == "/mailboxes":
                     selections = []
                     for value in form.get("mailbox", []):
@@ -4279,7 +4874,7 @@ def make_http_handler(
                             raise ConnectorError("sélection de dossier invalide")
                         selections.append((decoded[0], decoded[1]))
                     replace_mailbox_selection(config, selections)
-                    self._redirect()
+                    self._finish_action(principal, "mailboxes.select")
                 elif path == "/retry":
                     objects = []
                     for value in form.get("object", []):
@@ -4295,12 +4890,12 @@ def make_http_handler(
                         raise ConnectorError("aucun objet éligible à réindexer")
                     state.cycle_requested()
                     wake.set()
-                    self._redirect()
+                    self._finish_action(principal, "objects.retry")
                 elif path == "/reconcile":
                     if not state.reconciliation_requested():
                         raise ConnectorError("réconciliation OpenRAG déjà en cours")
                     reconciliation_wake.set()
-                    self._redirect()
+                    self._finish_action(principal, "openrag.reconcile")
                 elif path == "/pause":
                     action = form.get("action", [""])[0]
                     if action not in {"pause", "resume"}:
@@ -4309,11 +4904,11 @@ def make_http_handler(
                     if action == "resume":
                         state.cycle_requested()
                         wake.set()
-                    self._redirect()
+                    self._finish_action(principal, f"ingestion.{action}")
                 elif path == "/scan":
                     state.cycle_requested(force_inventory=True)
                     wake.set()
-                    self._redirect()
+                    self._finish_action(principal, "inventory.scan")
                 elif path == "/reset":
                     if form.get("confirmation", [""])[0] != "RESET":
                         raise ConnectorError("confirmation de remise à zéro absente")
@@ -4323,7 +4918,7 @@ def make_http_handler(
                     set_paused(config, True)
                     state.reset_requested()
                     wake.set()
-                    self._redirect()
+                    self._finish_action(principal, "state.reset")
                 else:
                     self._send(404, "not found\n", "text/plain; charset=utf-8")
             except (UnicodeDecodeError, ValueError, ConnectorError) as error:

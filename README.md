@@ -51,12 +51,73 @@ une ConfigMap sans construire une image spécifique. Les séparateurs dans
 5. `OpenRAGClient` et `wait_for_indexed_document` : soumission et validation ;
 6. `claim_next`, `process_work_item` et `process_queue` : file locale ;
 7. `RuntimeState`, `run_cycle` et les trois boucles de fond ;
-8. `make_http_handler` : interface, API d'état et actions ;
-9. `main` : assemblage du processus.
+8. `OpenRAGAuthClient` : délégation du login, session et permissions à OpenRAG ;
+9. `make_http_handler` : interface, API d'état et actions ;
+10. `main` : assemblage du processus.
 
 Les fonctions `parse_eml` et `render_mail_markdown` sont des utilitaires testés,
 mais ne sont pas sur le chemin d'ingestion actuel : OpenRAG reçoit le `.eml`
 original.
+
+## Authentification synchronisée avec OpenRAG
+
+Le connecteur n'a pas son propre annuaire et ne signe aucun token. En
+`OPENRAG_AUTH_MODE=auto`, il demande à `/auth/me` quel mode OpenRAG utilise :
+
+- si OpenRAG répond `no_auth_mode=true`, l'interface reste accessible comme
+  aujourd'hui ;
+- si OpenRAG exige une session, le connecteur affiche le même parcours
+  **Continuer avec Google** et refuse ses routes fonctionnelles sans session ;
+- si OpenRAG est indisponible, le connecteur échoue fermé avec une erreur 503
+  au lieu de contourner l'authentification.
+
+Le parcours OAuth reste entièrement piloté par OpenRAG :
+
+1. `POST /auth/login` demande à OpenRAG d'initialiser `purpose=app_auth` ;
+2. le navigateur est redirigé vers l'URL Google retournée par OpenRAG ;
+3. Google revient sur `/auth/callback` avec le code et le `state` ;
+4. le connecteur transmet ce retour à OpenRAG ;
+5. OpenRAG échange le code, crée l'utilisateur et signe son JWT ;
+6. le connecteur recopie ce JWT dans un cookie `Secure`, `HttpOnly`,
+   `SameSite=Lax` limité à son propre domaine ;
+7. à chaque requête protégée, `/auth/me` puis `/users/me` restent les sources
+   de vérité pour l'identité, les rôles et les permissions.
+
+Le JWT n'est jamais stocké dans SQLite. La table `users` ne conserve que
+l'identifiant opaque OpenRAG, le fournisseur, les rôles, les permissions et
+les dates de présence ; elle ne conserve ni nom ni adresse e-mail. La table
+`audit_log` attribue les mutations globales (scan, pause, reset, changement de
+sélection ou de secret) à cet identifiant.
+
+Lorsque le RBAC OpenRAG est actif, les actions partagées sensibles (`secrets`,
+sélections, pause et reset) demandent `config:write`. Le scan, la
+réconciliation et la réindexation demandent `knowledge:upload`. Lorsque le
+RBAC est désactivé, le connecteur reproduit le coupe-circuit OpenRAG et laisse
+les utilisateurs authentifiés agir.
+
+### Limite volontaire de cette première étape
+
+L'identité, les permissions et l'audit sont multi-utilisateurs, mais
+l'inventaire, les sélections et la file existants restent encore un espace
+d'exploitation partagé. L'interface l'indique explicitement. L'ingestion
+continue donc d'utiliser la clé API de service actuelle.
+
+La séparation complète demandera une table de travaux par
+`(openrag_user_id, type, object_id)` et une clé API OpenRAG appartenant à chaque
+utilisateur. Ce découpage ne doit pas être simulé en ajoutant simplement un
+`user_id` aux mails : un même mail peut légitimement être indexé par plusieurs
+utilisateurs avec des états et des tâches OpenRAG différents.
+
+Pour activer ultérieurement Google OAuth dans OpenRAG, les deux URI doivent
+être autorisées dans le client Google :
+
+```text
+https://openrag.ferme-de-pommerieux.fr/auth/callback
+https://openrag-openarchiver-connector.ferme-de-pommerieux.fr/auth/callback
+```
+
+Les identifiants OAuth restent configurés uniquement dans OpenRAG ; le
+connecteur ne les reçoit pas.
 
 ## Inventaire et sélection
 
@@ -214,6 +275,8 @@ Les valeurs actives sont définies dans `deployment.yaml`. Les principales sont 
 | --- | --- | --- |
 | `OPENARCHIVER_BASE_URL` | service interne OpenArchiver `/v1` | API source |
 | `OPENRAG_BASE_URL` | service interne `openrag-backend:8000` | API cible |
+| `OPENRAG_AUTH_MODE` | `auto` | suit automatiquement le mode de login OpenRAG |
+| `CONNECTOR_PUBLIC_URL` | URL HTTPS du connecteur | callback OAuth validé |
 | `OPENRAG_INGEST_MODE` | `api` | upload multipart authentifié |
 | `OPENRAG_UPLOAD_PATH` | `/v1/documents/ingest` | soumission |
 | `OPENRAG_TASK_PATH` | `/v1/tasks/{task_id}/enhanced` | suivi de tâche |
@@ -295,4 +358,8 @@ Pour diagnostiquer une ingestion lente, regarder dans cet ordre :
 - Incrémenter `SCHEMA_VERSION` pour toute migration de données ou de schéma et
   rendre cette migration rejouable sans danger.
 - Conserver les actions POST protégées par le jeton CSRF.
+- Ne jamais décoder un JWT sans le faire revalider par OpenRAG, ni le stocker
+  dans SQLite ou dans les logs.
+- Ne pas présenter l'espace d'exploitation partagé actuel comme une isolation
+  multi-utilisateur des connaissances.
 - Tester les transitions heureuses, les reprises et les réponses API invalides.

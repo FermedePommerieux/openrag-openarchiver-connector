@@ -80,6 +80,13 @@ spec:
               value: "https://openarchiver.ferme-de-pommerieux.fr/dashboard/archived-emails/{email_id}"
             - name: OPENRAG_BASE_URL
               value: http://openrag-backend.openrag.svc.cluster.local:8000
+            # L'interface délègue OAuth, les sessions et les permissions à
+            # OpenRAG. En mode auto elle reste ouverte tant qu'OpenRAG est en
+            # no_auth, puis exige le même login dès qu'il est activé.
+            - name: OPENRAG_AUTH_MODE
+              value: auto
+            - name: CONNECTOR_PUBLIC_URL
+              value: https://openrag-openarchiver-connector.ferme-de-pommerieux.fr
             - name: OPENRAG_INGEST_PATH
               value: /v1/documents/ingest-path
             - name: OPENRAG_INGEST_MODE

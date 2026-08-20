@@ -26,10 +26,11 @@ SPEC.loader.exec_module(connector)
 
 
 class Response:
-    def __init__(self, body=b"", status=200, chunks=None):
+    def __init__(self, body=b"", status=200, chunks=None, headers=None):
         self.body = io.BytesIO(body)
         self.status = status
         self.chunks = iter(chunks) if chunks is not None else None
+        self.headers = headers or {}
 
     def read(self, size=-1):
         if self.chunks is not None:
@@ -231,6 +232,148 @@ class ConnectorTests(unittest.TestCase):
                     }
                 ),
             )
+            self.assertEqual(defaults.openrag_auth_mode, "disabled")
+
+    def test_configuration_enables_openrag_auth_only_with_public_https_url(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            env = {
+                "OPENARCHIVER_API_KEY_FILE": str(config.openarchiver_api_key_file),
+                "OPENRAG_API_KEY_FILE": str(config.openrag_api_key_file),
+                "STATE_DB": str(config.state_db),
+                "OPENRAG_AUTH_MODE": "auto",
+                "CONNECTOR_PUBLIC_URL": "https://connector.example.test",
+            }
+            loaded = connector.Config.from_env(env)
+            self.assertEqual(loaded.openrag_auth_mode, "auto")
+            self.assertEqual(
+                loaded.connector_public_url, "https://connector.example.test"
+            )
+            for public_url in ("", "http://connector.example.test"):
+                with self.subTest(public_url=public_url), self.assertRaises(ValueError):
+                    connector.Config.from_env(
+                        {**env, "CONNECTOR_PUBLIC_URL": public_url}
+                    )
+
+    def test_openrag_auth_client_mirrors_noauth_identity_and_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(
+                Path(directory),
+                openrag_auth_mode="auto",
+                connector_public_url="https://connector.example.test",
+            )
+            responses = iter(
+                (
+                    Response(b'{"authenticated":false,"no_auth_mode":true}'),
+                    Response(
+                        json.dumps(
+                            {
+                                "authenticated": True,
+                                "user": {
+                                    "user_id": "google-123",
+                                    "email": "reader@example.test",
+                                    "name": "Lectrice",
+                                    "provider": "google",
+                                },
+                            }
+                        ).encode()
+                    ),
+                    Response(
+                        json.dumps(
+                            {
+                                "roles": ["user"],
+                                "permissions": ["knowledge:upload"],
+                                "rbac_enforced": True,
+                            }
+                        ).encode()
+                    ),
+                )
+            )
+            auth = connector.OpenRAGAuthClient(
+                config, opener=lambda *_args, **_kwargs: next(responses)
+            )
+            anonymous = auth.resolve()
+            self.assertIsNotNone(anonymous)
+            self.assertTrue(anonymous.no_auth_mode)
+            principal = auth.resolve("header.payload.signature")
+            self.assertEqual(principal.user_id, "google-123")
+            self.assertEqual(principal.roles, frozenset({"user"}))
+            self.assertTrue(principal.can("knowledge:upload"))
+            self.assertFalse(principal.can("config:write"))
+
+            required_config = self.config(
+                Path(directory),
+                openrag_auth_mode="required",
+                connector_public_url="https://connector.example.test",
+            )
+            required_auth = connector.OpenRAGAuthClient(
+                required_config,
+                opener=lambda *_args, **_kwargs: Response(
+                    b'{"authenticated":false,"no_auth_mode":true}'
+                ),
+            )
+            with self.assertRaisesRegex(
+                connector.ConnectorError, "sans authentification"
+            ):
+                required_auth.resolve()
+
+    def test_openrag_auth_client_delegates_oauth_and_extracts_cookie(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(
+                Path(directory),
+                openrag_auth_mode="auto",
+                connector_public_url="https://connector.example.test",
+            )
+            requests = []
+            callback_headers = EmailMessage()
+            callback_headers["Set-Cookie"] = (
+                "auth_token=header.payload.signature; HttpOnly; Path=/; SameSite=lax"
+            )
+            responses = iter(
+                (
+                    Response(b'{"authenticated":false,"user":null}'),
+                    Response(
+                        json.dumps(
+                            {
+                                "connection_id": "oauth-state-1",
+                                "oauth_config": {
+                                    "client_id": "google-client",
+                                    "scopes": ["openid", "email", "profile"],
+                                    "redirect_uri": "https://connector.example.test/auth/callback",
+                                    "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+                                    "prompt": "consent",
+                                },
+                            }
+                        ).encode()
+                    ),
+                    Response(b'{"purpose":"app_auth"}', headers=callback_headers),
+                )
+            )
+
+            def opener(request, **_kwargs):
+                requests.append(request)
+                return next(responses)
+
+            auth = connector.OpenRAGAuthClient(config, opener=opener)
+            authorization_url, state = auth.begin_login()
+            self.assertEqual(state, "oauth-state-1")
+            self.assertTrue(
+                authorization_url.startswith(
+                    "https://accounts.google.com/o/oauth2/v2/auth?"
+                )
+            )
+            self.assertEqual(
+                urllib.parse.parse_qs(urllib.parse.urlsplit(authorization_url).query)[
+                    "redirect_uri"
+                ],
+                ["https://connector.example.test/auth/callback"],
+            )
+            token = auth.complete_login(state, "authorization-code")
+            self.assertEqual(token, "header.payload.signature")
+            self.assertEqual(requests[1].full_url, config.openrag_base_url + "/auth/init")
+            self.assertEqual(
+                json.loads(requests[2].data)["connection_id"], "oauth-state-1"
+            )
 
     def test_docling_worker_metrics_count_active_convert_workers(self):
         metrics = """# HELP rq_workers RQ workers
@@ -344,6 +487,8 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                     "attachments",
                     "email_attachments",
                     "settings",
+                    "users",
+                    "audit_log",
                 }
                 <= tables
             )
@@ -366,6 +511,72 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             finally:
                 version_db.close()
             self.assertFalse(connector.is_paused(config))
+
+    def test_openrag_identity_snapshot_and_audit_do_not_persist_pii(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            principal = connector.ConnectorPrincipal(
+                user_id="google-123",
+                email="private@example.test",
+                name="Nom privé",
+                provider="google",
+                roles=frozenset({"user"}),
+                permissions=frozenset({"knowledge:upload"}),
+                authenticated=True,
+                rbac_enforced=True,
+            )
+            connector.sync_connector_user(config, principal)
+            connector.record_audit(config, principal, "inventory.scan")
+            with connector.database(config) as db:
+                user = db.execute("SELECT * FROM users").fetchone()
+                audit = db.execute("SELECT * FROM audit_log").fetchone()
+                columns = {
+                    row["name"] for row in db.execute("PRAGMA table_info(users)")
+                }
+            self.assertEqual(user["id"], "google-123")
+            self.assertEqual(json.loads(user["roles_json"]), ["user"])
+            self.assertNotIn("email", columns)
+            self.assertNotIn("name", columns)
+            self.assertEqual(audit["actor_user_id"], "google-123")
+            self.assertEqual(audit["action"], "inventory.scan")
+
+    def test_v3_to_v4_migration_preserves_the_existing_ingestion_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            self._insert_email(config, self.mail("mail-before-auth"))
+            with connector.database(config) as db:
+                db.execute(
+                    """UPDATE emails
+                       SET status='ingesting', attempts=2, task_id='task-existing'
+                       WHERE id='mail-before-auth'"""
+                )
+                db.execute("DROP TABLE audit_log")
+                db.execute("DROP TABLE users")
+                db.execute("PRAGMA user_version=3")
+
+            migrated = connector.connect_db(config)
+            try:
+                row = migrated.execute(
+                    "SELECT status, attempts, task_id FROM emails WHERE id=?",
+                    ("mail-before-auth",),
+                ).fetchone()
+                tables = {
+                    item[0]
+                    for item in migrated.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                version = migrated.execute("PRAGMA user_version").fetchone()[0]
+            finally:
+                migrated.close()
+
+            self.assertEqual(dict(row), {
+                "status": "ingesting",
+                "attempts": 2,
+                "task_id": "task-existing",
+            })
+            self.assertTrue({"users", "audit_log"} <= tables)
+            self.assertEqual(version, connector.SCHEMA_VERSION)
 
     def test_database_connections_do_not_repeat_migrations_during_a_write(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2011,6 +2222,130 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                 server.server_close()
                 thread.join(timeout=2)
 
+    def test_http_interface_follows_openrag_identity_and_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(
+                Path(directory),
+                openrag_auth_mode="auto",
+                connector_public_url="https://connector.example.test",
+            )
+            state = connector.RuntimeState()
+            state.set_running(True)
+            principal = connector.ConnectorPrincipal(
+                user_id="google-123",
+                email="reader@example.test",
+                name="Lectrice OpenRAG",
+                provider="google",
+                roles=frozenset({"user"}),
+                permissions=frozenset({"knowledge:upload"}),
+                authenticated=True,
+                rbac_enforced=True,
+            )
+
+            class FakeAuth:
+                def resolve(self, token=""):
+                    return principal if token == "valid-token" else None
+
+                def begin_login(self):
+                    return "https://accounts.google.com/o/oauth2/v2/auth?test=1", "state-1"
+
+                def complete_login(self, state, code):
+                    if state != "state-1" or code != "code-1":
+                        raise connector.ConnectorError("callback invalide")
+                    return "valid-token"
+
+                def logout(self, _token):
+                    pass
+
+            server = connector.ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                connector.make_http_handler(
+                    config, state, auth_client=FakeAuth()
+                ),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                class NoRedirect(urllib.request.HTTPRedirectHandler):
+                    def redirect_request(self, *_args, **_kwargs):
+                        return None
+
+                no_redirect = urllib.request.build_opener(NoRedirect())
+                login_request = urllib.request.Request(
+                    base + "/auth/login",
+                    data=urllib.parse.urlencode(
+                        {"csrf": state.snapshot()["csrf_token"]}
+                    ).encode(),
+                )
+                with self.assertRaises(urllib.error.HTTPError) as login_redirect:
+                    no_redirect.open(login_request)
+                self.assertEqual(login_redirect.exception.code, 303)
+                self.assertTrue(
+                    login_redirect.exception.headers["Location"].startswith(
+                        "https://accounts.google.com/"
+                    )
+                )
+                state_cookie = login_redirect.exception.headers["Set-Cookie"]
+                self.assertIn("openrag_oauth_state=state-1", state_cookie)
+                self.assertIn("HttpOnly", state_cookie)
+                self.assertIn("Secure", state_cookie)
+
+                callback_request = urllib.request.Request(
+                    base + "/auth/callback?state=state-1&code=code-1",
+                    headers={"Cookie": "openrag_oauth_state=state-1"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as callback_redirect:
+                    no_redirect.open(callback_request)
+                self.assertEqual(callback_redirect.exception.code, 303)
+                callback_cookies = callback_redirect.exception.headers.get_all(
+                    "Set-Cookie"
+                )
+                self.assertTrue(
+                    any("auth_token=valid-token" in value for value in callback_cookies)
+                )
+
+                with urllib.request.urlopen(base + "/") as response:
+                    login_page = response.read().decode()
+                    self.assertTrue(response.geturl().endswith("/login"))
+                self.assertIn("Continuer avec Google", login_page)
+
+                with self.assertRaises(urllib.error.HTTPError) as unauthorized:
+                    urllib.request.urlopen(base + "/status.json")
+                self.assertEqual(unauthorized.exception.code, 401)
+
+                authenticated = urllib.request.Request(
+                    base + "/", headers={"Cookie": "auth_token=valid-token"}
+                )
+                with urllib.request.urlopen(authenticated) as response:
+                    page = response.read().decode()
+                self.assertIn("Lectrice OpenRAG", page)
+                self.assertIn("Identité synchronisée avec OpenRAG", page)
+                self.assertIn("espace d’exploitation partagé", page)
+
+                forbidden = urllib.request.Request(
+                    base + "/reset",
+                    data=urllib.parse.urlencode(
+                        {
+                            "csrf": state.snapshot()["csrf_token"],
+                            "confirmation": "RESET",
+                        }
+                    ).encode(),
+                    headers={"Cookie": "auth_token=valid-token"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as denied:
+                    urllib.request.urlopen(forbidden)
+                self.assertEqual(denied.exception.code, 403)
+                self.assertFalse(state.snapshot()["reset_requested_at"])
+
+                with connector.database(config) as db:
+                    users = db.execute("SELECT id FROM users").fetchall()
+                self.assertEqual([row["id"] for row in users], ["google-123"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_status_event_stream_emits_each_runtime_change(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
@@ -2216,6 +2551,9 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
         self.assertIn("OPENRAG_INGEST_DIRECTORY", deployment)
         self.assertIn("/shared/openrag-documents/openarchiver", deployment)
         self.assertIn("/v1/documents/ingest-path", deployment)
+        self.assertIn("name: OPENRAG_AUTH_MODE\n              value: auto", deployment)
+        self.assertIn("name: CONNECTOR_PUBLIC_URL", deployment)
+        self.assertIn(f"value: https://{hostname}", deployment)
         self.assertIn(
             "https://openarchiver.ferme-de-pommerieux.fr/dashboard/archived-emails/{email_id}",
             deployment,
