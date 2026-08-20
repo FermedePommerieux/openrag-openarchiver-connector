@@ -13,6 +13,7 @@ repli vers l'upload multipart, avec une ``source_url`` distante facultative.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import html
 import http.client
@@ -1759,6 +1760,64 @@ class OpenRAGClient:
             raise ConnectorError("réponse de tâche OpenRAG invalide") from None
         return _require_object(payload, "tâche OpenRAG")
 
+    def indexed_document(self, filename: str) -> dict[str, object] | None:
+        """Retourne le document durable correspondant exactement au nom fourni."""
+        query = urllib.parse.urlencode(
+            {"data_sources": filename, "page_size": 2, "sort_by": "filename"}
+        )
+        request = urllib.request.Request(
+            f"{self.config.openrag_base_url}/v2/files?{query}",
+            headers={
+                "X-API-Key": read_secret(self.config.openrag_api_key_file, "OpenRAG"),
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=self.config.request_timeout_seconds
+            ) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as error:
+            raise HTTPStatusError(error.code, "vérification document OpenRAG") from None
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ConnectorError("réponse de documents OpenRAG invalide") from None
+        result = _require_object(payload, "documents OpenRAG")
+        files = result.get("files")
+        if not isinstance(files, list):
+            raise ConnectorError("réponse de documents OpenRAG sans liste de fichiers")
+        matches = [
+            item
+            for item in files
+            if isinstance(item, dict) and item.get("filename") == filename
+        ]
+        if len(matches) > 1:
+            raise ConnectorError(f"plusieurs documents OpenRAG nommés {filename}")
+        return matches[0] if matches else None
+
+    def document_is_indexed(
+        self, filename: str, sha256: str, *, attempts: int = 3
+    ) -> bool:
+        """Prouve que les octets soumis sont disponibles comme chunks OpenRAG."""
+        expected_id = openrag_document_id(sha256)
+        tries = max(1, attempts)
+        for attempt in range(tries):
+            document = self.indexed_document(filename)
+            if document is not None:
+                try:
+                    chunk_count = int(document.get("chunk_count", 0))
+                except (TypeError, ValueError):
+                    chunk_count = 0
+                if (
+                    chunk_count > 0
+                    and str(document.get("document_id", "")) == expected_id
+                ):
+                    return True
+            if attempt + 1 < tries:
+                self.sleeper(1)
+        return False
+
     def wait(self, task_id: str) -> None:
         deadline = time.monotonic() + self.config.task_timeout_seconds
         encoded = urllib.parse.quote(task_id, safe="")
@@ -1794,6 +1853,34 @@ def _failed_count(value: object) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 1 if value else 0
+
+
+def openrag_document_id(sha256: str) -> str:
+    """Reproduit ``OpenRAG.hash_id`` depuis le SHA-256 hexadécimal local."""
+    try:
+        digest = bytes.fromhex(sha256)
+    except ValueError:
+        raise ConnectorError("empreinte SHA-256 locale invalide") from None
+    if len(digest) != hashlib.sha256().digest_size:
+        raise ConnectorError("empreinte SHA-256 locale invalide")
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")[:24]
+
+
+def wait_for_indexed_document(
+    openrag: OpenRAGClient, task_id: str, filename: str, sha256: str
+) -> None:
+    """Attend la tâche volatile puis exige une preuve durable dans OpenSearch."""
+    try:
+        openrag.wait(task_id)
+    except LostTaskError:
+        if not openrag.document_is_indexed(filename, sha256):
+            raise
+        LOG.info("tâche OpenRAG disparue mais document indexé: %s", filename)
+        return
+    if not openrag.document_is_indexed(filename, sha256):
+        raise ConnectorError(
+            "tâche OpenRAG terminée sans document indexé correspondant"
+        )
 
 
 def claim_next(config: Config, *, now: int | None = None) -> WorkItem | None:
@@ -1937,7 +2024,9 @@ def process_work_item(
             )
             task_id, api_upload = openrag.ingest_source(document, source_url)
             _set_object_state(config, "email", item.object_id, "task_id=?", (task_id,))
-            openrag.wait(task_id)
+            wait_for_indexed_document(
+                openrag, task_id, str(row["openrag_filename"]), sha256
+            )
             if api_upload:
                 try:
                     document.unlink(missing_ok=True)
@@ -1985,7 +2074,9 @@ def process_work_item(
             _set_object_state(
                 config, "attachment", item.object_id, "task_id=?", (task_id,)
             )
-            openrag.wait(task_id)
+            wait_for_indexed_document(
+                openrag, task_id, str(row["openrag_filename"]), sha256
+            )
             if api_upload:
                 try:
                     document.unlink(missing_ok=True)

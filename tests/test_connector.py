@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import io
 import json
@@ -78,8 +79,9 @@ class FakeArchive:
 
 
 class FakeOpenRAG:
-    def __init__(self, fail=False):
+    def __init__(self, fail=False, indexed=True):
         self.fail = fail
+        self.indexed = indexed
         self.uploads = []
 
     def upload(self, path, remote_name):
@@ -97,6 +99,9 @@ class FakeOpenRAG:
     def wait(self, task_id):
         if self.fail:
             raise connector.ConnectorError("tâche OpenRAG failed")
+
+    def document_is_indexed(self, filename, sha256, *, attempts=3):
+        return self.indexed
 
 
 class ConnectorTests(unittest.TestCase):
@@ -1046,6 +1051,61 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                     connector.LostTaskError, "tâche OpenRAG inconnue"
                 ):
                     client.wait("lost-task")
+
+    def test_openrag_document_id_matches_content_hash(self):
+        self.assertEqual(
+            connector.openrag_document_id(
+                "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"
+            ),
+            "Om6weQ85rIfJTzhWst0sXREO",
+        )
+        with self.assertRaisesRegex(connector.ConnectorError, "SHA-256"):
+            connector.openrag_document_id("not-a-hash")
+
+    def test_openrag_index_proof_uses_exact_filename_chunks_and_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            client = connector.OpenRAGClient(config, sleeper=lambda _s: None)
+            sha256 = hashlib.sha256(b"data").hexdigest()
+            payload = json.dumps(
+                {
+                    "files": [
+                        {
+                            "filename": "openarchiver-mail-mail-1.eml",
+                            "document_id": connector.openrag_document_id(sha256),
+                            "source_url": "https://archive.example.test/mail-1",
+                            "chunk_count": 2,
+                        }
+                    ]
+                }
+            ).encode()
+            opener = mock.Mock(return_value=Response(payload))
+            with mock.patch.object(connector.urllib.request, "urlopen", opener):
+                self.assertTrue(
+                    client.document_is_indexed(
+                        "openarchiver-mail-mail-1.eml", sha256
+                    )
+                )
+            request = opener.call_args.args[0]
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
+            self.assertEqual(
+                query["data_sources"], ["openarchiver-mail-mail-1.eml"]
+            )
+
+            with mock.patch.object(
+                client,
+                "indexed_document",
+                return_value={
+                    "filename": "openarchiver-mail-mail-1.eml",
+                    "document_id": "stale-document",
+                    "chunk_count": 2,
+                },
+            ):
+                self.assertFalse(
+                    client.document_is_indexed(
+                        "openarchiver-mail-mail-1.eml", sha256
+                    )
+                )
 
     def test_openrag_ingest_path_uses_json_replace_duplicates(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2207,7 +2267,7 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                 config,
                 item,
                 FakeArchive(downloads={"mail/mail-1.eml": b"Subject: test\r\n\r\nbody"}),
-                LostOpenRAG(),
+                LostOpenRAG(indexed=False),
             )
             row = self.rows(config, "emails")[0]
             self.assertEqual(row["status"], "lost")
@@ -2219,6 +2279,40 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             claimed = self.rows(config, "emails")[0]
             self.assertEqual(claimed["status"], "downloading")
             self.assertEqual(claimed["task_id"], "")
+
+    def test_unknown_openrag_task_with_matching_chunks_is_validated(self):
+        class LostOpenRAG(FakeOpenRAG):
+            def wait(self, task_id):
+                raise connector.LostTaskError(f"tâche OpenRAG inconnue: {task_id}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            self._insert_email(config)
+            item = connector.claim_next(config, now=1)
+            connector.process_work_item(
+                config,
+                item,
+                FakeArchive(downloads={"mail/mail-1.eml": b"Subject: test\r\n\r\nbody"}),
+                LostOpenRAG(indexed=True),
+            )
+            row = self.rows(config, "emails")[0]
+            self.assertEqual(row["status"], "validated")
+            self.assertEqual(row["task_id"], "task-1")
+
+    def test_completed_task_without_matching_chunks_is_failed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            self._insert_email(config)
+            item = connector.claim_next(config, now=1)
+            connector.process_work_item(
+                config,
+                item,
+                FakeArchive(downloads={"mail/mail-1.eml": b"Subject: test\r\n\r\nbody"}),
+                FakeOpenRAG(indexed=False),
+            )
+            row = self.rows(config, "emails")[0]
+            self.assertEqual(row["status"], "failed")
+            self.assertIn("sans document indexé", row["last_error"])
 
     def test_retry_ui_separates_lost_and_failed_and_requeues_selection(self):
         with tempfile.TemporaryDirectory() as directory:
