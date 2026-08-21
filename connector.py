@@ -33,6 +33,7 @@ import os
 import re
 import signal
 import sqlite3
+import ssl
 import tempfile
 import threading
 import time
@@ -190,6 +191,13 @@ class Config:
     docling_metrics_url: str = (
         "http://docling-serve.docling.svc.cluster.local:5001/metrics"
     )
+    docling_workload_url: str = ""
+    kubernetes_token_file: Path = Path(
+        "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    )
+    kubernetes_ca_file: Path = Path(
+        "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+    )
     docling_metrics_timeout: int = 5
     docling_queue_name: str = "convert"
     page_limit: int = 250
@@ -287,6 +295,19 @@ class Config:
                 "DOCLING_METRICS_URL",
                 "http://docling-serve.docling.svc.cluster.local:5001/metrics",
             ),
+            docling_workload_url=values.get("DOCLING_WORKLOAD_URL", "").rstrip("/"),
+            kubernetes_token_file=Path(
+                values.get(
+                    "KUBERNETES_TOKEN_FILE",
+                    "/var/run/secrets/kubernetes.io/serviceaccount/token",
+                )
+            ),
+            kubernetes_ca_file=Path(
+                values.get(
+                    "KUBERNETES_CA_FILE",
+                    "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+                )
+            ),
             docling_metrics_timeout=max(
                 1, int(values.get("DOCLING_METRICS_TIMEOUT_SECONDS", "5"))
             ),
@@ -309,6 +330,10 @@ class Config:
         )
         _validate_internal_http_url(config.openrag_base_url, "OPENRAG_BASE_URL")
         _validate_internal_http_url(config.docling_metrics_url, "DOCLING_METRICS_URL")
+        if config.docling_workload_url:
+            _validate_internal_service_url(
+                config.docling_workload_url, "DOCLING_WORKLOAD_URL"
+            )
         if not config.openrag_ingest_directory.is_absolute():
             raise ValueError("OPENRAG_INGEST_DIRECTORY doit être un chemin absolu")
         if config.openrag_ingest_mode not in {"auto", "path", "api"}:
@@ -355,6 +380,28 @@ def _validate_internal_http_url(value: str, variable: str) -> None:
     )
     if parsed.scheme != "http" or not internal or parsed.username or parsed.password:
         raise ValueError(f"{variable} doit être une URL HTTP interne sans identifiants")
+
+
+def _validate_internal_service_url(value: str, variable: str) -> None:
+    """Valide une URL de service interne HTTP ou HTTPS sans identifiants."""
+
+    parsed = urllib.parse.urlsplit(value)
+    host = (parsed.hostname or "").lower()
+    internal = (
+        host in {"localhost", "127.0.0.1", "::1"}
+        or host.endswith(".svc")
+        or host.endswith(".svc.cluster.local")
+        or (host and "." not in host)
+    )
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not internal
+        or parsed.username
+        or parsed.password
+    ):
+        raise ValueError(
+            f"{variable} doit être une URL HTTP(S) interne sans identifiants"
+        )
 
 
 def _validate_connector_public_url(value: str) -> None:
@@ -2945,7 +2992,13 @@ def _safe_error(error: Exception) -> str:
 
 
 def parse_docling_worker_metrics(metrics: str, queue_name: str) -> int:
-    """Compte les workers RQ actifs qui consomment la file Docling attendue."""
+    """Compte les workers RQ enregistrés pour une installation hors Kubernetes.
+
+    RQ conserve les workers interrompus pendant plusieurs heures. Cette
+    métrique n'est donc utilisée qu'en repli lorsque ``DOCLING_WORKLOAD_URL``
+    n'est pas configurée ; Kubernetes fournit une capacité plus fiable via
+    l'état réel du Deployment.
+    """
     family_present = False
     workers = 0
     for line in metrics.splitlines():
@@ -2967,7 +3020,55 @@ def parse_docling_worker_metrics(metrics: str, queue_name: str) -> int:
     return workers
 
 
+def parse_docling_workload(payload: bytes) -> int:
+    """Retourne le nombre de réplicas Docling réellement prêts et disponibles."""
+
+    try:
+        workload = json.loads(payload)
+        metadata = workload["metadata"]
+        status = workload["status"]
+        generation = int(metadata["generation"])
+        observed_generation = int(status.get("observedGeneration", 0))
+        ready = max(0, int(status.get("readyReplicas", 0)))
+        available = max(0, int(status.get("availableReplicas", 0)))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError("état Kubernetes Docling invalide") from error
+
+    # Pendant une réconciliation, un statut d'une génération antérieure ne
+    # doit pas autoriser de nouveaux travaux sur une capacité devenue fausse.
+    if observed_generation < generation:
+        return 0
+    return min(ready, available)
+
+
+def detect_docling_kubernetes_workers(config: Config) -> int:
+    """Lit en lecture seule la capacité effective du Deployment Docling."""
+
+    token = config.kubernetes_token_file.read_text(encoding="utf-8").strip()
+    if not token:
+        raise RuntimeError("jeton Kubernetes vide")
+    request = urllib.request.Request(
+        config.docling_workload_url,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+    )
+    context = ssl.create_default_context(cafile=str(config.kubernetes_ca_file))
+    with urllib.request.urlopen(
+        request,
+        timeout=config.docling_metrics_timeout,
+        context=context,
+    ) as response:
+        payload = response.read(1_000_001)
+    if len(payload) > 1_000_000:
+        raise RuntimeError("réponse Kubernetes Docling trop volumineuse")
+    return parse_docling_workload(payload)
+
+
 def detect_docling_workers(config: Config) -> int:
+    if config.docling_workload_url:
+        return detect_docling_kubernetes_workers(config)
     request = urllib.request.Request(
         config.docling_metrics_url,
         headers={"Accept": "text/plain"},
@@ -3010,11 +3111,11 @@ def effective_ingestion_concurrency(
             effective = min(detected, config.ingestion_concurrency_max)
             if effective == 0:
                 LOG.warning(
-                    "aucun worker Docling RQ détecté; aucune nouvelle ingestion"
+                    "aucun worker Docling disponible; aucune nouvelle ingestion"
                 )
             else:
                 LOG.info(
-                    "%d worker(s) Docling détecté(s); concurrence effective=%d "
+                    "%d worker(s) Docling disponible(s); concurrence effective=%d "
                     "(maximum un thread par worker)",
                     detected,
                     effective,

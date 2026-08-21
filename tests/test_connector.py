@@ -214,6 +214,11 @@ class ConnectorTests(unittest.TestCase):
                 defaults.docling_metrics_url,
                 "http://docling-serve.docling.svc.cluster.local:5001/metrics",
             )
+            self.assertEqual(defaults.docling_workload_url, "")
+            self.assertEqual(
+                defaults.kubernetes_token_file,
+                Path("/var/run/secrets/kubernetes.io/serviceaccount/token"),
+            )
             self.assertEqual(
                 defaults.supported_extensions,
                 frozenset(
@@ -445,6 +450,77 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             connector.parse_docling_worker_metrics(
                 "# TYPE rq_jobs gauge\n", "convert"
             )
+
+    def test_docling_workload_counts_only_ready_available_replicas(self):
+        payload = json.dumps(
+            {
+                "metadata": {"generation": 7},
+                "status": {
+                    "observedGeneration": 7,
+                    "readyReplicas": 3,
+                    "availableReplicas": 2,
+                },
+            }
+        ).encode()
+        self.assertEqual(connector.parse_docling_workload(payload), 2)
+
+        stale = json.dumps(
+            {
+                "metadata": {"generation": 8},
+                "status": {
+                    "observedGeneration": 7,
+                    "readyReplicas": 3,
+                    "availableReplicas": 3,
+                },
+            }
+        ).encode()
+        self.assertEqual(connector.parse_docling_workload(stale), 0)
+
+    def test_kubernetes_docling_detection_uses_read_only_workload_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            token = root / "token"
+            ca = root / "ca.crt"
+            token.write_text("service-account-token\n", encoding="utf-8")
+            ca.write_text("test-ca", encoding="utf-8")
+            config = self.config(
+                root,
+                docling_workload_url=(
+                    "https://kubernetes.default.svc/apis/apps/v1/namespaces/"
+                    "docling/deployments/docling-rq-workers"
+                ),
+                kubernetes_token_file=token,
+                kubernetes_ca_file=ca,
+            )
+            payload = json.dumps(
+                {
+                    "metadata": {"generation": 4},
+                    "status": {
+                        "observedGeneration": 4,
+                        "readyReplicas": 3,
+                        "availableReplicas": 3,
+                    },
+                }
+            ).encode()
+            opener = mock.Mock(return_value=Response(payload))
+            tls_context = object()
+
+            with (
+                mock.patch.object(
+                    connector.ssl,
+                    "create_default_context",
+                    return_value=tls_context,
+                ) as create_context,
+                mock.patch.object(connector.urllib.request, "urlopen", opener),
+            ):
+                self.assertEqual(connector.detect_docling_workers(config), 3)
+
+            create_context.assert_called_once_with(cafile=str(ca))
+            request = opener.call_args.args[0]
+            self.assertEqual(
+                request.headers["Authorization"], "Bearer service-account-token"
+            )
+            self.assertIs(opener.call_args.kwargs["context"], tls_context)
 
     def test_automatic_concurrency_uses_detected_workers_and_cap(self):
         with tempfile.TemporaryDirectory() as directory:

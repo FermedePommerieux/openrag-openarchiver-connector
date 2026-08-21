@@ -216,10 +216,16 @@ Avec `INGESTION_CONCURRENCY=auto`, la concurrence vaut :
 min(workers_Docling_détectés, INGESTION_CONCURRENCY_MAX)
 ```
 
-La détection lit la métrique Prometheus `rq_workers` de la file Docling
-configurée. Si elle échoue, `INGESTION_CONCURRENCY_FALLBACK` est utilisé. Si la
-détection réussit mais trouve zéro worker, aucune nouvelle ingestion n'est
-soumise pendant ce cycle.
+Dans Kubernetes, `DOCLING_WORKLOAD_URL` pointe vers l'API du Deployment Docling.
+Le connecteur utilise le minimum entre ses réplicas `Ready` et `Available` : les
+enregistrements RQ fantômes conservés dans Valkey après l'arrêt d'un pod ne sont
+donc jamais comptés. Le compte de service n'a qu'un droit `get` sur ce
+Deployment. Hors Kubernetes, si cette URL est vide, la métrique Prometheus
+`rq_workers` reste disponible comme solution de compatibilité.
+
+Si la détection échoue ou si Kubernetes n'a pas encore observé la dernière
+génération du Deployment, aucune nouvelle ingestion n'est soumise pendant ce
+cycle.
 
 Cette concurrence limite les objets suivis simultanément par le connecteur.
 Elle ne garantit pas que Langflow ou Docling les exécutent immédiatement.
@@ -317,9 +323,13 @@ principales sont :
 | `RETRY_BASE_SECONDS` / `RETRY_MAX_SECONDS` | `300` / `3600` | backoff |
 | `MAX_FILE_BYTES` | `104857600` | limite à 100 Mio |
 | `INGESTION_CONCURRENCY` | `auto` | détection Docling |
-| `INGESTION_CONCURRENCY_FALLBACK` | `2` | repli si métriques indisponibles |
+| `INGESTION_CONCURRENCY_FALLBACK` | `2` | option historique, non utilisée en mode automatique sûr |
 | `INGESTION_CONCURRENCY_MAX` | `8` | borne opérateur du pool, toujours limitée au nombre de workers détectés |
 | `INGESTION_PREFETCH_PER_WORKER` | `1` | option historique ; le pool impose désormais un seul thread par worker |
+| `DOCLING_WORKLOAD_URL` | vide | API Kubernetes du Deployment Docling, prioritaire si configurée |
+| `KUBERNETES_TOKEN_FILE` | chemin standard Kubernetes | jeton du compte de service en lecture seule |
+| `KUBERNETES_CA_FILE` | chemin standard Kubernetes | autorité de certification de l'API Kubernetes |
+| `DOCLING_METRICS_URL` | service Docling interne | repli hors Kubernetes uniquement |
 | `DOCLING_RQ_QUEUE_NAME` | `convert` | file comptée dans les métriques |
 | `REQUEST_TIMEOUT_SECONDS` | `30` | timeout des appels HTTP courts |
 
