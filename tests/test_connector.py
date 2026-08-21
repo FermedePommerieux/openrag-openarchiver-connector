@@ -1492,6 +1492,44 @@ class ConnectorTests(unittest.TestCase):
             self.assertEqual(status["mails_per_minute"], 73)
             self.assertFalse(any("queue" in key for key in status))
 
+    def test_active_ingestions_expose_safe_name_size_and_status_in_ui(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            email_id = self._insert_email(
+                config,
+                self.mail(
+                    "active-mail",
+                    subject="Facture <électricité>",
+                    sizeBytes=1536,
+                ),
+                status="ingesting",
+            )
+            db = connector.connect_db(config)
+            db.execute(
+                "UPDATE emails SET openrag_filename=? WHERE id=?",
+                ("Facture <électricité>.eml", email_id),
+            )
+            db.commit()
+            db.close()
+            tasks = connector.active_ingestion_tasks(config)
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0]["id"], email_id)
+            self.assertEqual(tasks[0]["kind"], "email")
+            self.assertEqual(tasks[0]["size_bytes"], 1536)
+            self.assertEqual(tasks[0]["status"], "ingesting")
+
+            state = connector.RuntimeState()
+            state.active_ingestions_updated(tasks)
+            live = json.loads(connector.render_live_status(state))
+            self.assertEqual(live["active_ingestions"], tasks)
+            page = connector.render_status_page(config, state)
+            self.assertIn("Tâches en cours", page)
+            self.assertIn("1.5 Kio", page)
+            self.assertIn("Ingestion OpenRAG", page)
+            self.assertIn("Facture &lt;électricité&gt;.eml", page)
+            self.assertNotIn("Facture <électricité>.eml", page)
+            self.assertIn("renderActiveTasks(status.active_ingestions)", connector.UI_SCRIPT)
+
     def test_mail_rate_counts_recent_validated_selected_emails_only(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory), page_limit=10)

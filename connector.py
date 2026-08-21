@@ -79,7 +79,7 @@ POOL_RECONFIGURE = threading.Event()
 SCHEMA_VERSION = 5
 SCHEMA_LOCK = threading.Lock()
 RECONCILE_BATCH_SIZE = 100
-MAIL_RATE_POLL_SECONDS = 5
+MAIL_RATE_POLL_SECONDS = 1
 OPENRAG_TASK_POLL_SECONDS = 0.25
 API_KEY_DISPLAY_PREFIX_LENGTH = 12
 RUNTIME_OPENRAG_URL_KEY = "runtime_openrag_base_url"
@@ -3177,6 +3177,34 @@ def selected_mails_validated_last_minute(
     return int(row[0]) if row else 0
 
 
+def active_ingestion_tasks(config: Config) -> list[dict[str, object]]:
+    """Retourne les documents actuellement détenus par les slots du connecteur."""
+    with database(config) as db:
+        rows = db.execute(
+            """
+            SELECT kind, id, openrag_filename, size_bytes, status FROM (
+                SELECT 'email' AS kind, id, openrag_filename, size_bytes, status
+                FROM emails WHERE status IN ('downloading','ingesting')
+                UNION ALL
+                SELECT 'attachment' AS kind, id, openrag_filename, size_bytes, status
+                FROM attachments WHERE status IN ('downloading','ingesting')
+            )
+            ORDER BY CASE status WHEN 'ingesting' THEN 0 ELSE 1 END,
+                     openrag_filename, id
+            """
+        ).fetchall()
+    return [
+        {
+            "kind": str(row["kind"]),
+            "id": str(row["id"]),
+            "name": str(row["openrag_filename"]),
+            "size_bytes": max(0, int(row["size_bytes"])),
+            "status": str(row["status"]),
+        }
+        for row in rows
+    ]
+
+
 # ---------------------------------------------------------------------------
 # État mémoire, boucles de fond et cycle métier
 # ---------------------------------------------------------------------------
@@ -3212,6 +3240,7 @@ class RuntimeState:
         self.reconciliation_lost = 0
         self.reconciliation_error = ""
         self.mails_per_minute = 0
+        self.active_ingestions: list[dict[str, object]] = []
         self.ingestion_concurrency_effective = 0
         self.ready = False
         self.running = False
@@ -3352,6 +3381,16 @@ class RuntimeState:
                 self.mails_per_minute = value
                 self._notify_changed()
 
+    def active_ingestions_updated(
+        self, active_ingestions: Sequence[Mapping[str, object]]
+    ) -> None:
+        """Publie uniquement les changements de la liste des travaux actifs."""
+        normalized = [dict(task) for task in active_ingestions]
+        with self.changed:
+            if normalized != self.active_ingestions:
+                self.active_ingestions = normalized
+                self._notify_changed()
+
     def cycle_succeeded(self, scan: ScanResult, processed: int) -> None:
         with self.changed:
             self.last_cycle_completed_at = int(time.time())
@@ -3398,6 +3437,7 @@ class RuntimeState:
                 "reconciliation_lost": self.reconciliation_lost,
                 "reconciliation_error": self.reconciliation_error,
                 "mails_per_minute": self.mails_per_minute,
+                "active_ingestions": [dict(task) for task in self.active_ingestions],
                 "ingestion_concurrency_effective": self.ingestion_concurrency_effective,
                 "ready": self.ready,
                 "running": self.running,
@@ -3657,12 +3697,13 @@ def mail_rate_monitor_loop(
     stop: threading.Event = STOP,
     poll_seconds: float = MAIL_RATE_POLL_SECONDS,
 ) -> None:
-    """Actualise le débit récent depuis SQLite, sans interroger OpenRAG."""
+    """Actualise le débit et les tâches actives depuis SQLite uniquement."""
     while not stop.is_set():
         try:
             state.mail_rate_updated(selected_mails_validated_last_minute(config))
+            state.active_ingestions_updated(active_ingestion_tasks(config))
         except Exception as error:
-            LOG.warning("calcul du débit d'ingestion impossible: %s", _safe_error(error))
+            LOG.warning("actualisation de l'état d'ingestion impossible: %s", _safe_error(error))
         stop.wait(max(1.0, poll_seconds))
 
 
@@ -3782,12 +3823,13 @@ STATUS_PAGE_STYLE = """
 .app{min-height:100vh}.topbar{display:flex;align-items:center;justify-content:space-between;height:64px;border-bottom:1px solid var(--border);background:color-mix(in srgb,var(--background) 94%,transparent);padding:0 24px;position:sticky;top:0;z-index:2;backdrop-filter:blur(10px)}.brand{display:flex;align-items:center;gap:10px;font:600 18px/1 ui-monospace,SFMono-Regular,Menlo,monospace}.brand-logo{width:24px;height:22px;fill:currentColor}.connector-chip{border:1px solid var(--border);border-radius:999px;padding:5px 10px;color:var(--muted-foreground);font-size:12px}.user-menu{display:flex;align-items:center;gap:9px}.user-menu form{margin:0}.user-menu button{min-height:32px;padding:5px 10px;font-size:12px}.main{min-width:0;padding:38px 24px}.content{max-width:1120px;margin:0 auto}.page-heading{margin-bottom:24px}.eyebrow{margin:0 0 4px;color:var(--muted-foreground);font-size:12px;font-weight:600}.page-heading h1{margin:0;font-size:26px;line-height:1.25;letter-spacing:-.025em}.page-heading p{margin:7px 0 0;color:var(--muted-foreground)}.section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:18px}.section-heading h2{margin:0;font-size:18px;letter-spacing:-.015em}.section-heading p{margin:4px 0 0;color:var(--muted-foreground)}.toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.toolbar form{margin:0}
 .workspace-tabs{display:flex;gap:4px;width:max-content;max-width:100%;margin-bottom:28px;border:1px solid var(--border);border-radius:10px;background:var(--muted);padding:4px;overflow-x:auto}.workspace-tab{min-height:38px;border:0;background:transparent;padding:8px 15px;color:var(--muted-foreground);white-space:nowrap;box-shadow:none}.workspace-tab:hover{background:color-mix(in srgb,var(--card) 55%,transparent);color:var(--foreground)}.workspace-tab[aria-selected="true"]{background:var(--card);color:var(--foreground);box-shadow:var(--shadow)}.workspace-panel[hidden]{display:none}.workspace-panel{animation:panel-in .14s ease-out}@keyframes panel-in{from{opacity:.55;transform:translateY(2px)}to{opacity:1;transform:none}}
 .status-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:20px}.stat-card,.card{border:1px solid var(--border);border-radius:var(--radius);background:var(--card);box-shadow:var(--shadow)}.stat-card{padding:16px}.stat-label{display:flex;align-items:center;gap:7px;color:var(--muted-foreground);font-size:12px;font-weight:600}.dot{width:8px;height:8px;border-radius:50%;background:var(--muted-foreground)}.dot.success{background:var(--success)}.dot.warning{background:#f59e0b}.dot.danger{background:var(--danger)}.stat-value{display:block;margin-top:8px;font-size:22px;font-weight:650;letter-spacing:-.03em}.stat-detail{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px}.card{margin-bottom:16px;overflow:hidden}.card-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:18px 20px;border-bottom:1px solid var(--border)}.card-title{margin:0;font-size:15px}.card-description{margin:3px 0 0;color:var(--muted-foreground);font-size:13px}.card-body{padding:20px}.card-footer{display:flex;justify-content:flex-end;padding:14px 20px;border-top:1px solid var(--border);background:var(--sidebar)}.badge{display:inline-flex;align-items:center;border-radius:999px;background:var(--muted);padding:3px 8px;color:var(--muted-foreground);font-size:11px;font-weight:600}.badge.success{background:var(--success-soft);color:var(--success)}.badge.warning{background:var(--warning-soft);color:var(--warning)}.badge.danger{background:var(--danger-soft);color:var(--danger)}
+.active-task-list{display:grid}.active-task-row{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:13px 0;border-bottom:1px solid var(--border)}.active-task-row:first-child{padding-top:0}.active-task-row:last-child{padding-bottom:0;border-bottom:0}.active-task-document{min-width:0;display:grid;gap:2px}.active-task-document strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.active-task-document span{color:var(--muted-foreground);font-size:12px}.active-task-row>.badge{flex:0 0 auto}.active-task-empty{margin:0}
 .inventory-row{display:flex;align-items:center;gap:12px}.inventory-status{display:block;width:100%;min-height:24px;font-weight:600}.inventory-status.running{color:var(--success)}.progress-wrap{margin-top:12px}.progress-track{height:10px;overflow:hidden;border-radius:999px;background:var(--muted)}.progress-bar{height:100%;width:0;border-radius:inherit;background:var(--success);transition:width .25s ease}.progress-bar.indeterminate{width:35%;animation:progress-slide 1.2s ease-in-out infinite}.progress-label{display:block;margin-top:5px;color:var(--muted-foreground);font-size:12px;text-align:right}@keyframes progress-slide{0%{transform:translateX(-110%)}100%{transform:translateX(300%)}}.helper{margin:10px 0 0;color:var(--muted-foreground);font-size:12px}.error-alert{display:flex;gap:10px;margin-bottom:16px;border:1px solid #fecaca;border-radius:var(--radius);background:var(--danger-soft);padding:13px 15px;color:#991b1b}.error-alert strong{display:block}.selection-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:390px;overflow:auto}.selection-item{display:flex;align-items:flex-start;gap:11px;margin:0;border:1px solid var(--border);border-radius:var(--radius);padding:12px;cursor:pointer;transition:background .15s,border-color .15s}.selection-item:hover{background:var(--muted)}.selection-item:has(input:checked){border-color:#a1a1aa;background:var(--muted)}.selection-item input{width:16px;height:16px;margin:2px 0 0;accent-color:var(--primary);flex:0 0 auto}.selection-copy{min-width:0}.selection-title{display:block;font-weight:600;overflow-wrap:anywhere}.selection-meta{display:block;margin-top:2px;color:var(--muted-foreground);font-size:12px;overflow-wrap:anywhere}.empty{grid-column:1/-1;margin:0;border:1px dashed var(--border);border-radius:var(--radius);padding:22px;text-align:center;color:var(--muted-foreground)}.counts{display:flex;flex-wrap:wrap;gap:6px}.secret-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.secret-field{display:grid;gap:6px;color:var(--muted-foreground);font-size:12px;font-weight:600}.secret-current{font-weight:400}.secret-current code{display:inline-block;border-radius:5px;background:var(--muted);padding:2px 6px;color:var(--foreground);font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}.secret-missing{font-weight:400}.secret-field input{width:100%;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);padding:8px 10px}.footer-note{padding:8px 0 24px;text-align:center;color:var(--muted-foreground);font-size:12px}
 .reconciliation-row{display:flex;align-items:center;justify-content:space-between;gap:16px}.reconciliation-row form{flex:0 0 auto}.section-rule{margin:18px 0;border:0;border-top:1px solid var(--border)}.retry-tabs{position:relative}.tab-toggle{position:absolute;opacity:0;pointer-events:none}.tab-label{display:inline-flex;margin:0 6px 14px 0;border:1px solid var(--border);border-radius:999px;padding:7px 12px;color:var(--muted-foreground);cursor:pointer;font-weight:600}.tab-panel{display:none}.retry-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px}.retry-select-all{display:flex;align-items:center;gap:8px;color:var(--muted-foreground);font-size:12px}.retry-select-all input{width:16px;height:16px;accent-color:var(--primary)}#retry-tab-lost:checked~label[for="retry-tab-lost"],#retry-tab-failed:checked~label[for="retry-tab-failed"]{border-color:var(--primary);background:var(--primary);color:var(--primary-foreground)}#retry-tab-lost:checked~.tab-panels>#retry-panel-lost,#retry-tab-failed:checked~.tab-panels>#retry-panel-failed{display:block}
 .login-page{min-height:100vh;display:grid;place-items:center;padding:24px;background:var(--muted)}.login-card{width:min(440px,100%);border:1px solid var(--border);border-radius:14px;background:var(--card);padding:42px;box-shadow:var(--shadow);text-align:center}.login-card .brand-logo{width:50px;height:42px}.login-card h1{margin:24px 0 8px;font-size:24px}.login-card p{margin:0 0 28px;color:var(--muted-foreground)}.login-card form{margin:0}.login-card button{width:100%;min-height:46px}.identity-notice{margin-bottom:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--sidebar);padding:11px 14px;color:var(--muted-foreground);font-size:12px}
 @media(prefers-color-scheme:dark){:root{--background:#18181b;--foreground:#fafafa;--muted:#27272a;--muted-foreground:#a1a1aa;--border:#3f3f46;--card:#18181b;--sidebar:#111113;--primary:#fafafa;--primary-foreground:#09090b;--danger:#f87171;--danger-soft:#2b1719;--success:#34d399;--success-soft:#10251e;--warning:#fbbf24;--warning-soft:#2b2414;--shadow:none}.primary:hover{background:#e4e4e7}.error-alert{border-color:#7f1d1d;color:#fecaca}.selection-item:has(input:checked){border-color:#71717a}}
 @media(max-width:900px){.main{padding:28px 18px}.status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.secret-grid{grid-template-columns:1fr}}
-@media(max-width:620px){.topbar{height:58px;padding:0 16px}.connector-chip{display:none}.main{padding:24px 14px}.page-heading h1{font-size:23px}.section-heading{align-items:stretch;flex-direction:column}.toolbar button{width:100%}.toolbar form{display:flex;width:100%}.workspace-tabs{width:100%;margin-bottom:22px}.workspace-tab{flex:1;padding:8px 11px}.selection-list{grid-template-columns:1fr}.status-grid{grid-template-columns:1fr 1fr}.stat-card{padding:13px}.stat-value{font-size:19px}.card-header,.card-body{padding:16px}.card-footer{padding:12px 16px}.card-footer button{width:100%}.reconciliation-row{align-items:stretch;flex-direction:column}.reconciliation-row button{width:100%}}
+@media(max-width:620px){.topbar{height:58px;padding:0 16px}.connector-chip{display:none}.main{padding:24px 14px}.page-heading h1{font-size:23px}.section-heading{align-items:stretch;flex-direction:column}.toolbar button{width:100%}.toolbar form{display:flex;width:100%}.workspace-tabs{width:100%;margin-bottom:22px}.workspace-tab{flex:1;padding:8px 11px}.selection-list{grid-template-columns:1fr}.status-grid{grid-template-columns:1fr 1fr}.stat-card{padding:13px}.stat-value{font-size:19px}.card-header,.card-body{padding:16px}.card-footer{padding:12px 16px}.card-footer button{width:100%}.active-task-row{align-items:flex-start;flex-direction:column;gap:7px}.active-task-document{width:100%}.reconciliation-row{align-items:stretch;flex-direction:column}.reconciliation-row button{width:100%}}
 """
 
 
@@ -3803,8 +3845,13 @@ def render_inventory_status_page(state: RuntimeState) -> str:
 </head><body class="{body_class}" aria-live="polite" aria-busy="{str(running).lower()}">{status}</body></html>"""
 
 
-def render_live_status(state: RuntimeState) -> str:
+def render_live_status(state: RuntimeState, config: Config | None = None) -> str:
     snapshot = state.snapshot()
+    active = (
+        active_ingestion_tasks(config)
+        if config is not None
+        else list(snapshot["active_ingestions"])
+    )
     return json.dumps(
         {
             "csrf_token": str(snapshot["csrf_token"]),
@@ -3829,6 +3876,7 @@ def render_live_status(state: RuntimeState) -> str:
             "reconciliation_lost": int(snapshot["reconciliation_lost"]),
             "reconciliation_error": str(snapshot["reconciliation_error"] or ""),
             "mails_per_minute": int(snapshot["mails_per_minute"]),
+            "active_ingestions": active,
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -3900,6 +3948,8 @@ UI_SCRIPT = r"""(() => {
   const inventoryProgressBar = document.getElementById("inventory-cycle-progress-bar");
   const inventoryProgressLabel = document.getElementById("inventory-cycle-progress-label");
   const mailRate = document.getElementById("mail-rate");
+  const activeTaskCount = document.getElementById("active-task-count");
+  const activeTaskList = document.getElementById("active-task-list");
   const reconciliationButton = document.getElementById("reconciliation-button");
   const reconciliationStatus = document.getElementById("reconciliation-status");
   const reconciliationDetail = document.getElementById("reconciliation-detail");
@@ -3918,6 +3968,50 @@ UI_SCRIPT = r"""(() => {
   let observedActive = document.body.dataset.cycleActive === "true";
   let observedStage = document.body.dataset.cycleStage || "idle";
   let observedReconciliation = document.body.dataset.reconciliationActive === "true";
+  const formatFileSize = raw => {
+    let value = Math.max(0, Number(raw) || 0);
+    const units = ["o", "Kio", "Mio", "Gio"];
+    let unit = units[0];
+    for (let index = 0; index < units.length; index += 1) {
+      unit = units[index];
+      if (value < 1024 || index === units.length - 1) break;
+      value /= 1024;
+    }
+    const precision = unit === "o" || value >= 10 ? 0 : 1;
+    return value.toFixed(precision) + " " + unit;
+  };
+  const renderActiveTasks = rawTasks => {
+    if (!activeTaskList || !activeTaskCount) return;
+    const tasks = Array.isArray(rawTasks) ? rawTasks : [];
+    activeTaskCount.textContent = tasks.length + " active(s)";
+    const content = document.createDocumentFragment();
+    if (!tasks.length) {
+      const empty = document.createElement("p");
+      empty.className = "empty active-task-empty";
+      empty.textContent = "Aucune tâche en cours.";
+      content.append(empty);
+    }
+    tasks.forEach(task => {
+      const row = document.createElement("div");
+      row.className = "active-task-row";
+      const documentBlock = document.createElement("div");
+      documentBlock.className = "active-task-document";
+      const name = document.createElement("strong");
+      name.textContent = String(task.name || "Document sans nom");
+      name.title = name.textContent;
+      const detail = document.createElement("span");
+      detail.textContent = (task.kind === "email" ? "Mail" : "Pièce jointe") +
+        " · " + formatFileSize(task.size_bytes);
+      const status = document.createElement("span");
+      const ingesting = task.status === "ingesting";
+      status.className = "badge " + (ingesting ? "success" : "warning");
+      status.textContent = ingesting ? "Ingestion OpenRAG" : "Téléchargement";
+      documentBlock.append(name, detail);
+      row.append(documentBlock, status);
+      content.append(row);
+    });
+    activeTaskList.replaceChildren(content);
+  };
   const refreshInventoryDisplay = async () => {
     const response = await fetch("/?inventory-fragment=1", {cache: "no-store"});
     if (!response.ok) throw new Error("actualisation de l’inventaire impossible");
@@ -4006,6 +4100,7 @@ UI_SCRIPT = r"""(() => {
       }
       if (processed) processed.textContent = status.last_processed + " objet(s) au dernier cycle";
       if (mailRate) mailRate.textContent = String(Number(status.mails_per_minute || 0));
+      renderActiveTasks(status.active_ingestions);
       const updateProgress = (wrap, bar, label, visible) => {
         if (!wrap || !bar || !label) return;
         const current = Number(status.progress_current || 0);
@@ -4119,6 +4214,45 @@ def render_login_page(state: RuntimeState, error: str = "") -> str:
 </section></main></body></html>"""
 
 
+def format_file_size(size_bytes: int) -> str:
+    """Formate une taille de fichier de manière compacte pour l'exploitation."""
+    value = float(max(0, size_bytes))
+    units = ("o", "Kio", "Mio", "Gio")
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            precision = 0 if unit == "o" or value >= 10 else 1
+            return f"{value:.{precision}f} {unit}"
+        value /= 1024
+    raise AssertionError("unité de taille inaccessible")
+
+
+def render_active_ingestion_tasks(tasks: Sequence[Mapping[str, object]]) -> str:
+    """Construit la liste initiale ; JavaScript reprend ensuite les mises à jour."""
+    if not tasks:
+        return '<p class="empty active-task-empty">Aucune tâche en cours.</p>'
+    lines = []
+    for task in tasks:
+        kind = str(task.get("kind", ""))
+        status = str(task.get("status", ""))
+        kind_label = "Mail" if kind == "email" else "Pièce jointe"
+        status_label = (
+            "Ingestion OpenRAG" if status == "ingesting" else "Téléchargement"
+        )
+        status_class = "success" if status == "ingesting" else "warning"
+        lines.append(
+            '<div class="active-task-row">'
+            '<div class="active-task-document">'
+            f'<strong title="{html.escape(str(task.get("name", "")), quote=True)}">'
+            f'{html.escape(str(task.get("name", "")))}</strong>'
+            f'<span>{html.escape(kind_label)} · '
+            f'{html.escape(format_file_size(int(task.get("size_bytes", 0))))}</span>'
+            "</div>"
+            f'<span class="badge {status_class}">{html.escape(status_label)}</span>'
+            "</div>"
+        )
+    return "".join(lines)
+
+
 def render_status_page(
     config: Config,
     state: RuntimeState,
@@ -4129,6 +4263,7 @@ def render_status_page(
     mailboxes = mailbox_rows(config)
     counts = _status_counts(config)
     selected_counts = _status_counts(config, selected_only=True)
+    active_tasks = active_ingestion_tasks(config)
     inventory_cache = cached_inventory(config, allow_expired=True)
     paused = is_paused(config)
     csrf = html.escape(str(snapshot["csrf_token"]), quote=True)
@@ -4403,6 +4538,8 @@ def render_status_page(
 <div class="stat-card"><span class="stat-label">Mails dans la sélection</span><strong id="mail-count" class="stat-value">{email_total}</strong><span id="mailbox-selected-count" class="stat-detail">{selected_mailboxes} dossier(s) sélectionné(s)</span></div>
 <div class="stat-card"><span class="stat-label">Débit récent</span><strong id="mail-rate" class="stat-value">{int(snapshot["mails_per_minute"])}</strong><span class="stat-detail">mail(s) validé(s)/min</span></div>
 </section>
+<section class="card" aria-labelledby="active-task-title"><div class="card-header"><div><h2 id="active-task-title" class="card-title">Tâches en cours</h2><p class="card-description">Documents actuellement détenus par les slots du connecteur.</p></div><span id="active-task-count" class="badge">{len(active_tasks)} active(s)</span></div>
+<div class="card-body"><div id="active-task-list" class="active-task-list" aria-live="polite">{render_active_ingestion_tasks(active_tasks)}</div></div></section>
 <section class="card"><div class="card-header"><div><h2 class="card-title">Ingestion OpenRAG</h2><p class="card-description">Progression de l’envoi des mails et pièces jointes sélectionnés.</p></div></div>
 <div class="card-body"><div id="cycle-progress" class="progress-wrap" role="progressbar" aria-label="Progression de l’ingestion OpenRAG" hidden><div class="progress-track"><div id="cycle-progress-bar" class="progress-bar"></div></div><span id="cycle-progress-label" class="progress-label">Préparation…</span></div>
 <p id="inventory-completion" class="helper" role="status" hidden></p>
@@ -4432,7 +4569,7 @@ def render_status_page(
 <div class="section-heading"><div><h2>Configuration</h2><p>Accès techniques et identité héritée d’OpenRAG.</p></div></div>
 {identity_notice}
 <form method="post" action="/configuration" class="card" autocomplete="off"><div class="card-header"><div><h2 class="card-title">Services et ingestion</h2><p class="card-description">Configurez les adresses du connecteur et la concurrence d’ingestion.</p></div><span class="badge success">{url_configuration_state}</span></div>
-<div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="secret-grid"><label class="secret-field">URL interne de l’API OpenRAG<span class="secret-current">Service HTTP joignable depuis le cluster</span><input type="url" name="openrag_base_url" value="{openrag_base_url}" required spellcheck="false" autocomplete="url"></label><label class="secret-field">URL publique du connecteur<span class="secret-current">Adresse HTTPS sans chemin ni paramètres</span><input type="url" name="connector_public_url" value="{connector_public_url}" required spellcheck="false" autocomplete="url"></label><label class="secret-field">Taille du pool d’ingestion<span class="secret-current">De 1 à 6 tâches simultanées · valeur par défaut : 3</span><input type="number" name="ingestion_pool_size" value="{ingestion_pool_size}" min="1" max="6" step="1" required inputmode="numeric"></label></div><p class="helper">Ces valeurs sont conservées dans SQLite sur le PVC et deviennent actives immédiatement. Lors d’un changement de pool, les tâches déjà en cours se terminent puis le pool redémarre avec la nouvelle taille.</p></div>
+<div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="secret-grid"><label class="secret-field">URL interne de l’API OpenRAG<span class="secret-current">Service HTTP joignable depuis le cluster</span><input type="url" name="openrag_base_url" value="{openrag_base_url}" required spellcheck="false" autocomplete="url"></label><label class="secret-field">URL publique du connecteur<span class="secret-current">Adresse HTTPS sans chemin ni paramètres</span><input type="url" name="connector_public_url" value="{connector_public_url}" required spellcheck="false" autocomplete="url"></label><label class="secret-field">Taille du pool d’ingestion<span class="secret-current">De 1 à 6 tâches simultanées · valeur par défaut : 3</span><input type="number" name="ingestion_pool_size" value="{ingestion_pool_size}" min="1" max="6" step="1" required inputmode="numeric"></label></div><p class="helper">Ces valeurs sont conservées dans SQLite sur le PVC et deviennent actives immédiatement. Les slots sont ajustés sans interrompre les tâches déjà en cours.</p></div>
 <div class="card-footer"><button class="primary" type="submit">Enregistrer la configuration</button></div></form>
 <form method="post" action="/secrets" class="card" autocomplete="off"><div class="card-header"><div><h2 class="card-title">Clés API</h2><p class="card-description">Renouvelez séparément les accès OpenArchiver et OpenRAG.</p></div><span class="badge">OpenArchiver : {openarchiver_key_state} · OpenRAG : {openrag_key_state}</span></div>
 <div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="secret-grid"><label class="secret-field">Nouvelle clé OpenArchiver<span class="secret-current">Clé actuelle : {openarchiver_key_display}</span><input type="password" name="openarchiver_key" autocomplete="new-password"></label><label class="secret-field">Nouvelle clé OpenRAG<span class="secret-current">Clé actuelle : {openrag_key_display}</span><input type="password" name="openrag_key" autocomplete="new-password"></label></div><p class="helper">Laissez un champ vide pour conserver sa valeur actuelle. Seul le début des clés est affiché ; leur valeur complète n’est jamais placée dans la page ni enregistrée dans SQLite.</p></div>
@@ -4595,7 +4732,7 @@ def make_http_handler(
                 while True:
                     current_revision = state.revision()
                     if current_revision != revision:
-                        payload = render_live_status(state).rstrip("\n")
+                        payload = render_live_status(state, config).rstrip("\n")
                         event = (
                             f"id: {current_revision}\n"
                             f"event: status\n"
@@ -4700,7 +4837,7 @@ def make_http_handler(
                 elif path == "/status.json":
                     self._send(
                         200,
-                        render_live_status(state),
+                        render_live_status(state, config),
                         "application/json; charset=utf-8",
                     )
                 elif path == "/events":
