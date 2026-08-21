@@ -1480,16 +1480,21 @@ class ConnectorTests(unittest.TestCase):
                     )
                 )
 
-    def test_mail_rate_is_rendered_without_remote_pending_state(self):
+    def test_remaining_time_is_rendered_without_remote_queue_state(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
             state = connector.RuntimeState()
-            state.mail_rate_updated(73)
+            state.ingestion_estimate_updated(42, 3660)
             page = connector.render_status_page(config, state)
-            self.assertIn('id="mail-rate" class="stat-value">73</strong>', page)
+            self.assertIn(
+                'id="remaining-time" class="stat-value">1 h 01</strong>', page
+            )
+            self.assertIn("42 objet(s) restant(s)", page)
+            self.assertNotIn("mail(s) validé(s)/min", page)
             self.assertNotIn("pending du connecteur", page)
             status = json.loads(connector.render_live_status(state))
-            self.assertEqual(status["mails_per_minute"], 73)
+            self.assertEqual(status["remaining_items"], 42)
+            self.assertEqual(status["remaining_seconds"], 3660)
             self.assertFalse(any("queue" in key for key in status))
 
     def test_active_ingestions_expose_safe_name_size_and_status_in_ui(self):
@@ -1530,7 +1535,7 @@ class ConnectorTests(unittest.TestCase):
             self.assertNotIn("Facture <électricité>.eml", page)
             self.assertIn("renderActiveTasks(status.active_ingestions)", connector.UI_SCRIPT)
 
-    def test_mail_rate_counts_recent_validated_selected_emails_only(self):
+    def test_remaining_time_uses_recent_validated_selected_objects(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory), page_limit=10)
             self.select(config, "source-1")
@@ -1543,8 +1548,9 @@ class ConnectorTests(unittest.TestCase):
                                 self.mail("recent"),
                                 self.mail("old"),
                                 self.mail("failed"),
+                                self.mail("queued"),
                             ],
-                            "total": 3,
+                            "total": 4,
                         }
                     }
                 ),
@@ -1556,7 +1562,7 @@ class ConnectorTests(unittest.TestCase):
                     "WHERE id='recent'"
                 )
                 db.execute(
-                    "UPDATE emails SET status='validated', last_success_at=939 "
+                    "UPDATE emails SET status='validated', last_success_at=99 "
                     "WHERE id='old'"
                 )
                 db.execute(
@@ -1564,9 +1570,7 @@ class ConnectorTests(unittest.TestCase):
                     "WHERE id='failed'"
                 )
 
-            self.assertEqual(
-                connector.selected_mails_validated_last_minute(config, now=1000), 1
-            )
+            self.assertEqual(connector.selected_ingestion_estimate(config, now=1000), (1, 60))
 
     def test_reconciliation_restores_found_and_marks_missing_validated_lost(self):
         class ReconciliationOpenRAG:
@@ -2531,7 +2535,7 @@ class ConnectorTests(unittest.TestCase):
         self.assertEqual(selected_counts["emails"]["queued"], 1)
         self.assertEqual(attachment_mail_count, 1)
         self.assertIn("Mails dans la sélection", page)
-        self.assertIn("Débit récent", page)
+        self.assertIn("Temps restant estimé", page)
         self.assertIn("pas encore détaillées", page)
         self.assertIn("Historique local conservé : 2 mail(s)", page)
         self.assertIn("Les éléments hors sélection ne sont pas envoyés", page)

@@ -79,7 +79,8 @@ POOL_RECONFIGURE = threading.Event()
 SCHEMA_VERSION = 5
 SCHEMA_LOCK = threading.Lock()
 RECONCILE_BATCH_SIZE = 100
-MAIL_RATE_POLL_SECONDS = 1
+INGESTION_ESTIMATE_POLL_SECONDS = 1
+INGESTION_ESTIMATE_WINDOW_SECONDS = 15 * 60
 OPENRAG_TASK_POLL_SECONDS = 0.25
 API_KEY_DISPLAY_PREFIX_LENGTH = 12
 RUNTIME_OPENRAG_URL_KEY = "runtime_openrag_base_url"
@@ -3155,26 +3156,76 @@ def selected_queue_pending_count(config: Config) -> int:
     )
 
 
-def selected_mails_validated_last_minute(
+def selected_ingestion_estimate(
     config: Config, *, now: int | None = None
-) -> int:
-    """Débit glissant des mails sélectionnés réellement validés."""
-    cutoff = (int(time.time()) if now is None else now) - 60
+) -> tuple[int, int | None]:
+    """Retourne le nombre restant et une durée estimée en secondes.
+
+    Le débit observé inclut les mails et leurs pièces jointes validés dans
+    la sélection active. Une fenêtre de quinze minutes amortit les fortes
+    variations de durée entre un EML simple et un PDF complexe.
+    """
+    timestamp = int(time.time()) if now is None else now
+    cutoff = timestamp - INGESTION_ESTIMATE_WINDOW_SECONDS
+    pending = selected_queue_pending_count(config)
+    if pending <= 0:
+        return 0, 0
     with database(config) as db:
         row = db.execute(
             """
-            SELECT COUNT(*) FROM emails e
-            WHERE e.status='validated' AND e.last_success_at>=?
-              AND EXISTS (
-                SELECT 1 FROM sources s
-                JOIN mailboxes m
-                  ON m.source_id=e.source_id AND m.path=e.mailbox_path
-                WHERE s.id=e.source_id AND s.selected=1 AND m.selected=1
-              )
+            SELECT COUNT(*) AS completed, MIN(last_success_at) AS oldest FROM (
+                SELECT e.last_success_at
+                FROM emails e
+                WHERE e.status='validated' AND e.last_success_at>=?
+                  AND EXISTS (
+                    SELECT 1 FROM sources s
+                    JOIN mailboxes m
+                      ON m.source_id=e.source_id AND m.path=e.mailbox_path
+                    WHERE s.id=e.source_id AND s.selected=1 AND m.selected=1
+                  )
+                UNION ALL
+                SELECT a.last_success_at
+                FROM attachments a
+                WHERE a.status='validated' AND a.last_success_at>=?
+                  AND EXISTS (
+                    SELECT 1 FROM email_attachments ea
+                    JOIN emails e ON e.id=ea.email_id
+                    JOIN sources s ON s.id=e.source_id
+                    JOIN mailboxes m
+                      ON m.source_id=e.source_id AND m.path=e.mailbox_path
+                    WHERE ea.attachment_id=a.id
+                      AND s.selected=1 AND m.selected=1
+                  )
+            ) recent
             """,
-            (cutoff,),
+            (cutoff, cutoff),
         ).fetchone()
-    return int(row[0]) if row else 0
+    completed = int(row["completed"] or 0) if row else 0
+    if completed <= 0:
+        return pending, None
+    oldest = int(row["oldest"] or timestamp)
+    observed_seconds = min(
+        INGESTION_ESTIMATE_WINDOW_SECONDS,
+        max(60, timestamp - oldest),
+    )
+    remaining_seconds = max(1, round(pending * observed_seconds / completed))
+    return pending, remaining_seconds
+
+
+def format_remaining_time(pending: int, remaining_seconds: int | None) -> str:
+    """Formate une estimation compacte adaptée à la carte de statut."""
+    if pending <= 0:
+        return "Terminé"
+    if remaining_seconds is None:
+        return "Calcul en cours…"
+    minutes = max(1, round(remaining_seconds / 60))
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, remaining_minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours} h {remaining_minutes:02d}"
+    days, remaining_hours = divmod(hours, 24)
+    return f"{days} j {remaining_hours} h"
 
 
 def active_ingestion_tasks(config: Config) -> list[dict[str, object]]:
@@ -3239,7 +3290,8 @@ class RuntimeState:
         self.reconciliation_restored = 0
         self.reconciliation_lost = 0
         self.reconciliation_error = ""
-        self.mails_per_minute = 0
+        self.remaining_items = 0
+        self.remaining_seconds: int | None = None
         self.active_ingestions: list[dict[str, object]] = []
         self.ingestion_concurrency_effective = 0
         self.ready = False
@@ -3373,12 +3425,16 @@ class RuntimeState:
             self.reconciliation_error = _safe_error(error)
             self._notify_changed()
 
-    def mail_rate_updated(self, mails_per_minute: int) -> None:
-        """Publie le débit récent calculé dans la base locale."""
+    def ingestion_estimate_updated(
+        self, remaining_items: int, remaining_seconds: int | None
+    ) -> None:
+        """Publie l'estimation du temps nécessaire pour vider la sélection."""
         with self.changed:
-            value = max(0, mails_per_minute)
-            if value != self.mails_per_minute:
-                self.mails_per_minute = value
+            items = max(0, remaining_items)
+            seconds = None if remaining_seconds is None else max(0, remaining_seconds)
+            if items != self.remaining_items or seconds != self.remaining_seconds:
+                self.remaining_items = items
+                self.remaining_seconds = seconds
                 self._notify_changed()
 
     def active_ingestions_updated(
@@ -3436,7 +3492,8 @@ class RuntimeState:
                 "reconciliation_restored": self.reconciliation_restored,
                 "reconciliation_lost": self.reconciliation_lost,
                 "reconciliation_error": self.reconciliation_error,
-                "mails_per_minute": self.mails_per_minute,
+                "remaining_items": self.remaining_items,
+                "remaining_seconds": self.remaining_seconds,
                 "active_ingestions": [dict(task) for task in self.active_ingestions],
                 "ingestion_concurrency_effective": self.ingestion_concurrency_effective,
                 "ready": self.ready,
@@ -3690,17 +3747,17 @@ def reconciliation_loop(
             LOG.error("réconciliation OpenRAG en échec: %s", _safe_error(error))
 
 
-def mail_rate_monitor_loop(
+def ingestion_estimate_monitor_loop(
     config: Config,
     state: RuntimeState,
     *,
     stop: threading.Event = STOP,
-    poll_seconds: float = MAIL_RATE_POLL_SECONDS,
+    poll_seconds: float = INGESTION_ESTIMATE_POLL_SECONDS,
 ) -> None:
-    """Actualise le débit et les tâches actives depuis SQLite uniquement."""
+    """Actualise l'estimation et les tâches actives depuis SQLite uniquement."""
     while not stop.is_set():
         try:
-            state.mail_rate_updated(selected_mails_validated_last_minute(config))
+            state.ingestion_estimate_updated(*selected_ingestion_estimate(config))
             state.active_ingestions_updated(active_ingestion_tasks(config))
         except Exception as error:
             LOG.warning("actualisation de l'état d'ingestion impossible: %s", _safe_error(error))
@@ -3875,7 +3932,8 @@ def render_live_status(state: RuntimeState, config: Config | None = None) -> str
             "reconciliation_restored": int(snapshot["reconciliation_restored"]),
             "reconciliation_lost": int(snapshot["reconciliation_lost"]),
             "reconciliation_error": str(snapshot["reconciliation_error"] or ""),
-            "mails_per_minute": int(snapshot["mails_per_minute"]),
+            "remaining_items": int(snapshot["remaining_items"]),
+            "remaining_seconds": snapshot["remaining_seconds"],
             "active_ingestions": active,
         },
         ensure_ascii=False,
@@ -3947,7 +4005,8 @@ UI_SCRIPT = r"""(() => {
   const inventoryProgressWrap = document.getElementById("inventory-cycle-progress");
   const inventoryProgressBar = document.getElementById("inventory-cycle-progress-bar");
   const inventoryProgressLabel = document.getElementById("inventory-cycle-progress-label");
-  const mailRate = document.getElementById("mail-rate");
+  const remainingTime = document.getElementById("remaining-time");
+  const remainingDetail = document.getElementById("remaining-detail");
   const activeTaskCount = document.getElementById("active-task-count");
   const activeTaskList = document.getElementById("active-task-list");
   const reconciliationButton = document.getElementById("reconciliation-button");
@@ -4099,7 +4158,25 @@ UI_SCRIPT = r"""(() => {
           "Dernière synchro : Jamais exécutée";
       }
       if (processed) processed.textContent = status.last_processed + " objet(s) au dernier cycle";
-      if (mailRate) mailRate.textContent = String(Number(status.mails_per_minute || 0));
+      if (remainingTime) {
+        const pending = Number(status.remaining_items || 0);
+        const seconds = status.remaining_seconds == null ? null : Number(status.remaining_seconds);
+        if (pending <= 0) remainingTime.textContent = "Terminé";
+        else if (seconds == null) remainingTime.textContent = "Calcul en cours…";
+        else {
+          const minutes = Math.max(1, Math.round(seconds / 60));
+          if (minutes < 60) remainingTime.textContent = minutes + " min";
+          else {
+            const hours = Math.floor(minutes / 60);
+            const rest = minutes % 60;
+            remainingTime.textContent = hours < 24 ?
+              hours + " h " + String(rest).padStart(2, "0") :
+              Math.floor(hours / 24) + " j " + (hours % 24) + " h";
+          }
+        }
+        if (remainingDetail) remainingDetail.textContent =
+          pending + " objet(s) restant(s) · estimation sur 15 min";
+      }
       renderActiveTasks(status.active_ingestions);
       const updateProgress = (wrap, bar, label, visible) => {
         if (!wrap || !bar || !label) return;
@@ -4536,7 +4613,7 @@ def render_status_page(
 <div class="stat-card"><span class="stat-label"><span class="dot {status_class}"></span>Service</span><strong id="service-status" class="stat-value">{ready}</strong><span id="last-sync" class="stat-detail">Dernière synchro : {last_sync}</span></div>
 <div class="stat-card"><span class="stat-label"><span class="dot {activity_class}"></span>Indexation</span><strong class="stat-value">{activity}</strong><span id="last-processed" class="stat-detail">{int(snapshot["last_processed"])} objet(s) au dernier cycle · pool manuel : {effective_concurrency}</span></div>
 <div class="stat-card"><span class="stat-label">Mails dans la sélection</span><strong id="mail-count" class="stat-value">{email_total}</strong><span id="mailbox-selected-count" class="stat-detail">{selected_mailboxes} dossier(s) sélectionné(s)</span></div>
-<div class="stat-card"><span class="stat-label">Débit récent</span><strong id="mail-rate" class="stat-value">{int(snapshot["mails_per_minute"])}</strong><span class="stat-detail">mail(s) validé(s)/min</span></div>
+<div class="stat-card"><span class="stat-label">Temps restant estimé</span><strong id="remaining-time" class="stat-value">{format_remaining_time(int(snapshot["remaining_items"]), snapshot["remaining_seconds"])}</strong><span id="remaining-detail" class="stat-detail">{int(snapshot["remaining_items"])} objet(s) restant(s) · estimation sur 15 min</span></div>
 </section>
 <section class="card" aria-labelledby="active-task-title"><div class="card-header"><div><h2 id="active-task-title" class="card-title">Tâches en cours</h2><p class="card-description">Documents actuellement détenus par les slots du connecteur.</p></div><span id="active-task-count" class="badge">{len(active_tasks)} active(s)</span></div>
 <div class="card-body"><div id="active-task-list" class="active-task-list" aria-live="polite">{render_active_ingestion_tasks(active_tasks)}</div></div></section>
@@ -5091,13 +5168,13 @@ def main() -> None:
         daemon=True,
     )
     reconciliation_worker.start()
-    mail_rate_worker = threading.Thread(
-        target=mail_rate_monitor_loop,
+    estimate_worker = threading.Thread(
+        target=ingestion_estimate_monitor_loop,
         args=(config, state),
-        name="mail-rate-monitor",
+        name="ingestion-estimate-monitor",
         daemon=True,
     )
-    mail_rate_worker.start()
+    estimate_worker.start()
     server = ThreadingHTTPServer(
         (config.http_host, config.http_port), make_http_handler(config, state)
     )
@@ -5113,7 +5190,7 @@ def main() -> None:
         server.server_close()
         worker.join(timeout=5)
         reconciliation_worker.join(timeout=5)
-        mail_rate_worker.join(timeout=5)
+        estimate_worker.join(timeout=5)
 
 
 if __name__ == "__main__":
