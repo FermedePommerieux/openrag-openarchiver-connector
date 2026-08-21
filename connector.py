@@ -76,7 +76,7 @@ STOP = threading.Event()
 WAKE = threading.Event()
 RECONCILE_WAKE = threading.Event()
 POOL_RECONFIGURE = threading.Event()
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SCHEMA_LOCK = threading.Lock()
 RECONCILE_BATCH_SIZE = 100
 MAIL_RATE_POLL_SECONDS = 5
@@ -828,6 +828,8 @@ def connect_db(config: Config) -> sqlite3.Connection:
             ON emails(status, next_retry_at);
         CREATE INDEX IF NOT EXISTS attachments_queue
             ON attachments(status, next_retry_at);
+        CREATE INDEX IF NOT EXISTS email_attachments_by_attachment
+            ON email_attachments(attachment_id, email_id);
             """
         )
         email_columns = {

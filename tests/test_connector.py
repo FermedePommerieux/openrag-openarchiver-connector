@@ -518,6 +518,12 @@ class ConnectorTests(unittest.TestCase):
                 email_columns = {
                     row["name"] for row in db.execute("PRAGMA table_info(emails)")
                 }
+                indexes = {
+                    row[0]
+                    for row in db.execute(
+                        "SELECT name FROM sqlite_master WHERE type='index'"
+                    )
+                }
                 db.close()
             self.assertTrue(
                 {
@@ -533,6 +539,7 @@ class ConnectorTests(unittest.TestCase):
                 <= tables
             )
             self.assertIn("sha256", email_columns)
+            self.assertIn("email_attachments_by_attachment", indexes)
             self.assertIn("mailbox_path", email_columns)
             version_db = connector.connect_db(config)
             try:
