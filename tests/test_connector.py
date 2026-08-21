@@ -209,7 +209,7 @@ class ConnectorTests(unittest.TestCase):
             self.assertIsNone(defaults.ingestion_concurrency)
             self.assertEqual(defaults.ingestion_concurrency_fallback, 2)
             self.assertEqual(defaults.ingestion_concurrency_max, 8)
-            self.assertEqual(defaults.ingestion_prefetch_per_worker, 2)
+            self.assertEqual(defaults.ingestion_prefetch_per_worker, 1)
             self.assertEqual(
                 defaults.docling_metrics_url,
                 "http://docling-serve.docling.svc.cluster.local:5001/metrics",
@@ -463,7 +463,7 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             self.assertEqual(snapshot["ingestion_concurrency_effective"], 3)
             self.assertTrue(snapshot["worker_detection_success"])
 
-    def test_automatic_concurrency_prefetches_two_tasks_per_worker(self):
+    def test_automatic_concurrency_never_exceeds_detected_workers(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(
                 Path(directory),
@@ -472,7 +472,16 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                 ingestion_prefetch_per_worker=2,
             )
             with mock.patch.object(connector, "detect_docling_workers", return_value=3):
-                self.assertEqual(connector.effective_ingestion_concurrency(config), 6)
+                self.assertEqual(connector.effective_ingestion_concurrency(config), 3)
+
+    def test_fixed_concurrency_remains_an_explicit_operator_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(
+                Path(directory),
+                ingestion_concurrency=8,
+                ingestion_concurrency_max=8,
+            )
+            self.assertEqual(connector.effective_ingestion_concurrency(config), 8)
 
     def test_automatic_concurrency_stops_at_zero_and_falls_back_on_error(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -488,7 +497,7 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                 "detect_docling_workers",
                 side_effect=OSError("metrics indisponibles"),
             ):
-                self.assertEqual(connector.effective_ingestion_concurrency(config), 2)
+                self.assertEqual(connector.effective_ingestion_concurrency(config), 0)
 
     def test_secret_rotation_is_atomic_and_only_renders_safe_prefixes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3034,6 +3043,86 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             for thread in threads:
                 thread.join()
             self.assertEqual(sum(result is not None for result in results), 1)
+
+    def test_process_queue_keeps_slot_alive_after_claim_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory), ingestion_concurrency=1)
+            item = connector.WorkItem("email", "mail-1", 1)
+            with (
+                mock.patch.object(
+                    connector,
+                    "claim_next",
+                    side_effect=[sqlite3.OperationalError("database is locked"), item, None],
+                ),
+                mock.patch.object(connector, "process_work_item") as process,
+                mock.patch.object(connector.time, "sleep") as sleep,
+                mock.patch.object(connector, "selected_queue_pending_count", return_value=1),
+            ):
+                processed = connector.process_queue(
+                    config, FakeArchive(), FakeOpenRAG()
+                )
+
+            self.assertEqual(processed, 1)
+            process.assert_called_once_with(
+                config, item, mock.ANY, mock.ANY
+            )
+            sleep.assert_called_once_with(1.0)
+
+    def test_process_queue_keeps_slot_alive_after_unhandled_processing_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory), ingestion_concurrency=1)
+            first = connector.WorkItem("email", "mail-1", 1)
+            second = connector.WorkItem("email", "mail-2", 1)
+            with (
+                mock.patch.object(
+                    connector, "claim_next", side_effect=[first, second, None]
+                ),
+                mock.patch.object(
+                    connector,
+                    "process_work_item",
+                    side_effect=[RuntimeError("unexpected"), None],
+                ) as process,
+                mock.patch.object(connector.time, "sleep") as sleep,
+                mock.patch.object(connector, "selected_queue_pending_count", return_value=2),
+            ):
+                processed = connector.process_queue(
+                    config, FakeArchive(), FakeOpenRAG()
+                )
+
+            self.assertEqual(processed, 1)
+            self.assertEqual(process.call_count, 2)
+            sleep.assert_called_once_with(1.0)
+
+    def test_process_queue_ignores_progress_callback_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory), ingestion_concurrency=1)
+            first = connector.WorkItem("email", "mail-1", 1)
+            second = connector.WorkItem("email", "mail-2", 1)
+            progress_calls = 0
+
+            def progress(_current, _total):
+                nonlocal progress_calls
+                progress_calls += 1
+                if progress_calls == 2:
+                    raise RuntimeError("UI unavailable")
+
+            with (
+                mock.patch.object(
+                    connector, "claim_next", side_effect=[first, second, None]
+                ),
+                mock.patch.object(connector, "process_work_item") as process,
+                mock.patch.object(connector, "selected_queue_pending_count", return_value=2),
+            ):
+                processed = connector.process_queue(
+                    config,
+                    FakeArchive(),
+                    FakeOpenRAG(),
+                    progress=progress,
+                )
+
+            self.assertEqual(processed, 2)
+            self.assertEqual(process.call_count, 2)
+            self.assertEqual(progress_calls, 3)
 
     def test_no_automatic_delete_and_logs_exclude_keys_and_bodies(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
