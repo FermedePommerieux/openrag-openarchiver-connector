@@ -33,7 +33,6 @@ import os
 import re
 import signal
 import sqlite3
-import ssl
 import tempfile
 import threading
 import time
@@ -73,13 +72,10 @@ ALL_STATUSES = (
 )
 DEFAULT_EXTENSIONS = ".asc,.asciidoc,.adoc,.csv,.docx,.htm,.html,.md,.pdf,.txt,.xlsx"
 SAFE_EXTENSION = re.compile(r"^\.[a-z0-9]{1,10}$")
-RQ_WORKER_METRIC = re.compile(
-    r"^rq_workers\{(?P<labels>.*)\}\s+(?P<value>[0-9.eE+-]+)$"
-)
-PROMETHEUS_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
 STOP = threading.Event()
 WAKE = threading.Event()
 RECONCILE_WAKE = threading.Event()
+POOL_RECONFIGURE = threading.Event()
 SCHEMA_VERSION = 4
 SCHEMA_LOCK = threading.Lock()
 RECONCILE_BATCH_SIZE = 100
@@ -88,6 +84,9 @@ OPENRAG_TASK_POLL_SECONDS = 0.25
 API_KEY_DISPLAY_PREFIX_LENGTH = 12
 RUNTIME_OPENRAG_URL_KEY = "runtime_openrag_base_url"
 RUNTIME_CONNECTOR_URL_KEY = "runtime_connector_public_url"
+RUNTIME_POOL_SIZE_KEY = "runtime_ingestion_pool_size"
+MIN_INGESTION_POOL_SIZE = 1
+MAX_INGESTION_POOL_SIZE = 6
 CONFIG_LOCK = threading.RLock()
 
 
@@ -184,22 +183,8 @@ class Config:
     retry_max_seconds: int = 3600
     supported_extensions: frozenset[str] = frozenset(DEFAULT_EXTENSIONS.split(","))
     openarchiver_requests_per_minute: int = 90
-    ingestion_concurrency: int | None = None
-    ingestion_concurrency_fallback: int = 2
-    ingestion_concurrency_max: int = 8
-    ingestion_prefetch_per_worker: int = 1
-    docling_metrics_url: str = (
-        "http://docling-serve.docling.svc.cluster.local:5001/metrics"
-    )
-    docling_workload_url: str = ""
-    kubernetes_token_file: Path = Path(
-        "/var/run/secrets/kubernetes.io/serviceaccount/token"
-    )
-    kubernetes_ca_file: Path = Path(
-        "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-    )
-    docling_metrics_timeout: int = 5
-    docling_queue_name: str = "convert"
+    ingestion_concurrency: int = 3
+    ingestion_concurrency_max: int = 6
     page_limit: int = 250
     openarchiver_link_template: str = ""
     openarchiver_source_url_template: str = ""
@@ -218,12 +203,22 @@ class Config:
             )
             if item.strip()
         )
-        concurrency_max = max(1, int(values.get("INGESTION_CONCURRENCY_MAX", "8")))
-        concurrency_value = values.get("INGESTION_CONCURRENCY", "auto").strip().lower()
+        concurrency_max = min(
+            MAX_INGESTION_POOL_SIZE,
+            max(
+                MIN_INGESTION_POOL_SIZE,
+                int(values.get("INGESTION_CONCURRENCY_MAX", "6")),
+            ),
+        )
+        concurrency_value = values.get("INGESTION_CONCURRENCY", "3").strip().lower()
+        # ``auto`` était l'ancienne valeur de déploiement. Elle migre vers le
+        # nouveau défaut manuel afin qu'une mise à jour ne bloque pas le service.
         ingestion_concurrency = (
-            None
-            if concurrency_value == "auto"
-            else min(concurrency_max, max(1, int(concurrency_value)))
+            3 if concurrency_value == "auto" else int(concurrency_value)
+        )
+        ingestion_concurrency = min(
+            concurrency_max,
+            max(MIN_INGESTION_POOL_SIZE, ingestion_concurrency),
         )
         config = cls(
             openarchiver_base_url=values.get(
@@ -283,35 +278,7 @@ class Config:
                 1, int(values.get("OPENARCHIVER_REQUESTS_PER_MINUTE", "90"))
             ),
             ingestion_concurrency=ingestion_concurrency,
-            ingestion_concurrency_fallback=min(
-                concurrency_max,
-                max(1, int(values.get("INGESTION_CONCURRENCY_FALLBACK", "2"))),
-            ),
             ingestion_concurrency_max=concurrency_max,
-            ingestion_prefetch_per_worker=max(
-                1, int(values.get("INGESTION_PREFETCH_PER_WORKER", "1"))
-            ),
-            docling_metrics_url=values.get(
-                "DOCLING_METRICS_URL",
-                "http://docling-serve.docling.svc.cluster.local:5001/metrics",
-            ),
-            docling_workload_url=values.get("DOCLING_WORKLOAD_URL", "").rstrip("/"),
-            kubernetes_token_file=Path(
-                values.get(
-                    "KUBERNETES_TOKEN_FILE",
-                    "/var/run/secrets/kubernetes.io/serviceaccount/token",
-                )
-            ),
-            kubernetes_ca_file=Path(
-                values.get(
-                    "KUBERNETES_CA_FILE",
-                    "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-                )
-            ),
-            docling_metrics_timeout=max(
-                1, int(values.get("DOCLING_METRICS_TIMEOUT_SECONDS", "5"))
-            ),
-            docling_queue_name=values.get("DOCLING_RQ_QUEUE_NAME", "convert"),
             page_limit=max(1, int(values.get("OPENARCHIVER_PAGE_LIMIT", "250"))),
             openarchiver_link_template=values.get("OPENARCHIVER_LINK_TEMPLATE", ""),
             openarchiver_source_url_template=values.get(
@@ -329,11 +296,6 @@ class Config:
             config.openarchiver_base_url, "OPENARCHIVER_BASE_URL"
         )
         _validate_internal_http_url(config.openrag_base_url, "OPENRAG_BASE_URL")
-        _validate_internal_http_url(config.docling_metrics_url, "DOCLING_METRICS_URL")
-        if config.docling_workload_url:
-            _validate_internal_service_url(
-                config.docling_workload_url, "DOCLING_WORKLOAD_URL"
-            )
         if not config.openrag_ingest_directory.is_absolute():
             raise ValueError("OPENRAG_INGEST_DIRECTORY doit être un chemin absolu")
         if config.openrag_ingest_mode not in {"auto", "path", "api"}:
@@ -380,28 +342,6 @@ def _validate_internal_http_url(value: str, variable: str) -> None:
     )
     if parsed.scheme != "http" or not internal or parsed.username or parsed.password:
         raise ValueError(f"{variable} doit être une URL HTTP interne sans identifiants")
-
-
-def _validate_internal_service_url(value: str, variable: str) -> None:
-    """Valide une URL de service interne HTTP ou HTTPS sans identifiants."""
-
-    parsed = urllib.parse.urlsplit(value)
-    host = (parsed.hostname or "").lower()
-    internal = (
-        host in {"localhost", "127.0.0.1", "::1"}
-        or host.endswith(".svc")
-        or host.endswith(".svc.cluster.local")
-        or (host and "." not in host)
-    )
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not internal
-        or parsed.username
-        or parsed.password
-    ):
-        raise ValueError(
-            f"{variable} doit être une URL HTTP(S) interne sans identifiants"
-        )
 
 
 def _validate_connector_public_url(value: str) -> None:
@@ -1081,6 +1021,65 @@ def set_paused(config: Config, paused: bool) -> None:
             "INSERT OR REPLACE INTO settings(key,value) VALUES ('paused',?)",
             ("1" if paused else "0",),
         )
+
+
+def normalize_runtime_pool_size(value: object) -> int:
+    """Valide la taille manuelle du pool exposée dans l'interface."""
+
+    try:
+        size = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise ConnectorError("la taille du pool doit être un entier") from None
+    if not MIN_INGESTION_POOL_SIZE <= size <= MAX_INGESTION_POOL_SIZE:
+        raise ConnectorError(
+            f"la taille du pool doit être comprise entre "
+            f"{MIN_INGESTION_POOL_SIZE} et {MAX_INGESTION_POOL_SIZE}"
+        )
+    return size
+
+
+def apply_runtime_pool_size(config: Config, value: object) -> int:
+    """Active une taille manuelle validée et demande un nouveau pool."""
+
+    size = normalize_runtime_pool_size(value)
+    with CONFIG_LOCK:
+        config.ingestion_concurrency = size
+    POOL_RECONFIGURE.set()
+    return size
+
+
+def persist_runtime_pool_size(config: Config, value: object) -> int:
+    """Conserve la taille du pool sur le PVC puis l'active sans redémarrage."""
+
+    size = normalize_runtime_pool_size(value)
+    with database(config) as db:
+        db.execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)",
+            (RUNTIME_POOL_SIZE_KEY, str(size)),
+        )
+    return apply_runtime_pool_size(config, size)
+
+
+def restore_runtime_pool_size(config: Config) -> bool:
+    """Restaure le réglage manuel ou conserve le défaut du Deployment."""
+
+    with database(config) as db:
+        row = db.execute(
+            "SELECT value FROM settings WHERE key=?", (RUNTIME_POOL_SIZE_KEY,)
+        ).fetchone()
+    if row is None:
+        return False
+    with CONFIG_LOCK:
+        config.ingestion_concurrency = normalize_runtime_pool_size(row[0])
+    return True
+
+
+def runtime_pool_size_is_persisted(config: Config) -> bool:
+    with database(config) as db:
+        row = db.execute(
+            "SELECT 1 FROM settings WHERE key=?", (RUNTIME_POOL_SIZE_KEY,)
+        ).fetchone()
+    return row is not None
 
 
 def normalize_runtime_urls(
@@ -2991,148 +2990,19 @@ def _safe_error(error: Exception) -> str:
     return error.__class__.__name__
 
 
-def parse_docling_worker_metrics(metrics: str, queue_name: str) -> int:
-    """Compte les workers RQ enregistrés pour une installation hors Kubernetes.
-
-    RQ conserve les workers interrompus pendant plusieurs heures. Cette
-    métrique n'est donc utilisée qu'en repli lorsque ``DOCLING_WORKLOAD_URL``
-    n'est pas configurée ; Kubernetes fournit une capacité plus fiable via
-    l'état réel du Deployment.
-    """
-    family_present = False
-    workers = 0
-    for line in metrics.splitlines():
-        line = line.strip()
-        if line.startswith("# HELP rq_workers ") or line == "# TYPE rq_workers gauge":
-            family_present = True
-            continue
-        match = RQ_WORKER_METRIC.match(line)
-        if not match:
-            continue
-        family_present = True
-        labels = dict(PROMETHEUS_LABEL.findall(match.group("labels")))
-        queues = {item.strip() for item in labels.get("queues", "").split(",")}
-        if queue_name not in queues or labels.get("state") == "suspended":
-            continue
-        workers += max(0, int(float(match.group("value"))))
-    if not family_present:
-        raise RuntimeError("métrique rq_workers absente de la réponse Docling")
-    return workers
-
-
-def parse_docling_workload(payload: bytes) -> int:
-    """Retourne le nombre de réplicas Docling réellement prêts et disponibles."""
-
-    try:
-        workload = json.loads(payload)
-        metadata = workload["metadata"]
-        status = workload["status"]
-        generation = int(metadata["generation"])
-        observed_generation = int(status.get("observedGeneration", 0))
-        ready = max(0, int(status.get("readyReplicas", 0)))
-        available = max(0, int(status.get("availableReplicas", 0)))
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-        raise RuntimeError("état Kubernetes Docling invalide") from error
-
-    # Pendant une réconciliation, un statut d'une génération antérieure ne
-    # doit pas autoriser de nouveaux travaux sur une capacité devenue fausse.
-    if observed_generation < generation:
-        return 0
-    return min(ready, available)
-
-
-def detect_docling_kubernetes_workers(config: Config) -> int:
-    """Lit en lecture seule la capacité effective du Deployment Docling."""
-
-    token = config.kubernetes_token_file.read_text(encoding="utf-8").strip()
-    if not token:
-        raise RuntimeError("jeton Kubernetes vide")
-    request = urllib.request.Request(
-        config.docling_workload_url,
-        headers={
-            "Accept": "application/json",
-            "Authorization": f"Bearer {token}",
-        },
-    )
-    context = ssl.create_default_context(cafile=str(config.kubernetes_ca_file))
-    with urllib.request.urlopen(
-        request,
-        timeout=config.docling_metrics_timeout,
-        context=context,
-    ) as response:
-        payload = response.read(1_000_001)
-    if len(payload) > 1_000_000:
-        raise RuntimeError("réponse Kubernetes Docling trop volumineuse")
-    return parse_docling_workload(payload)
-
-
-def detect_docling_workers(config: Config) -> int:
-    if config.docling_workload_url:
-        return detect_docling_kubernetes_workers(config)
-    request = urllib.request.Request(
-        config.docling_metrics_url,
-        headers={"Accept": "text/plain"},
-    )
-    with urllib.request.urlopen(
-        request, timeout=config.docling_metrics_timeout
-    ) as response:
-        payload = response.read(2_000_001)
-    if len(payload) > 2_000_000:
-        raise RuntimeError("réponse métriques Docling trop volumineuse")
-    return parse_docling_worker_metrics(
-        payload.decode("utf-8", errors="replace"),
-        config.docling_queue_name,
-    )
-
-
 def effective_ingestion_concurrency(
     config: Config, state: RuntimeState | None = None
 ) -> int:
-    """Plafonne le pool automatique au nombre de workers Docling détectés.
+    """Retourne la taille manuelle du pool, toujours comprise entre 1 et 6."""
 
-    Le déploiement utilise ce mode automatique. La valeur fixe reste une
-    dérogation opérateur explicite utile aux tests et au dépannage. Si les
-    métriques sont indisponibles en mode automatique, aucune nouvelle
-    ingestion n'est lancée : un repli positif ne permettrait pas de garantir
-    cette propriété de sûreté.
-    """
-
-    detected = -1
-    detection_success = False
-    if config.ingestion_concurrency is not None:
-        # Le mode fixe reste une dérogation opérateur explicite. Le déploiement
-        # de production utilise le mode auto ci-dessous, qui porte la garantie
-        # stricte un thread par worker.
-        effective = min(config.ingestion_concurrency, config.ingestion_concurrency_max)
-    else:
-        try:
-            detected = detect_docling_workers(config)
-            detection_success = True
-            effective = min(detected, config.ingestion_concurrency_max)
-            if effective == 0:
-                LOG.warning(
-                    "aucun worker Docling disponible; aucune nouvelle ingestion"
-                )
-            else:
-                LOG.info(
-                    "%d worker(s) Docling disponible(s); concurrence effective=%d "
-                    "(maximum un thread par worker)",
-                    detected,
-                    effective,
-                )
-        except Exception as error:
-            effective = 0
-            LOG.warning(
-                "détection des workers Docling impossible (%s); "
-                "aucune nouvelle ingestion",
-                _safe_error(error),
-            )
-    if state is not None:
-        state.worker_detection_updated(
-            detected=detected,
-            effective=effective,
-            success=detection_success,
+    with CONFIG_LOCK:
+        effective = min(
+            MAX_INGESTION_POOL_SIZE,
+            config.ingestion_concurrency_max,
+            max(MIN_INGESTION_POOL_SIZE, int(config.ingestion_concurrency)),
         )
+    if state is not None:
+        state.ingestion_concurrency_updated(effective)
     return effective
 
 
@@ -3145,15 +3015,13 @@ def process_queue(
 ) -> int:
     """Vide la file locale avec la concurrence calculée pour ce cycle.
 
-    Chaque thread ne garde qu'un objet à la fois. En mode automatique, le
-    nombre de threads ne dépasse jamais le nombre de workers Docling détectés
-    ni ``INGESTION_CONCURRENCY_MAX``. Aucune heuristique liée à la taille ou à
-    l'OCR n'est appliquée ici.
+    Chaque thread ne garde qu'un objet à la fois. La taille manuelle est bornée
+    entre 1 et 6. Aucune heuristique liée à la taille ou à l'OCR n'est
+    appliquée ici.
     """
 
     workers = effective_ingestion_concurrency(config, state)
-    if workers == 0:
-        return 0
+    POOL_RECONFIGURE.clear()
     progress_lock = threading.Lock()
     processed_total = 0
     initial_total = selected_queue_pending_count(config)
@@ -3174,6 +3042,11 @@ def process_queue(
         processed = 0
         consecutive_errors = 0
         while True:
+            # Un changement depuis l'interface laisse finir chaque objet déjà
+            # réservé, puis ferme ce pool. La boucle runtime en recrée un avec
+            # la nouvelle taille sans perdre de tâche en cours.
+            if POOL_RECONFIGURE.is_set():
+                return processed
             try:
                 item = claim_next(config)
             except Exception:
@@ -3297,10 +3170,7 @@ class RuntimeState:
         self.reconciliation_lost = 0
         self.reconciliation_error = ""
         self.mails_per_minute = 0
-        self.docling_workers_detected = -1
         self.ingestion_concurrency_effective = 0
-        self.worker_detection_success = False
-        self.worker_detection_at = 0
         self.ready = False
         self.running = False
 
@@ -3323,14 +3193,11 @@ class RuntimeState:
             self.changed.wait_for(lambda: self._revision != revision, timeout)
             return self._revision
 
-    def worker_detection_updated(
-        self, *, detected: int, effective: int, success: bool
-    ) -> None:
+    def ingestion_concurrency_updated(self, effective: int) -> None:
+        """Publie la taille effective du pool manuel dans l'état live."""
+
         with self.changed:
-            self.docling_workers_detected = detected
             self.ingestion_concurrency_effective = effective
-            self.worker_detection_success = success
-            self.worker_detection_at = int(time.time())
             self._notify_changed()
 
     def restore_cycle(
@@ -3489,10 +3356,7 @@ class RuntimeState:
                 "reconciliation_lost": self.reconciliation_lost,
                 "reconciliation_error": self.reconciliation_error,
                 "mails_per_minute": self.mails_per_minute,
-                "docling_workers_detected": self.docling_workers_detected,
                 "ingestion_concurrency_effective": self.ingestion_concurrency_effective,
-                "worker_detection_success": self.worker_detection_success,
-                "worker_detection_at": self.worker_detection_at,
                 "ready": self.ready,
                 "running": self.running,
             }
@@ -4355,14 +4219,7 @@ def render_status_page(
     pause_label = "Reprendre l’indexation" if paused else "Mettre en pause"
     pause_action = "resume" if paused else "pause"
     activity = "En pause" if paused else "Active"
-    concurrency_mode = "auto" if config.ingestion_concurrency is None else "fixe"
     effective_concurrency = int(snapshot["ingestion_concurrency_effective"])
-    detected_workers = int(snapshot["docling_workers_detected"])
-    worker_label = (
-        str(detected_workers)
-        if snapshot["worker_detection_success"]
-        else "indisponible"
-    )
     inventory_running = bool(snapshot["cycle_in_progress"])
     inventory_requested = bool(snapshot["cycle_requested_at"])
     current_stage = cycle_stage(snapshot)
@@ -4418,9 +4275,11 @@ def render_status_page(
     )
     openrag_base_url = html.escape(config.openrag_base_url, quote=True)
     connector_public_url = html.escape(config.connector_public_url, quote=True)
+    ingestion_pool_size = normalize_runtime_pool_size(config.ingestion_concurrency)
     url_configuration_state = (
         "Enregistrée sur le PVC"
         if runtime_urls_are_persisted(config)
+        and runtime_pool_size_is_persisted(config)
         else "Amorçage Rancher/Fleet"
     )
     status_class = "success" if snapshot["ready"] else "danger"
@@ -4498,7 +4357,7 @@ def render_status_page(
 {error_alert}
 <section class="status-grid" aria-label="État du connecteur">
 <div class="stat-card"><span class="stat-label"><span class="dot {status_class}"></span>Service</span><strong id="service-status" class="stat-value">{ready}</strong><span id="last-sync" class="stat-detail">Dernière synchro : {last_sync}</span></div>
-<div class="stat-card"><span class="stat-label"><span class="dot {activity_class}"></span>Indexation</span><strong class="stat-value">{activity}</strong><span id="last-processed" class="stat-detail">{int(snapshot["last_processed"])} objet(s) au dernier cycle · concurrence {concurrency_mode} : {effective_concurrency} · workers Docling : {worker_label}</span></div>
+<div class="stat-card"><span class="stat-label"><span class="dot {activity_class}"></span>Indexation</span><strong class="stat-value">{activity}</strong><span id="last-processed" class="stat-detail">{int(snapshot["last_processed"])} objet(s) au dernier cycle · pool manuel : {effective_concurrency}</span></div>
 <div class="stat-card"><span class="stat-label">Mails dans la sélection</span><strong id="mail-count" class="stat-value">{email_total}</strong><span id="mailbox-selected-count" class="stat-detail">{selected_mailboxes} dossier(s) sélectionné(s)</span></div>
 <div class="stat-card"><span class="stat-label">Débit récent</span><strong id="mail-rate" class="stat-value">{int(snapshot["mails_per_minute"])}</strong><span class="stat-detail">mail(s) validé(s)/min</span></div>
 </section>
@@ -4530,9 +4389,9 @@ def render_status_page(
 <section id="workspace-panel-configuration" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-configuration" data-workspace-panel="configuration" hidden>
 <div class="section-heading"><div><h2>Configuration</h2><p>Accès techniques et identité héritée d’OpenRAG.</p></div></div>
 {identity_notice}
-<form method="post" action="/configuration" class="card" autocomplete="off"><div class="card-header"><div><h2 class="card-title">Adresses des services</h2><p class="card-description">Configurez la cible OpenRAG et l’adresse publique utilisée par le callback de connexion.</p></div><span class="badge success">{url_configuration_state}</span></div>
-<div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="secret-grid"><label class="secret-field">URL interne de l’API OpenRAG<span class="secret-current">Service HTTP joignable depuis le cluster</span><input type="url" name="openrag_base_url" value="{openrag_base_url}" required spellcheck="false" autocomplete="url"></label><label class="secret-field">URL publique du connecteur<span class="secret-current">Adresse HTTPS sans chemin ni paramètres</span><input type="url" name="connector_public_url" value="{connector_public_url}" required spellcheck="false" autocomplete="url"></label></div><p class="helper">Ces valeurs sont conservées dans SQLite sur le PVC et deviennent actives immédiatement. Les variables Rancher/Fleet ne servent qu’à amorcer le premier démarrage. Les requêtes déjà en cours terminent avec leur ancienne destination.</p></div>
-<div class="card-footer"><button class="primary" type="submit">Enregistrer les adresses</button></div></form>
+<form method="post" action="/configuration" class="card" autocomplete="off"><div class="card-header"><div><h2 class="card-title">Services et ingestion</h2><p class="card-description">Configurez les adresses du connecteur et la concurrence d’ingestion.</p></div><span class="badge success">{url_configuration_state}</span></div>
+<div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="secret-grid"><label class="secret-field">URL interne de l’API OpenRAG<span class="secret-current">Service HTTP joignable depuis le cluster</span><input type="url" name="openrag_base_url" value="{openrag_base_url}" required spellcheck="false" autocomplete="url"></label><label class="secret-field">URL publique du connecteur<span class="secret-current">Adresse HTTPS sans chemin ni paramètres</span><input type="url" name="connector_public_url" value="{connector_public_url}" required spellcheck="false" autocomplete="url"></label><label class="secret-field">Taille du pool d’ingestion<span class="secret-current">De 1 à 6 tâches simultanées · valeur par défaut : 3</span><input type="number" name="ingestion_pool_size" value="{ingestion_pool_size}" min="1" max="6" step="1" required inputmode="numeric"></label></div><p class="helper">Ces valeurs sont conservées dans SQLite sur le PVC et deviennent actives immédiatement. Lors d’un changement de pool, les tâches déjà en cours se terminent puis le pool redémarre avec la nouvelle taille.</p></div>
+<div class="card-footer"><button class="primary" type="submit">Enregistrer la configuration</button></div></form>
 <form method="post" action="/secrets" class="card" autocomplete="off"><div class="card-header"><div><h2 class="card-title">Clés API</h2><p class="card-description">Renouvelez séparément les accès OpenArchiver et OpenRAG.</p></div><span class="badge">OpenArchiver : {openarchiver_key_state} · OpenRAG : {openrag_key_state}</span></div>
 <div class="card-body"><input type="hidden" name="csrf" value="{csrf}"><div class="secret-grid"><label class="secret-field">Nouvelle clé OpenArchiver<span class="secret-current">Clé actuelle : {openarchiver_key_display}</span><input type="password" name="openarchiver_key" autocomplete="new-password"></label><label class="secret-field">Nouvelle clé OpenRAG<span class="secret-current">Clé actuelle : {openrag_key_display}</span><input type="password" name="openrag_key" autocomplete="new-password"></label></div><p class="helper">Laissez un champ vide pour conserver sa valeur actuelle. Seul le début des clés est affiché ; leur valeur complète n’est jamais placée dans la page ni enregistrée dans SQLite.</p></div>
 <div class="card-footer"><button class="primary" type="submit">Enregistrer les clés renseignées</button></div></form>
@@ -4558,10 +4417,6 @@ def render_metrics(config: Config, state: RuntimeState) -> str:
         f"openarchiver_connector_paused {1 if paused else 0}",
         "# TYPE openarchiver_connector_ingestion_concurrency gauge",
         f"openarchiver_connector_ingestion_concurrency {snapshot['ingestion_concurrency_effective']}",
-        "# TYPE openarchiver_connector_docling_workers_detected gauge",
-        f"openarchiver_connector_docling_workers_detected {snapshot['docling_workers_detected']}",
-        "# TYPE openarchiver_connector_worker_detection_success gauge",
-        f"openarchiver_connector_worker_detection_success {1 if snapshot['worker_detection_success'] else 0}",
         "# TYPE openarchiver_connector_objects gauge",
     ]
     for kind, values in counts.items():
@@ -4912,14 +4767,18 @@ def make_http_handler(
                     connector_public_url = form.get(
                         "connector_public_url", [""]
                     )[0]
+                    ingestion_pool_size = normalize_runtime_pool_size(
+                        form.get("ingestion_pool_size", [""])[0]
+                    )
                     persist_runtime_urls(
                         config,
                         openrag_base_url=openrag_base_url,
                         connector_public_url=connector_public_url,
                     )
+                    persist_runtime_pool_size(config, ingestion_pool_size)
                     state.cycle_requested()
                     wake.set()
-                    self._finish_action(principal, "configuration.urls.update")
+                    self._finish_action(principal, "configuration.update")
                 elif path == "/secrets":
                     changed = []
                     openarchiver_key = form.get("openarchiver_key", [""])[0]
@@ -5019,10 +4878,16 @@ def main() -> None:
         pass
     if restore_runtime_urls(config):
         LOG.info("URL OpenRAG et URL publique restaurées depuis la configuration")
+    if restore_runtime_pool_size(config):
+        LOG.info(
+            "taille du pool d'ingestion restaurée: %d",
+            config.ingestion_concurrency,
+        )
 
     STOP.clear()
     WAKE.clear()
     RECONCILE_WAKE.clear()
+    POOL_RECONFIGURE.clear()
     state = RuntimeState()
     restore_cycle_outcome(config, state)
 
