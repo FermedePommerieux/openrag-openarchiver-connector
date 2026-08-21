@@ -3064,6 +3064,60 @@ class ConnectorTests(unittest.TestCase):
             self.assertEqual(process.call_count, 2)
             sleep.assert_called_once_with(1.0)
 
+    def test_process_queue_grows_without_waiting_for_a_long_running_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory), ingestion_concurrency=1)
+            items = [
+                connector.WorkItem("attachment", f"attachment-{number}", 1)
+                for number in range(1, 4)
+            ]
+            queue_lock = threading.Lock()
+            long_started = threading.Event()
+            extra_started = threading.Event()
+            release_long = threading.Event()
+            processed_ids = []
+
+            def claim_next(_config):
+                with queue_lock:
+                    return items.pop(0) if items else None
+
+            def process(_config, item, _archive, _openrag):
+                processed_ids.append(item.object_id)
+                if item.object_id == "attachment-1":
+                    long_started.set()
+                    self.assertTrue(release_long.wait(5))
+                elif {"attachment-2", "attachment-3"}.issubset(processed_ids):
+                    extra_started.set()
+
+            with (
+                mock.patch.object(connector, "claim_next", side_effect=claim_next),
+                mock.patch.object(connector, "process_work_item", side_effect=process),
+                mock.patch.object(
+                    connector, "selected_queue_pending_count", return_value=3
+                ),
+            ):
+                result = []
+                runner = threading.Thread(
+                    target=lambda: result.append(
+                        connector.process_queue(
+                            config, FakeArchive(), FakeOpenRAG()
+                        )
+                    )
+                )
+                runner.start()
+                self.assertTrue(long_started.wait(2))
+                connector.apply_runtime_pool_size(config, 3)
+                self.assertTrue(extra_started.wait(2))
+                release_long.set()
+                runner.join(5)
+
+            self.assertFalse(runner.is_alive())
+            self.assertEqual(result, [3])
+            self.assertCountEqual(
+                processed_ids,
+                ["attachment-1", "attachment-2", "attachment-3"],
+            )
+
     def test_process_queue_ignores_progress_callback_error(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory), ingestion_concurrency=1)
@@ -3095,7 +3149,7 @@ class ConnectorTests(unittest.TestCase):
             self.assertEqual(process.call_count, 2)
             self.assertEqual(progress_calls, 3)
 
-    def test_process_queue_restarts_after_manual_pool_change(self):
+    def test_process_queue_applies_manual_pool_change_in_place(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory), ingestion_concurrency=1)
             first = connector.WorkItem("email", "mail-1", 1)
@@ -3105,7 +3159,9 @@ class ConnectorTests(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    connector, "claim_next", side_effect=[first, AssertionError]
+                    connector,
+                    "claim_next",
+                    side_effect=[first, None, None, None],
                 ) as claim,
                 mock.patch.object(
                     connector,
@@ -3121,7 +3177,7 @@ class ConnectorTests(unittest.TestCase):
                 )
 
             self.assertEqual(processed, 1)
-            self.assertEqual(claim.call_count, 1)
+            self.assertEqual(claim.call_count, 4)
             self.assertEqual(config.ingestion_concurrency, 3)
 
     def test_no_automatic_delete_and_logs_exclude_keys_and_bodies(self):

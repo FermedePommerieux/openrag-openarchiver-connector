@@ -42,7 +42,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass
 from email import policy
@@ -1615,6 +1615,11 @@ def scan_selected_sources(
             )
         return ScanResult(len(source_ids), len(global_emails), False, True)
 
+    # Un inventaire peut contenir plusieurs dizaines de milliers de mails.
+    # Une transaction unique gardait alors le verrou d'écriture SQLite assez
+    # longtemps pour empêcher les slots d'ingestion de réserver leur travail.
+    # Les données sont écrites par lots courts ; seul le marqueur final rend le
+    # nouvel inventaire visible comme un instantané complet.
     with database(config) as db:
         if source_ids:
             placeholders = ",".join("?" for _ in source_ids)
@@ -1639,8 +1644,12 @@ def scan_selected_sources(
                 """,
                 (source_id, path, count, scan_started, scan_started),
             )
-        for email in global_emails.values():
-            _upsert_email(db, email, scan_started)
+    emails = list(global_emails.values())
+    for offset in range(0, len(emails), 200):
+        with database(config) as db:
+            for email in emails[offset : offset + 200]:
+                _upsert_email(db, email, scan_started)
+    with database(config) as db:
         db.execute(
             "INSERT OR REPLACE INTO settings(key,value) VALUES ('last_scan_error','')"
         )
@@ -3013,14 +3022,15 @@ def process_queue(
     progress: Callable[[int, int], None] | None = None,
     state: RuntimeState | None = None,
 ) -> int:
-    """Vide la file locale avec la concurrence calculée pour ce cycle.
+    """Vide la file locale avec un superviseur redimensionnable à chaud.
 
-    Chaque thread ne garde qu'un objet à la fois. La taille manuelle est bornée
-    entre 1 et 6. Aucune heuristique liée à la taille ou à l'OCR n'est
-    appliquée ici.
+    Une Future ne traite qu'un objet. Le superviseur maintient ensuite autant
+    de Futures actives que la taille manuelle courante, comprise entre 1 et 6.
+    Une conversion Docling longue n'empêche donc ni les autres slots d'avancer,
+    ni une augmentation de capacité depuis l'interface.
     """
 
-    workers = effective_ingestion_concurrency(config, state)
+    effective_ingestion_concurrency(config, state)
     POOL_RECONFIGURE.clear()
     progress_lock = threading.Lock()
     processed_total = 0
@@ -3028,25 +3038,11 @@ def process_queue(
     if progress is not None:
         progress(0, initial_total)
 
-    def worker(slot: int) -> int:
-        """Maintient un slot d'ingestion vivant malgré une erreur transitoire.
-
-        ``ThreadPoolExecutor`` conserve une exception dans la ``Future``. Avec
-        une boucle longue par Future, une exception non interceptée supprimait
-        donc silencieusement un slot jusqu'à la fin complète de la file. Le
-        superviseur local journalise l'incident, applique un léger backoff et
-        reprend une réservation au lieu de laisser la concurrence décroître.
-        """
-
+    def process_one(slot: int) -> bool:
+        """Réserve et traite un objet ; ``False`` signifie file épuisée."""
         nonlocal processed_total
-        processed = 0
         consecutive_errors = 0
         while True:
-            # Un changement depuis l'interface laisse finir chaque objet déjà
-            # réservé, puis ferme ce pool. La boucle runtime en recrée un avec
-            # la nouvelle taille sans perdre de tâche en cours.
-            if POOL_RECONFIGURE.is_set():
-                return processed
             try:
                 item = claim_next(config)
             except Exception:
@@ -3060,7 +3056,7 @@ def process_queue(
                 time.sleep(delay)
                 continue
             if item is None:
-                return processed
+                return False
             try:
                 process_work_item(config, item, openarchiver, openrag)
             except Exception:
@@ -3080,13 +3076,14 @@ def process_queue(
                     delay,
                 )
                 time.sleep(delay)
-                continue
-            consecutive_errors = 0
-            processed += 1
+                # L'objet a bien occupé ce slot. Le superviseur doit en ouvrir
+                # un nouveau même si la persistance de son échec a elle-même
+                # échoué.
+                return True
+            with progress_lock:
+                processed_total += 1
+                current = processed_total
             if progress is not None:
-                with progress_lock:
-                    processed_total += 1
-                    current = processed_total
                 try:
                     progress(current, max(initial_total, current))
                 except Exception:
@@ -3095,11 +3092,54 @@ def process_queue(
                         "slot d'ingestion %d: mise à jour de progression ignorée",
                         slot,
                     )
+            return True
 
+    active: dict[Future[bool], int] = {}
+    next_slot = 1
+    queue_exhausted = False
     with ThreadPoolExecutor(
-        max_workers=workers, thread_name_prefix="openarchiver-ingest"
+        max_workers=MAX_INGESTION_POOL_SIZE,
+        thread_name_prefix="openarchiver-ingest",
     ) as pool:
-        return sum(pool.map(worker, range(1, workers + 1)))
+        while True:
+            current_workers = effective_ingestion_concurrency(config, state)
+            if POOL_RECONFIGURE.is_set():
+                POOL_RECONFIGURE.clear()
+                queue_exhausted = False
+
+            while not queue_exhausted and len(active) < current_workers:
+                future = pool.submit(process_one, next_slot)
+                active[future] = next_slot
+                next_slot = next_slot % MAX_INGESTION_POOL_SIZE + 1
+
+            if not active:
+                return processed_total
+
+            completed, _ = wait(
+                active, timeout=0.25, return_when=FIRST_COMPLETED
+            )
+            if not completed:
+                continue
+
+            # Une réservation vide signifie qu'il ne reste momentanément plus
+            # d'objet réservable. On attend alors la fin des travaux actifs :
+            # ils peuvent découvrir de nouvelles pièces jointes à leur tour.
+            saw_claimed = False
+            saw_empty = False
+            for future in completed:
+                slot = active.pop(future)
+                try:
+                    claimed = future.result()
+                except Exception:
+                    LOG.exception(
+                        "slot d'ingestion %d: erreur non interceptée", slot
+                    )
+                    claimed = True
+                saw_claimed = saw_claimed or claimed
+                saw_empty = saw_empty or not claimed
+            queue_exhausted = saw_empty and not saw_claimed
+            if queue_exhausted and not active:
+                return processed_total
 
 
 def selected_queue_pending_count(config: Config) -> int:
