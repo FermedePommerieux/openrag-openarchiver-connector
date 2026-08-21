@@ -28,7 +28,7 @@ Les points de couplage à vérifier avant tout changement de branche OpenRAG son
 - `/v1/tasks/{task_id}/enhanced`, avec repli sur `/v1/tasks/{task_id}` ;
 - `/v2/files`, les chunks et le `document_id` dérivé du SHA-256 ;
 - `/auth/me`, `/users/me` et le flux OAuth délégué ;
-- la métrique Docling RQ `rq_workers` utilisée par la concurrence automatique.
+- la capacité Docling et Langflow que l'opérateur associe au pool manuel.
 
 ## Vue d'ensemble
 
@@ -204,28 +204,20 @@ efface les anciennes preuves SHA/task et remet les objets indexables en file.
 OpenRAG reçoit `replace_duplicates=true`, ce qui met progressivement à jour les
 connaissances avec les noms lisibles.
 
-## Concurrence et capacité Docling
+## Pool d'ingestion manuel
 
 `process_queue` crée un pool de threads. Chaque thread réserve et traite un seul
 objet à la fois, puis réclame le suivant. Il n'existe volontairement aucune
 sérialisation selon la taille du document ou la présence supposée d'OCR.
 
-Avec `INGESTION_CONCURRENCY=auto`, la concurrence vaut :
+La taille est choisie dans l'onglet **Configuration**, vaut `3` par défaut et
+doit rester comprise entre `1` et `6`. Elle est conservée dans SQLite sur le
+PVC. La détection automatique Docling/RQ/Kubernetes n'est plus utilisée.
 
-```text
-min(workers_Docling_détectés, INGESTION_CONCURRENCY_MAX)
-```
-
-Dans Kubernetes, `DOCLING_WORKLOAD_URL` pointe vers l'API du Deployment Docling.
-Le connecteur utilise le minimum entre ses réplicas `Ready` et `Available` : les
-enregistrements RQ fantômes conservés dans Valkey après l'arrêt d'un pod ne sont
-donc jamais comptés. Le compte de service n'a qu'un droit `get` sur ce
-Deployment. Hors Kubernetes, si cette URL est vide, la métrique Prometheus
-`rq_workers` reste disponible comme solution de compatibilité.
-
-Si la détection échoue ou si Kubernetes n'a pas encore observé la dernière
-génération du Deployment, aucune nouvelle ingestion n'est soumise pendant ce
-cycle.
+Lors d'un changement, les objets déjà réservés terminent normalement. Les
+threads ne réclament ensuite plus de nouvel objet, le pool se ferme et la
+boucle runtime le recrée immédiatement avec la nouvelle taille. Cette méthode
+évite de perdre les tâches OpenRAG en cours.
 
 Cette concurrence limite les objets suivis simultanément par le connecteur.
 Elle ne garantit pas que Langflow ou Docling les exécutent immédiatement.
@@ -322,15 +314,8 @@ principales sont :
 | `MAX_AUTO_RETRIES` | `3` | tentatives automatiques par objet |
 | `RETRY_BASE_SECONDS` / `RETRY_MAX_SECONDS` | `300` / `3600` | backoff |
 | `MAX_FILE_BYTES` | `104857600` | limite à 100 Mio |
-| `INGESTION_CONCURRENCY` | `auto` | détection Docling |
-| `INGESTION_CONCURRENCY_FALLBACK` | `2` | option historique, non utilisée en mode automatique sûr |
-| `INGESTION_CONCURRENCY_MAX` | `8` | borne opérateur du pool, toujours limitée au nombre de workers détectés |
-| `INGESTION_PREFETCH_PER_WORKER` | `1` | option historique ; le pool impose désormais un seul thread par worker |
-| `DOCLING_WORKLOAD_URL` | vide | API Kubernetes du Deployment Docling, prioritaire si configurée |
-| `KUBERNETES_TOKEN_FILE` | chemin standard Kubernetes | jeton du compte de service en lecture seule |
-| `KUBERNETES_CA_FILE` | chemin standard Kubernetes | autorité de certification de l'API Kubernetes |
-| `DOCLING_METRICS_URL` | service Docling interne | repli hors Kubernetes uniquement |
-| `DOCLING_RQ_QUEUE_NAME` | `convert` | file comptée dans les métriques |
+| `INGESTION_CONCURRENCY` | `3` | amorçage manuel avant le premier enregistrement UI |
+| `INGESTION_CONCURRENCY_MAX` | `6` | borne dure du pool manuel |
 | `REQUEST_TIMEOUT_SECONDS` | `30` | timeout des appels HTTP courts |
 
 `OPENRAG_BASE_URL` et `CONNECTOR_PUBLIC_URL` ont un fonctionnement particulier :

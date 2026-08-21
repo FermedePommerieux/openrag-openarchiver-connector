@@ -206,19 +206,8 @@ class ConnectorTests(unittest.TestCase):
                     "STATE_DB": str(config.state_db),
                 }
             )
-            self.assertIsNone(defaults.ingestion_concurrency)
-            self.assertEqual(defaults.ingestion_concurrency_fallback, 2)
-            self.assertEqual(defaults.ingestion_concurrency_max, 8)
-            self.assertEqual(defaults.ingestion_prefetch_per_worker, 1)
-            self.assertEqual(
-                defaults.docling_metrics_url,
-                "http://docling-serve.docling.svc.cluster.local:5001/metrics",
-            )
-            self.assertEqual(defaults.docling_workload_url, "")
-            self.assertEqual(
-                defaults.kubernetes_token_file,
-                Path("/var/run/secrets/kubernetes.io/serviceaccount/token"),
-            )
+            self.assertEqual(defaults.ingestion_concurrency, 3)
+            self.assertEqual(defaults.ingestion_concurrency_max, 6)
             self.assertEqual(
                 defaults.supported_extensions,
                 frozenset(
@@ -437,143 +426,41 @@ class ConnectorTests(unittest.TestCase):
                 json.loads(requests[2].data)["connection_id"], "oauth-state-1"
             )
 
-    def test_docling_worker_metrics_count_active_convert_workers(self):
-        metrics = """# HELP rq_workers RQ workers
-# TYPE rq_workers gauge
-rq_workers{name="one",state="idle",queues="convert"} 1.0
-rq_workers{name="two",state="busy",queues="convert,low"} 1.0
-rq_workers{name="paused",state="suspended",queues="convert"} 1.0
-rq_workers{name="other",state="idle",queues="other"} 1.0
-"""
-        self.assertEqual(connector.parse_docling_worker_metrics(metrics, "convert"), 2)
-        with self.assertRaisesRegex(RuntimeError, "rq_workers"):
-            connector.parse_docling_worker_metrics(
-                "# TYPE rq_jobs gauge\n", "convert"
-            )
-
-    def test_docling_workload_counts_only_ready_available_replicas(self):
-        payload = json.dumps(
-            {
-                "metadata": {"generation": 7},
-                "status": {
-                    "observedGeneration": 7,
-                    "readyReplicas": 3,
-                    "availableReplicas": 2,
-                },
-            }
-        ).encode()
-        self.assertEqual(connector.parse_docling_workload(payload), 2)
-
-        stale = json.dumps(
-            {
-                "metadata": {"generation": 8},
-                "status": {
-                    "observedGeneration": 7,
-                    "readyReplicas": 3,
-                    "availableReplicas": 3,
-                },
-            }
-        ).encode()
-        self.assertEqual(connector.parse_docling_workload(stale), 0)
-
-    def test_kubernetes_docling_detection_uses_read_only_workload_status(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            token = root / "token"
-            ca = root / "ca.crt"
-            token.write_text("service-account-token\n", encoding="utf-8")
-            ca.write_text("test-ca", encoding="utf-8")
-            config = self.config(
-                root,
-                docling_workload_url=(
-                    "https://kubernetes.default.svc/apis/apps/v1/namespaces/"
-                    "docling/deployments/docling-rq-workers"
-                ),
-                kubernetes_token_file=token,
-                kubernetes_ca_file=ca,
-            )
-            payload = json.dumps(
-                {
-                    "metadata": {"generation": 4},
-                    "status": {
-                        "observedGeneration": 4,
-                        "readyReplicas": 3,
-                        "availableReplicas": 3,
-                    },
-                }
-            ).encode()
-            opener = mock.Mock(return_value=Response(payload))
-            tls_context = object()
-
-            with (
-                mock.patch.object(
-                    connector.ssl,
-                    "create_default_context",
-                    return_value=tls_context,
-                ) as create_context,
-                mock.patch.object(connector.urllib.request, "urlopen", opener),
-            ):
-                self.assertEqual(connector.detect_docling_workers(config), 3)
-
-            create_context.assert_called_once_with(cafile=str(ca))
-            request = opener.call_args.args[0]
-            self.assertEqual(
-                request.headers["Authorization"], "Bearer service-account-token"
-            )
-            self.assertIs(opener.call_args.kwargs["context"], tls_context)
-
-    def test_automatic_concurrency_uses_detected_workers_and_cap(self):
+    def test_manual_concurrency_defaults_to_three_and_is_capped_at_six(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(
                 Path(directory),
-                ingestion_concurrency=None,
-                ingestion_concurrency_max=3,
+                ingestion_concurrency=3,
+                ingestion_concurrency_max=6,
             )
             state = connector.RuntimeState()
-            with mock.patch.object(connector, "detect_docling_workers", return_value=5):
-                self.assertEqual(
-                    connector.effective_ingestion_concurrency(config, state), 3
-                )
+            self.assertEqual(
+                connector.effective_ingestion_concurrency(config, state), 3
+            )
             snapshot = state.snapshot()
-            self.assertEqual(snapshot["docling_workers_detected"], 5)
             self.assertEqual(snapshot["ingestion_concurrency_effective"], 3)
-            self.assertTrue(snapshot["worker_detection_success"])
+            config.ingestion_concurrency = 99
+            self.assertEqual(connector.effective_ingestion_concurrency(config), 6)
 
-    def test_automatic_concurrency_never_exceeds_detected_workers(self):
+    def test_manual_pool_size_is_persisted_validated_and_restored(self):
         with tempfile.TemporaryDirectory() as directory:
-            config = self.config(
-                Path(directory),
-                ingestion_concurrency=None,
-                ingestion_concurrency_max=8,
-                ingestion_prefetch_per_worker=2,
-            )
-            with mock.patch.object(connector, "detect_docling_workers", return_value=3):
-                self.assertEqual(connector.effective_ingestion_concurrency(config), 3)
+            root = Path(directory)
+            config = self.config(root, ingestion_concurrency=3)
+            connector.POOL_RECONFIGURE.clear()
+            self.assertFalse(connector.runtime_pool_size_is_persisted(config))
+            self.assertEqual(connector.persist_runtime_pool_size(config, "5"), 5)
+            self.assertEqual(config.ingestion_concurrency, 5)
+            self.assertTrue(connector.POOL_RECONFIGURE.is_set())
+            self.assertTrue(connector.runtime_pool_size_is_persisted(config))
 
-    def test_fixed_concurrency_remains_an_explicit_operator_override(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config = self.config(
-                Path(directory),
-                ingestion_concurrency=8,
-                ingestion_concurrency_max=8,
-            )
-            self.assertEqual(connector.effective_ingestion_concurrency(config), 8)
-
-    def test_automatic_concurrency_stops_at_zero_and_falls_back_on_error(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config = self.config(
-                Path(directory),
-                ingestion_concurrency=None,
-                ingestion_concurrency_fallback=2,
-            )
-            with mock.patch.object(connector, "detect_docling_workers", return_value=0):
-                self.assertEqual(connector.effective_ingestion_concurrency(config), 0)
-            with mock.patch.object(
-                connector,
-                "detect_docling_workers",
-                side_effect=OSError("metrics indisponibles"),
-            ):
-                self.assertEqual(connector.effective_ingestion_concurrency(config), 0)
+            restored = self.config(root, ingestion_concurrency=3)
+            self.assertTrue(connector.restore_runtime_pool_size(restored))
+            self.assertEqual(restored.ingestion_concurrency, 5)
+            for invalid in (0, 7, "auto", ""):
+                with self.subTest(invalid=invalid), self.assertRaises(
+                    connector.ConnectorError
+                ):
+                    connector.persist_runtime_pool_size(restored, invalid)
 
     def test_secret_rotation_is_atomic_and_only_renders_safe_prefixes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2237,6 +2124,7 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                             "csrf": state.snapshot()["csrf_token"],
                             "openrag_base_url": "http://new-openrag:8000/",
                             "connector_public_url": "https://connector.example.test/",
+                            "ingestion_pool_size": "5",
                         }
                     ).encode("ascii"),
                 )
@@ -2246,11 +2134,16 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
                 self.assertEqual(
                     config.connector_public_url, "https://connector.example.test"
                 )
+                self.assertEqual(config.ingestion_concurrency, 5)
                 self.assertIn('value="http://new-openrag:8000"', configuration_page)
                 self.assertIn(
                     'value="https://connector.example.test"', configuration_page
                 )
                 self.assertIn("Enregistrée sur le PVC", configuration_page)
+                self.assertIn(
+                    'name="ingestion_pool_size" value="5"', configuration_page
+                )
+                self.assertTrue(connector.POOL_RECONFIGURE.is_set())
                 self.assertTrue(wake.is_set())
                 wake.clear()
 
@@ -2689,6 +2582,8 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
         self.assertIn('action="/configuration"', page)
         self.assertIn('name="openrag_base_url"', page)
         self.assertIn('name="connector_public_url"', page)
+        self.assertIn('name="ingestion_pool_size"', page)
+        self.assertIn('min="1" max="6"', page)
         self.assertIn('value="http://openrag-backend:8000"', page)
 
         state.cycle_progress("Traitement de l’ingestion OpenRAG", 6, 10)
@@ -3199,6 +3094,35 @@ rq_workers{name="other",state="idle",queues="other"} 1.0
             self.assertEqual(processed, 2)
             self.assertEqual(process.call_count, 2)
             self.assertEqual(progress_calls, 3)
+
+    def test_process_queue_restarts_after_manual_pool_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory), ingestion_concurrency=1)
+            first = connector.WorkItem("email", "mail-1", 1)
+
+            def process_then_reconfigure(*_args):
+                connector.apply_runtime_pool_size(config, 3)
+
+            with (
+                mock.patch.object(
+                    connector, "claim_next", side_effect=[first, AssertionError]
+                ) as claim,
+                mock.patch.object(
+                    connector,
+                    "process_work_item",
+                    side_effect=process_then_reconfigure,
+                ),
+                mock.patch.object(
+                    connector, "selected_queue_pending_count", return_value=2
+                ),
+            ):
+                processed = connector.process_queue(
+                    config, FakeArchive(), FakeOpenRAG()
+                )
+
+            self.assertEqual(processed, 1)
+            self.assertEqual(claim.call_count, 1)
+            self.assertEqual(config.ingestion_concurrency, 3)
 
     def test_no_automatic_delete_and_logs_exclude_keys_and_bodies(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
