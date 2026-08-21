@@ -186,7 +186,7 @@ class Config:
     ingestion_concurrency: int | None = None
     ingestion_concurrency_fallback: int = 2
     ingestion_concurrency_max: int = 8
-    ingestion_prefetch_per_worker: int = 2
+    ingestion_prefetch_per_worker: int = 1
     docling_metrics_url: str = (
         "http://docling-serve.docling.svc.cluster.local:5001/metrics"
     )
@@ -281,7 +281,7 @@ class Config:
             ),
             ingestion_concurrency_max=concurrency_max,
             ingestion_prefetch_per_worker=max(
-                1, int(values.get("INGESTION_PREFETCH_PER_WORKER", "2"))
+                1, int(values.get("INGESTION_PREFETCH_PER_WORKER", "1"))
             ),
             docling_metrics_url=values.get(
                 "DOCLING_METRICS_URL",
@@ -2987,19 +2987,27 @@ def detect_docling_workers(config: Config) -> int:
 def effective_ingestion_concurrency(
     config: Config, state: RuntimeState | None = None
 ) -> int:
-    """Résout la concurrence fixe ou automatique et publie son état runtime."""
+    """Plafonne le pool automatique au nombre de workers Docling détectés.
+
+    Le déploiement utilise ce mode automatique. La valeur fixe reste une
+    dérogation opérateur explicite utile aux tests et au dépannage. Si les
+    métriques sont indisponibles en mode automatique, aucune nouvelle
+    ingestion n'est lancée : un repli positif ne permettrait pas de garantir
+    cette propriété de sûreté.
+    """
+
     detected = -1
     detection_success = False
     if config.ingestion_concurrency is not None:
+        # Le mode fixe reste une dérogation opérateur explicite. Le déploiement
+        # de production utilise le mode auto ci-dessous, qui porte la garantie
+        # stricte un thread par worker.
         effective = min(config.ingestion_concurrency, config.ingestion_concurrency_max)
     else:
         try:
             detected = detect_docling_workers(config)
             detection_success = True
-            effective = min(
-                detected * config.ingestion_prefetch_per_worker,
-                config.ingestion_concurrency_max,
-            )
+            effective = min(detected, config.ingestion_concurrency_max)
             if effective == 0:
                 LOG.warning(
                     "aucun worker Docling RQ détecté; aucune nouvelle ingestion"
@@ -3007,20 +3015,16 @@ def effective_ingestion_concurrency(
             else:
                 LOG.info(
                     "%d worker(s) Docling détecté(s); concurrence effective=%d "
-                    "(%d tâche(s) en vol par worker)",
+                    "(maximum un thread par worker)",
                     detected,
                     effective,
-                    config.ingestion_prefetch_per_worker,
                 )
         except Exception as error:
-            effective = min(
-                config.ingestion_concurrency_fallback,
-                config.ingestion_concurrency_max,
-            )
+            effective = 0
             LOG.warning(
-                "détection des workers Docling impossible (%s); repli concurrence=%d",
+                "détection des workers Docling impossible (%s); "
+                "aucune nouvelle ingestion",
                 _safe_error(error),
-                effective,
             )
     if state is not None:
         state.worker_detection_updated(
@@ -3041,8 +3045,8 @@ def process_queue(
     """Vide la file locale avec la concurrence calculée pour ce cycle.
 
     Chaque thread ne garde qu'un objet à la fois. En mode automatique, le
-    nombre de threads vaut ``workers Docling x prefetch``, borné par
-    ``INGESTION_CONCURRENCY_MAX``. Aucune heuristique liée à la taille ou à
+    nombre de threads ne dépasse jamais le nombre de workers Docling détectés
+    ni ``INGESTION_CONCURRENCY_MAX``. Aucune heuristique liée à la taille ou à
     l'OCR n'est appliquée ici.
     """
 
@@ -3055,25 +3059,73 @@ def process_queue(
     if progress is not None:
         progress(0, initial_total)
 
-    def worker() -> int:
+    def worker(slot: int) -> int:
+        """Maintient un slot d'ingestion vivant malgré une erreur transitoire.
+
+        ``ThreadPoolExecutor`` conserve une exception dans la ``Future``. Avec
+        une boucle longue par Future, une exception non interceptée supprimait
+        donc silencieusement un slot jusqu'à la fin complète de la file. Le
+        superviseur local journalise l'incident, applique un léger backoff et
+        reprend une réservation au lieu de laisser la concurrence décroître.
+        """
+
         nonlocal processed_total
         processed = 0
+        consecutive_errors = 0
         while True:
-            item = claim_next(config)
+            try:
+                item = claim_next(config)
+            except Exception:
+                consecutive_errors += 1
+                delay = min(30.0, float(2 ** min(consecutive_errors - 1, 5)))
+                LOG.exception(
+                    "slot d'ingestion %d: réservation impossible; reprise dans %.0fs",
+                    slot,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
             if item is None:
                 return processed
-            process_work_item(config, item, openarchiver, openrag)
+            try:
+                process_work_item(config, item, openarchiver, openrag)
+            except Exception:
+                # ``process_work_item`` convertit normalement toute erreur en
+                # état failed/lost. Cette garde protège le pool si cette
+                # persistance échoue elle-même (SQLite, disque, etc.). L'objet
+                # reste alors downloading/ingesting et sera récupéré au
+                # prochain redémarrage, mais le slot continue immédiatement.
+                consecutive_errors += 1
+                delay = min(30.0, float(2 ** min(consecutive_errors - 1, 5)))
+                LOG.exception(
+                    "slot d'ingestion %d: traitement interrompu pour %s/%s; "
+                    "reprise dans %.0fs",
+                    slot,
+                    item.kind,
+                    item.object_id,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            consecutive_errors = 0
             processed += 1
             if progress is not None:
                 with progress_lock:
                     processed_total += 1
                     current = processed_total
-                progress(current, max(initial_total, current))
+                try:
+                    progress(current, max(initial_total, current))
+                except Exception:
+                    # La télémétrie ne doit jamais arrêter le travail métier.
+                    LOG.exception(
+                        "slot d'ingestion %d: mise à jour de progression ignorée",
+                        slot,
+                    )
 
     with ThreadPoolExecutor(
         max_workers=workers, thread_name_prefix="openarchiver-ingest"
     ) as pool:
-        return sum(pool.map(lambda _index: worker(), range(workers)))
+        return sum(pool.map(worker, range(1, workers + 1)))
 
 
 def selected_queue_pending_count(config: Config) -> int:

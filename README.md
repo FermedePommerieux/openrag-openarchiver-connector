@@ -213,8 +213,7 @@ sérialisation selon la taille du document ou la présence supposée d'OCR.
 Avec `INGESTION_CONCURRENCY=auto`, la concurrence vaut :
 
 ```text
-min(workers_Docling_détectés × INGESTION_PREFETCH_PER_WORKER,
-    INGESTION_CONCURRENCY_MAX)
+min(workers_Docling_détectés, INGESTION_CONCURRENCY_MAX)
 ```
 
 La détection lit la métrique Prometheus `rq_workers` de la file Docling
@@ -319,8 +318,8 @@ principales sont :
 | `MAX_FILE_BYTES` | `104857600` | limite à 100 Mio |
 | `INGESTION_CONCURRENCY` | `auto` | détection Docling |
 | `INGESTION_CONCURRENCY_FALLBACK` | `2` | repli si métriques indisponibles |
-| `INGESTION_CONCURRENCY_MAX` | `4` | borne du pool local |
-| `INGESTION_PREFETCH_PER_WORKER` | `2` | objets en vol par worker détecté |
+| `INGESTION_CONCURRENCY_MAX` | `8` | borne opérateur du pool, toujours limitée au nombre de workers détectés |
+| `INGESTION_PREFETCH_PER_WORKER` | `1` | option historique ; le pool impose désormais un seul thread par worker |
 | `DOCLING_RQ_QUEUE_NAME` | `convert` | file comptée dans les métriques |
 | `REQUEST_TIMEOUT_SECONDS` | `30` | timeout des appels HTTP courts |
 
